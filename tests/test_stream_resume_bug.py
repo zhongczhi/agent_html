@@ -80,12 +80,13 @@ async def test_partial_content_lost_on_interrupted_stream(client, clean_registry
     conversation_id = "partial-test-conv"
 
     # Start a stream and manually interrupt it (don't await completion)
+    # Note: service.generate() already calls job.append_token() internally,
+    # so we don't need to call it here. We just consume the yielded tokens.
     async def start_stream():
         job = get_or_create_job(conversation_id, [])
         async for token in service.generate("Hello", conversation_id, resume=False):
-            job.append_token(token)
-            # Simulate interruption after first token
-            if token == ", ":
+            # Simulate interruption after first token (token is now a dict {"token": "..."})
+            if token.get("token") == ", ":
                 return
 
     # Run the partial stream

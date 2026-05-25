@@ -6,7 +6,10 @@ import asyncio
 
 async def async_gen_from_list(items):
     for item in items:
-        yield item
+        # Wrap items in mock chunks with content attribute (new LLM chunk format)
+        chunk = MagicMock()
+        chunk.content = item
+        yield chunk
 
 
 class TestChatService:
@@ -25,7 +28,7 @@ class TestChatService:
         async for token in service.generate("Hi"):
             messages.append(token)
 
-        assert "".join(messages) == "Hello World"
+        assert "".join(m.get("token", "") for m in messages) == "Hello World"
 
     @pytest.mark.asyncio
     async def test_generate_with_conversation_history(self, mock_chain, temp_storage_dir):
@@ -78,7 +81,7 @@ class TestStreamJobIntegration:
         async for token in service.generate("hello", "stream-test"):
             tokens.append(token)
 
-        assert tokens == ["H", "i", "!"]
+        assert [t.get("token") for t in tokens] == ["H", "i", "!"]
         job = get_job("stream-test")
         assert job is not None
         assert job.tokens == ["H", "i", "!"]
