@@ -76,13 +76,13 @@ idea → SPEC.md → DESI.md → implementation → testing → assessment → m
 
 ### Iteration Process
 
-1. **Plan**: Define new feature/modification in `SPEC_focus.md` and `DESI_focus.md`
+1. **Plan**: Define new feature/modification in `./document/SPEC_focus.md` and `./document/DESI_focus.md`
 2. **Implement**: Work on code based on `_focus.md` files only
 3. **Test**: Verify implementation against `_focus.md` specifications
 4. **Full Test**: Run full test suite to ensure existing functionality is not broken
 5. **Merge**: On success, merge `_focus.md` changes into main `SPEC.md`/`DESI.md`
-5. **Archive**: Rename completed `_focus.md` as `SPEC_focus_v{N}.md` / `DESI_focus_v{N}.md`
-6. **Reset**: Create fresh `_focus.md` files for next iteration
+6. **Archive**: Rename completed `_focus.md` as `SPEC_focus_v{N}.md` / `DESI_focus_v{N}.md` and move to `./document/history`
+7. **Reset**: Create fresh `_focus.md` files for next iteration
 
 ### Key Principle
 
