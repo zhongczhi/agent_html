@@ -95,7 +95,6 @@ File-based JSON in `storage/conversations.json`.
 | `frontend/index.html` | Chat UI with streaming JavaScript |
 | `tests/conftest.py` | Shared pytest fixtures (mock LLM, temp storage dir) |
 | `tests/test_chat_service.py` | Unit tests for `ChatService` |
-| `tests/test_chat_chain.py` | Unit tests for LangChain chain construction |
 | `tests/test_storage.py` | Unit tests for file-based storage |
 
 ---
@@ -221,7 +220,6 @@ File-based JSON in `storage/conversations.json`.
 - **Location:** `tests/` directory
 - **Test Files:**
   - `test_chat_service.py` - Tests ChatService.generate() with mocked LLM
-  - `test_chat_chain.py` - Tests LCEL chain construction and invocation
   - `test_storage.py` - Tests JSON read/write roundtrip
 - **Fixtures:** `conftest.py` provides mock LLM, temp storage directory
 - **Mocking:** Mock `ChatModel` from LangChain to avoid real API calls
@@ -247,7 +245,6 @@ Tests use **mocking** for LLM calls — no real API calls during tests.
 **Test coverage:**
 
 - `test_chat_service.py`: Mock LLM, test `ChatService.generate()` returns expected response
-- `test_chat_chain.py`: Test LCEL chain construction and invocation
 - `test_storage.py`: Test JSON read/write roundtrip for conversation history
 
 ---

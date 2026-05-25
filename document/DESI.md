@@ -1,317 +1,295 @@
 # Chatbot Project - Detailed Design
 
-## Decisions
+## 1. Architecture Decisions
 
-### 1. Communication Protocol
+### 1.1 Communication Protocol: SSE
 
-- **SSE (Server-Sent Events)** for streaming responses
+**Choice:** Server-Sent Events (SSE) for streaming responses.
+
+**Rationale:**
+- Unidirectional (server → client) fits chat streaming use case
 - FastAPI native `StreamingResponse` support
 - Frontend uses Fetch API with `ReadableStream`
+- Simpler than WebSocket for this use case
 
-### 2. Authentication
+### 1.2 LLM Integration: LangChain LCEL
 
-- No authentication for initial version
-- Easy to add API Key or JWT later via FastAPI dependencies
+**Choice:** LangChain with LangChain Expression Language (LCEL).
 
-### 3. Conversation History Storage
+**Rationale:**
+- LCEL enables clean streaming chain composition
+- Built-in support for Anthropic models via MiniMax endpoint
+- Easy to swap models without changing application logic
+- Environment variables: `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`
 
-- File-based JSON storage (`storage/conversations.json`)
-- Per-conversation JSON files for future scalability
-- Future migration path to PostgreSQL
+### 1.3 Storage: JSON Files
 
-### 4. LLM Integration
+**Choice:** File-based JSON storage (`storage/conversations.json`).
 
-- **LangChain with LCEL** (LangChain Expression Language)
-- Model: Anthropic Claude via MiniMax endpoint
-- Environment variables:
-  - `ANTHROPIC_BASE_URL`
-  - `ANTHROPIC_API_KEY`
+**Rationale:**
+- Zero infrastructure setup
+- Easy to inspect and debug
+- Migration path to PostgreSQL defined for future
+- Per-conversation structure allows future sharding
 
-### 5. Frontend
+### 1.4 Frontend: Plain HTML/JS
 
-- Plain HTML/JS (no framework)
+**Choice:** No framework, single `index.html`.
+
+**Rationale:**
 - Zero build step
-- Served by FastAPI as static file
-- Streaming via native `ReadableStream` API
+- Easy to understand and modify
+- Served directly by FastAPI
+- Native `ReadableStream` for SSE handling
 
-### 6. Backend Structure
+### 1.5 Configuration: Environment Variables
 
-- **Domain-driven modular structure**
-- Separate domains: `chat`, `storage`
-- Clean separation of routes, chains, services
+**Choice:** `pydantic-settings` with `.env` file.
 
-### 7. Backend Server
-
-- Uvicorn directly for development
-- Single port serving both API and frontend
-
-### 8. Configuration
-
-- Environment variables via `pydantic-settings`
-- `config.py` for typed settings with defaults
-- `.env` file for secrets
-
-### 9. Development Serve
-
-- FastAPI serves frontend static files
-- Single origin, no CORS issues
-- Routes:
-  - `/` → frontend `index.html`
-  - `/api/chat/stream` → SSE streaming endpoint
-
-### 10. Logging
-
-- Python standard `logging` module
-- Uvicorn default logging (INFO level)
-
-## Key Patterns
-
-### SSE Streaming
-
-`POST /api/chat/stream` returns `StreamingResponse` with SSE format.
-
-### LangChain LCEL
-
-Chat logic in `chat/chain.py` using LangChain Expression Language.
-
-### Domain Structure
-
-Each domain has `routes.py`, `chain.py`, `service.py`.
-
-### Conversation History
-
-File-based JSON in `storage/conversations.json`.
-
-## File Descriptions
-
-| File | Purpose |
-|------|---------|
-| `backend/main.py` | FastAPI app entry point, serves frontend + API |
-| `backend/config.py` | Pydantic settings from environment variables |
-| `backend/chat/routes.py` | `/api/chat/stream` SSE streaming endpoint |
-| `backend/chat/chain.py` | LangChain LCEL chain definition |
-| `backend/chat/service.py` | Chat business logic |
-| `backend/storage/file_storage.py` | JSON file read/write operations |
-| `frontend/index.html` | Chat UI with streaming JavaScript |
-| `tests/conftest.py` | Shared pytest fixtures (mock LLM, temp storage dir) |
-| `tests/test_chat_service.py` | Unit tests for `ChatService` |
-| `tests/test_chat_chain.py` | Unit tests for LangChain chain construction |
-| `tests/test_storage.py` | Unit tests for file-based storage |
+**Rationale:**
+- Standard Python pattern
+- Type validation on startup
+- Secrets kept out of codebase
 
 ---
 
-## Functional Requirements
+## 2. System Architecture
 
-### FR-1: Chat Streaming API
+```
+┌─────────────┐     SSE/HTTP      ┌─────────────────┐
+│   Frontend  │ ◄───────────────► │   FastAPI       │
+│  (Plain     │                   │   Backend       │
+│   HTML/JS)  │                   │   (LangChain)   │
+└─────────────┘                   └────────┬────────┘
+                                           │
+                    ┌──────────────────────┼──────────────────────┐
+                    │                      │                       │
+                    │              ┌───────────────┐        ┌───────────────┐
+                    │              │  chat domain  │        │ storage domain│
+                    │              └───────────────┘        └───────────────┘
+                    └──────────────────────────────────────────────────────┘
+```
 
-- **Endpoint:** `POST /api/chat/stream`
-- **Behavior:** Accepts a JSON payload with `message` (string) and optional `conversation_id` (string), returns SSE stream of tokens
-- **SSE Format:** `data: {"token": "..."}\n\n` for tokens, `data: {"token": null}\n\n` to signal end
-- **Response Flow:**
-  1. Parse request body for `message` and `conversation_id`
-  2. Generate new `conversation_id` via UUID if not provided
-  3. Retrieve existing conversation history or start fresh
-  4. Append user message to history
-  5. Stream LLM response tokens in real-time via SSE
-  6. Save assistant response to conversation history on completion
+---
 
-### FR-2: Conversation History API
+## 3. Backend Structure
 
-- **Endpoint:** `GET /api/chat/history/{conversation_id}`
-- **Behavior:** Returns JSON with `conversation_id` and `messages` array
-- **Response Format:**
-  ```json
-  {
-    "conversation_id": "uuid-string",
-    "messages": [
-      {"role": "user", "content": "..."},
-      {"role": "assistant", "content": "..."}
-    ]
-  }
-  ```
-- **Edge Case:** Returns empty messages array for unknown `conversation_id`
+```
+backend/
+├── main.py                 # FastAPI app entry, serves frontend + mounts routers
+├── config.py               # Pydantic Settings from env vars
+├── chat/
+│   ├── routes.py           # /api/chat/* endpoints
+│   ├── chain.py            # LangChain LCEL chain definition
+│   ├── service.py          # ChatService orchestration
+│   └── stream_manager.py   # StreamJob tracking + STREAM_REGISTRY
+└── storage/
+    └── file_storage.py     # JSON file read/write operations
+```
 
-### FR-3: Conversation History Storage
+### Domain Pattern
 
-- **Storage Location:** `storage/conversations.json`
-- **Data Structure:**
-  ```json
-  {
-    "conversation_id": {
-      "conversation_id": "uuid",
-      "messages": [{"role": "user"|"assistant", "content": "..."}]
+Each domain has three files:
+- `routes.py` — HTTP interface (endpoints)
+- `chain.py` — Business logic composition (LCEL)
+- `service.py` — Orchestration and state management
+
+### Stream Registry
+
+In-memory registry (`STREAM_REGISTRY`) tracks active streams:
+- `conversation_id` → `StreamJob` mapping
+- Enables stream resume on conversation switch/refresh
+
+---
+
+## 4. API Protocol
+
+### SSE Format
+
+```
+data: {"token": "Hello"}\n\n
+data: {"token": "!"}\n\n
+data: {"token": null}\n\n
+```
+
+| Event | Format | Description |
+|-------|--------|-------------|
+| Token | `data: {"token": "..."}` | Single token |
+| Partial | `data: {"partial": "..."}` | Already-streamed content on resume |
+| End | `data: {"token": null}` | Stream complete |
+
+### Request/Response Flow
+
+**New Stream:**
+1. Parse request body (`message`, `conversation_id`)
+2. Generate UUID for new conversation if needed
+3. Retrieve existing history or start fresh
+4. Append user message to history
+5. Stream LLM tokens via SSE
+6. Save assistant response on completion
+
+**Resume Stream:**
+1. Check `STREAM_REGISTRY` for active job
+2. Send `{"partial": "already streamed..."}` to catch up client
+3. Continue streaming from current position
+
+---
+
+## 5. Data Storage
+
+### conversations.json
+
+```json
+{
+  "conversations": {
+    "uuid-1": {
+      "conversation_id": "uuid-1",
+      "messages": [
+        {"role": "user"|"assistant", "content": "..."}
+      ],
+      "created_at": "ISO8601",
+      "updated_at": "ISO8601"
     }
   }
-  ```
-- **Operations:**
-  - `get_conversation(conversation_id)` - Retrieve conversation or `None`
-  - `save_conversation(conversation_id, messages)` - Persist entire messages array
-  - `append_message(conversation_id, role, content)` - Append single message
-- **Storage Directory:** Auto-created at `storage/` if missing
-- **Error Handling:** Invalid JSON returns empty dict, logging warning
+}
+```
 
-### FR-4: Frontend Chat UI
+### Storage Operations
 
-- **Technology:** Plain HTML/JS (no framework), single `index.html`
-- **Features:**
-  - Text input for messages with Enter key or button click submission
-  - Display area for conversation history (user/assistant messages)
-  - Loading indicator ("Thinking..." with animated dots) during streaming
-  - Real-time token streaming as SSE responses arrive
-  - Persistent `conversation_id` maintained across messages in session
-- **Styling:** Centered chat container (max 800px), message bubbles (user right-aligned blue, assistant left-aligned gray), rounded input field
-- **Error Handling:** Shows "Sorry, an error occurred" message on fetch failure
+| Function | Behavior |
+|----------|----------|
+| `get_conversation(id)` | Retrieve conversation or `None` |
+| `save_conversation(id, messages)` | Persist entire messages array |
+| `append_message(id, role, content)` | Append single message |
+| `list_conversations()` | Return sorted list (updated_at desc) |
+| `delete_conversation(id)` | Remove conversation, clear stream |
+
+**Error Handling:** Invalid JSON returns empty dict with warning log.
 
 ---
 
-## Non-Functional Requirements
+## 6. Frontend Implementation
 
-### NFR-1: Configuration
+### Responsibilities
 
-- **Method:** Environment variables via `pydantic-settings`
-- **Variables:**
-  | Variable | Default | Description |
-  |----------|---------|-------------|
-  | `ANTHROPIC_BASE_URL` | `https://api.minimax.chat/v1` | LLM API base URL |
-  | `ANTHROPIC_API_KEY` | `""` | API key for authentication |
-- **Settings File:** `.env` file support (gitignored)
+- Manage conversation list UI and state
+- Store `currentConversationId` in `localStorage`
+- On page load: check stream status, resume if needed
+- Handle SSE stream parsing and display
 
-### NFR-2: LLM Integration
+### Page Load Flow
 
-- **Provider:** Anthropic Claude via MiniMax endpoint
-- **Model:** `minimax-2.7-highspeed`
-- **Max Tokens:** 4096
-- **Message Format:** Convert `{role, content}` dicts to LangChain `HumanMessage` objects
+```
+1. Read currentConversationId from localStorage
+2. If exists, GET /api/chat/stream/status/{id}
+3. If streaming=true → POST /stream to resume
+4. If streaming=false → GET /api/chat/history/{id}
+```
 
-### NFR-3: Backend Structure
+### Conversation Switch Flow
 
-- **Framework:** FastAPI with Uvicorn
-- **Architecture:** Domain-driven modular structure
-  ```
-  backend/
-  ├── main.py           # FastAPI app entry, serves frontend + mounts routers
-  ├── config.py         # Pydantic Settings class
-  ├── chat/
-  │   ├── routes.py     # /api/chat endpoints (stream, history)
-  │   ├── chain.py      # LangChain LCEL chain (messages → LLM)
-  │   └── service.py    # ChatService (orchestrates chain + storage)
-  └── storage/
-      └── file_storage.py  # JSON file operations
-  ```
-- **Domain Pattern:** Each domain has `routes.py`, `chain.py`, `service.py`
+```
+1. User clicks conversation in sidebar
+2. If currently streaming → SSE connection closes
+3. Server continues streaming (STREAM_REGISTRY intact)
+4. Load clicked conversation's history
+5. If it was streaming → resume via POST /stream
+```
 
-### NFR-4: Logging
+### UI Styling
 
-- **Module:** Python standard `logging`
-- **Level:** INFO (via `logging.basicConfig`)
-- **Error Cases:** `chat/service.py` logs LLM generation errors
-
-### NFR-5: Frontend Serving
-
-- **Root Route:** `GET /` serves `frontend/index.html`
-- **Static Files:** Mounted at `/static` if `frontend/index.html` exists
-- **Single Origin:** No CORS issues
+- Centered chat container (max 800px)
+- User messages: right-aligned, blue bubble
+- Assistant messages: left-aligned, gray bubble
+- Loading indicator: "Thinking..." with animated dots
 
 ---
 
-## Testing Requirements
+## 7. Testing Strategy
 
-### TR-1: Unit Tests
+### Test Approach
 
-- **Location:** `tests/` directory
-- **Test Files:**
-  - `test_chat_service.py` - Tests ChatService.generate() with mocked LLM
-  - `test_chat_chain.py` - Tests LCEL chain construction and invocation
-  - `test_storage.py` - Tests JSON read/write roundtrip
-- **Fixtures:** `conftest.py` provides mock LLM, temp storage directory
-- **Mocking:** Mock `langchain_anthropic.ChatAnthropic` to avoid real API calls
-- **Test Client:** `httpx.AsyncClient` against FastAPI TestClient
-
-### TR-2: Test Dependencies
-
-- `pytest>=7.0.0`
-- `pytest-asyncio>=0.21.0`
-- `httpx>=0.25.0`
-
-## Testing Approach
-
-Tests use **mocking** for LLM calls — no real API calls during tests.
-
-**Key testing principles:**
-
-- Mock `ChatModel` from LangChain to return controlled responses
-- Use temporary directory for storage tests (cleanup after)
-- Test streaming behavior via `AsyncIterator` mocking
+- Mock LLM calls via `langchain.anthropic.ChatModel`
+- Use temporary directories for storage tests
 - HTTP tests via `httpx.AsyncClient` against FastAPI TestClient
 
-**Test coverage:**
+### Test Coverage
 
-- `test_chat_service.py`: Mock LLM, test `ChatService.generate()` returns expected response
-- `test_chat_chain.py`: Test LCEL chain construction and invocation
-- `test_storage.py`: Test JSON read/write roundtrip for conversation history
+| File | What is Tested |
+|------|----------------|
+| `test_chat_service.py` | `ChatService.generate()` with mocked LLM |
+| `test_storage.py` | JSON read/write roundtrip |
+| `test_chat_routes.py` | HTTP endpoint responses |
+| `test_stream_manager.py` | StreamJob state transitions |
+
+### Test Dependencies
+
+```
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+httpx>=0.25.0
+```
 
 ---
 
-## Implementation Details for Future Extensions
+## 8. Future Extension Points
 
 ### Adding RAG
 
 1. Create `backend/rag/` domain
 2. Add document loader in `rag/loader.py`
 3. Add vector store in `rag/vectorstore.py`
-4. Integrate into `chat/chain.py` as a LangChain RAG chain
+4. Integrate into `chat/chain.py` as RAG chain
 5. No changes to `chat/routes.py` — same interface
-
-### Adding File Upload
-
-1. Create `backend/files/` domain
-2. Add upload route in `files/routes.py`
-3. Store files in `storage/uploads/`
-4. Link files to conversations via `storage/file_storage.py`
-
-### Adding Memory Persistence
-
-1. Replace `storage/file_storage.py` with `storage/db_storage.py` using PostgreSQL
-2. Update `chat/service.py` to use new storage
-3. Add `chat/memory.py` for conversation memory buffer
 
 ### Adding Authentication
 
-1. Add `backend/auth/` domain
-2. Create FastAPI dependency `get_current_user`
-3. Apply to routes via `Depends(get_current_user)`
+1. Create `backend/auth/` domain
+2. Add FastAPI dependency `get_current_user`
+3. Apply via `Depends(get_current_user)` on routes
 
-## Verification Steps
+### PostgreSQL Migration
 
-1. **Start backend:**
-   ```bash
-   pip install -r requirements.txt
-   uvicorn backend.main:app --reload --port 8000
-   ```
-
-2. **Open frontend:**
-   Navigate to `http://localhost:8000` in browser
-
-3. **Test chat:**
-   - Type a message, verify streaming response appears token by token
-   - Check `storage/conversations.json` for saved history
-
-4. **Verify streaming:**
-   - Response should stream in real-time, not wait for full generation
-
-5. **Run tests:**
-   ```bash
-   cd backend
-   pip install pytest pytest-asyncio httpx
-   pytest tests/ -v
-   ```
+1. Replace `storage/file_storage.py` with `storage/db_storage.py`
+2. Update `chat/service.py` to use new storage
+3. Keep interface the same
 
 ---
 
-## Out of Scope (Future)
+## 9. File Inventory
 
-- RAG (Retrieval-Augmented Generation)
-- File upload
-- Authentication / API keys
-- PostgreSQL storage
-- Conversation memory buffer
+| File | Purpose |
+|------|---------|
+| `backend/main.py` | FastAPI app entry, serves frontend + mounts routers |
+| `backend/config.py` | Pydantic Settings from environment variables |
+| `backend/chat/routes.py` | `/api/chat/*` endpoints |
+| `backend/chat/chain.py` | LangChain LCEL chain definition |
+| `backend/chat/service.py` | ChatService (orchestrates chain + storage) |
+| `backend/chat/stream_manager.py` | StreamJob + STREAM_REGISTRY |
+| `backend/storage/file_storage.py` | JSON file operations |
+| `frontend/index.html` | Chat UI with SSE streaming JS |
+| `tests/conftest.py` | Pytest fixtures (mock LLM, temp storage) |
+| `tests/test_chat_*.py` | Chat domain tests |
+| `tests/test_storage.py` | Storage layer tests |
+| `tests/test_stream_manager.py` | Stream registry tests |
+
+---
+
+## 10. Environment Configuration
+
+```env
+ANTHROPIC_BASE_URL=https://api.minimax.chat/v1
+ANTHROPIC_API_KEY=your-api-key-here
+```
+
+### Runtime Dependencies
+
+```
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+langchain>=0.1.0
+langchain-anthropic>=0.1.0
+pydantic>=2.0
+pydantic-settings>=2.0
+python-multipart>=0.0.6
+```

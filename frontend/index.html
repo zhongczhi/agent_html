@@ -15,6 +15,96 @@
             background: #f5f5f5;
             height: 100vh;
             display: flex;
+        }
+        .sidebar {
+            width: 280px;
+            background: #1a1a1a;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            transition: margin-left 0.3s;
+        }
+        .sidebar.collapsed {
+            margin-left: -280px;
+        }
+        .sidebar-header {
+            padding: 16px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .new-chat-btn {
+            background: #4a90d9;
+            color: white;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .new-chat-btn:hover {
+            background: #3a7bc8;
+        }
+        .toggle-sidebar {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 20px;
+            cursor: pointer;
+            padding: 4px 8px;
+        }
+        .conversation-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+        .conversation-item {
+            padding: 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 4px;
+        }
+        .conversation-item:hover {
+            background: #333;
+        }
+        .conversation-item.active {
+            background: #4a90d9;
+        }
+        .conversation-item .title {
+            flex: 1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-size: 14px;
+        }
+        .conversation-item .delete-btn {
+            opacity: 0;
+            background: none;
+            border: none;
+            color: #ff6b6b;
+            cursor: pointer;
+            padding: 4px 8px;
+            font-size: 16px;
+        }
+        .conversation-item:hover .delete-btn {
+            opacity: 1;
+        }
+        .conversation-item .streaming-badge {
+            background: #f59e0b;
+            color: white;
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 10px;
+            margin-left: 8px;
+        }
+        .main-content {
+            flex: 1;
+            display: flex;
             flex-direction: column;
         }
         .chat-container {
@@ -33,6 +123,9 @@
             color: white;
             font-size: 18px;
             font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 12px;
         }
         .chat-messages {
             flex: 1;
@@ -122,12 +215,25 @@
     </style>
 </head>
 <body>
-    <div class="chat-container">
-        <div class="chat-header">Chatbot</div>
-        <div class="chat-messages" id="messages"></div>
-        <div class="chat-input-container">
-            <input type="text" class="chat-input" id="messageInput" placeholder="Type your message..." autocomplete="off">
-            <button class="send-button" id="sendButton">Send</button>
+    <div class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <button class="new-chat-btn" id="newChatBtn">+ New Chat</button>
+            <button class="toggle-sidebar" id="toggleSidebar">&#9776;</button>
+        </div>
+        <div class="conversation-list" id="conversationList"></div>
+    </div>
+
+    <div class="main-content">
+        <div class="chat-container">
+            <div class="chat-header">
+                <button class="toggle-sidebar" id="toggleSidebarMain">&#9776;</button>
+                <span>Chatbot</span>
+            </div>
+            <div class="chat-messages" id="messages"></div>
+            <div class="chat-input-container">
+                <input type="text" class="chat-input" id="messageInput" placeholder="Type your message..." autocomplete="off">
+                <button class="send-button" id="sendButton">Send</button>
+            </div>
         </div>
     </div>
 
@@ -135,8 +241,290 @@
         const messagesContainer = document.getElementById('messages');
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
+        const sidebar = document.getElementById('sidebar');
+        const conversationList = document.getElementById('conversationList');
+        const newChatBtn = document.getElementById('newChatBtn');
+        const toggleSidebar = document.getElementById('toggleSidebar');
+        const toggleSidebarMain = document.getElementById('toggleSidebarMain');
 
-        let conversationId = null;
+        let currentConversationId = localStorage.getItem('currentConversationId');
+        let conversations = {};
+        let isStreaming = false;
+        let currentEventSource = null;
+
+        // Initialize
+        async function init() {
+            await loadConversationList();
+            if (currentConversationId) {
+                await loadConversation(currentConversationId);
+                await checkStreamStatus();
+            }
+        }
+
+        // Load conversation list
+        async function loadConversationList() {
+            try {
+                const response = await fetch('/api/chat/conversations');
+                const data = await response.json();
+                conversations = {};
+                conversationList.innerHTML = '';
+
+                for (const conv of data.conversations) {
+                    conversations[conv.conversation_id] = conv;
+                    addConversationToList(conv);
+                }
+            } catch (error) {
+                console.error('Failed to load conversations:', error);
+            }
+        }
+
+        // Add conversation to sidebar list
+        function addConversationToList(conv) {
+            const div = document.createElement('div');
+            div.className = 'conversation-item' + (conv.conversation_id === currentConversationId ? ' active' : '');
+            div.dataset.id = conv.conversation_id;
+
+            const titleSpan = document.createElement('span');
+            titleSpan.className = 'title';
+            titleSpan.textContent = conv.title || 'New conversation';
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'delete-btn';
+            deleteBtn.textContent = '×';
+            deleteBtn.onclick = (e) => {
+                e.stopPropagation();
+                deleteConversation(conv.conversation_id);
+            };
+
+            div.appendChild(titleSpan);
+            div.appendChild(deleteBtn);
+            div.onclick = () => switchConversation(conv.conversation_id);
+
+            conversationList.appendChild(div);
+        }
+
+        // Switch to a conversation
+        async function switchConversation(convId) {
+            if (convId === currentConversationId) return;
+
+            // Close current stream if any
+            if (currentEventSource) {
+                currentEventSource.close();
+                currentEventSource = null;
+            }
+
+            currentConversationId = convId;
+            localStorage.setItem('currentConversationId', convId);
+
+            // Update active state in list
+            document.querySelectorAll('.conversation-item').forEach(el => {
+                el.classList.toggle('active', el.dataset.id === convId);
+            });
+
+            await loadConversation(convId);
+            await checkStreamStatus();
+        }
+
+        // Load conversation history
+        async function loadConversation(convId) {
+            try {
+                const response = await fetch(`/api/chat/history/${convId}`);
+                const data = await response.json();
+
+                messagesContainer.innerHTML = '';
+                for (const msg of data.messages) {
+                    addMessage(msg.role, msg.content);
+                }
+            } catch (error) {
+                console.error('Failed to load conversation:', error);
+            }
+        }
+
+        // Check stream status and resume if needed
+        async function checkStreamStatus() {
+            if (!currentConversationId) return;
+
+            try {
+                const response = await fetch(`/api/chat/stream/status/${currentConversationId}`);
+                const status = await response.json();
+
+                if (status.streaming) {
+                    // Show streaming indicator
+                    showStreamingBadge(true);
+                    // Resume stream
+                    await resumeStream();
+                } else if (status.partial_content && !status.is_complete) {
+                    // Partial content but not streaming - might need resume
+                    // This is handled by the resume logic on send
+                }
+            } catch (error) {
+                console.error('Failed to check stream status:', error);
+            }
+        }
+
+        // Show/hide streaming badge on conversation item
+        function showStreamingBadge(show) {
+            const activeItem = document.querySelector(`.conversation-item[data-id="${currentConversationId}"]`);
+            if (!activeItem) return;
+
+            let badge = activeItem.querySelector('.streaming-badge');
+            if (show && !badge) {
+                badge = document.createElement('span');
+                badge.className = 'streaming-badge';
+                badge.textContent = 'Streaming';
+                activeItem.appendChild(badge);
+            } else if (!show && badge) {
+                badge.remove();
+            }
+        }
+
+        // Resume stream for current conversation
+        async function resumeStream() {
+            if (isStreaming || !currentConversationId) return;
+
+            isStreaming = true;
+            showLoading();
+            showStreamingBadge(true);
+
+            try {
+                const response = await fetch(`/api/chat/stream/resume/${currentConversationId}`);
+                await processStreamResponse(response, true);
+            } catch (error) {
+                console.error('Stream error:', error);
+                removeLoading();
+                showStreamingBadge(false);
+            }
+
+            isStreaming = false;
+            showStreamingBadge(false);
+        }
+
+        // Start new chat
+        async function startNewChat() {
+            if (currentEventSource) {
+                currentEventSource.close();
+                currentEventSource = null;
+            }
+
+            currentConversationId = null;
+            localStorage.removeItem('currentConversationId');
+            messagesContainer.innerHTML = '';
+            document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
+            messageInput.focus();
+        }
+
+        // Delete conversation
+        async function deleteConversation(convId) {
+            if (!confirm('Delete this conversation?')) return;
+
+            try {
+                await fetch(`/api/chat/conversation/${convId}`, { method: 'DELETE' });
+
+                delete conversations[convId];
+                const item = document.querySelector(`.conversation-item[data-id="${convId}"]`);
+                if (item) item.remove();
+
+                if (convId === currentConversationId) {
+                    await startNewChat();
+                }
+            } catch (error) {
+                console.error('Failed to delete conversation:', error);
+            }
+        }
+
+        // Send message
+        async function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message || isStreaming) return;
+
+            messageInput.value = '';
+            sendButton.disabled = true;
+
+            addMessage('user', message);
+            showLoading();
+
+            if (!currentConversationId) {
+                // Create new conversation from first message
+                currentConversationId = crypto.randomUUID();
+                localStorage.setItem('currentConversationId', currentConversationId);
+            }
+
+            isStreaming = true;
+            showStreamingBadge(true);
+
+            try {
+                const response = await fetch('/api/chat/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message,
+                        conversation_id: currentConversationId
+                    })
+                });
+
+                removeLoading();
+
+                if (!response.ok) {
+                    throw new Error('Failed to get response');
+                }
+
+                // Refresh conversation list immediately after sending (conversation is saved on backend before streaming starts)
+                await loadConversationList();
+
+                await processStreamResponse(response, false);
+
+            } catch (error) {
+                removeLoading();
+                addMessage('assistant', 'Sorry, an error occurred. Please try again.');
+                console.error('Error:', error);
+            }
+
+            isStreaming = false;
+            showStreamingBadge(false);
+            sendButton.disabled = false;
+            messageInput.focus();
+        }
+
+        // Process SSE stream response
+        async function processStreamResponse(response, isResume) {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let assistantMessage = null;
+            let partialReceived = false;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value);
+                const lines = chunk.split('\n');
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.slice(6));
+
+                            if (data.partial && !partialReceived) {
+                                // First message is partial content from resume
+                                partialReceived = true;
+                                assistantMessage = addMessage('assistant', data.partial);
+                            } else if (data.token === null) {
+                                // End of stream
+                                break;
+                            } else if (data.token) {
+                                if (!assistantMessage) {
+                                    assistantMessage = addMessage('assistant', '');
+                                }
+                                assistantMessage.textContent += data.token;
+                                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                            }
+                        } catch (e) {
+                            // Ignore parse errors for incomplete chunks
+                        }
+                    }
+                }
+            }
+        }
 
         function addMessage(role, content) {
             const messageDiv = document.createElement('div');
@@ -161,74 +549,17 @@
             if (loading) loading.remove();
         }
 
-        async function sendMessage() {
-            const message = messageInput.value.trim();
-            if (!message) return;
-
-            messageInput.value = '';
-            sendButton.disabled = true;
-
-            addMessage('user', message);
-            showLoading();
-
-            try {
-                const response = await fetch('/api/chat/stream', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message, conversation_id: conversationId })
-                });
-
-                removeLoading();
-
-                if (!response.ok) {
-                    throw new Error('Failed to get response');
-                }
-
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let assistantMessage = null;
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    const chunk = decoder.decode(value);
-                    const lines = chunk.split('\n');
-
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const data = JSON.parse(line.slice(6));
-                                if (data.token === null) {
-                                    break;
-                                }
-                                if (data.token) {
-                                    if (!assistantMessage) {
-                                        assistantMessage = addMessage('assistant', '');
-                                    }
-                                    assistantMessage.textContent += data.token;
-                                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                                }
-                            } catch (e) {
-                                // Ignore parse errors for incomplete chunks
-                            }
-                        }
-                    }
-                }
-            } catch (error) {
-                removeLoading();
-                addMessage('assistant', 'Sorry, an error occurred. Please try again.');
-                console.error('Error:', error);
-            }
-
-            sendButton.disabled = false;
-            messageInput.focus();
-        }
-
+        // Event listeners
         sendButton.addEventListener('click', sendMessage);
         messageInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') sendMessage();
         });
+        newChatBtn.addEventListener('click', startNewChat);
+        toggleSidebar.addEventListener('click', () => sidebar.classList.toggle('collapsed'));
+        toggleSidebarMain.addEventListener('click', () => sidebar.classList.toggle('collapsed'));
+
+        // Initialize
+        init();
     </script>
 </body>
 </html>

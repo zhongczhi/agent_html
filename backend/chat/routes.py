@@ -1,14 +1,15 @@
-# backend/chat/routes.py
 import json
 import logging
-from typing import AsyncGenerator
+from typing import AsyncGenerator, List, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
 from backend.chat.chain import create_chain
 from backend.chat.service import ChatService
+from backend.chat.stream_manager import get_job, clear_job, get_or_create_job
+from backend.storage import file_storage
 
 logger = logging.getLogger(__name__)
 
@@ -28,20 +29,76 @@ class ChatHistoryResponse(BaseModel):
     messages: list
 
 
-async def generate_stream(message: str, conversation_id: str | None = None) -> AsyncGenerator[str, None]:
-    full_response = []
+class ConversationSummary(BaseModel):
+    conversation_id: str
+    title: str
+    message_count: int
+    updated_at: str | None
 
-    async for token in chat_service.generate(message, conversation_id):
-        full_response.append(token)
-        yield f"data: {json.dumps({'token': token})}\n\n"
+
+class ConversationListResponse(BaseModel):
+    conversations: List[ConversationSummary]
+
+
+class DeleteResponse(BaseModel):
+    deleted: bool
+
+
+class StreamStatusResponse(BaseModel):
+    streaming: bool
+    status: str
+    tokens_count: int
+    is_complete: bool
+    partial_content: Optional[str] = None
+
+
+async def generate_stream(
+    message: str,
+    conversation_id: str | None = None,
+    resume: bool = False
+) -> AsyncGenerator[str, None]:
+    # For resume, get existing job
+    job = get_job(conversation_id) if resume else get_or_create_job(conversation_id, [])
+
+    if not resume:
+        # Normal start: generate new
+        async for token in chat_service.generate(message, conversation_id, resume=False):
+            yield f"data: {json.dumps({'token': token})}\n\n"
+    else:
+        # Resume: send existing tokens first, then continue if active
+        if job and job.tokens:
+            full_content = job.get_full_content()
+            yield f"data: {json.dumps({'partial': full_content})}\n\n"
+
+        if job and job.status == "active":
+            # Continue streaming - generate new tokens from current position
+            async for token in chat_service.generate(message, conversation_id, resume=True):
+                yield f"data: {json.dumps({'token': token})}\n\n"
 
     yield f"data: {json.dumps({'token': None})}\n\n"
 
 
 @router.post("/stream")
 async def stream_chat(request: ChatRequest):
+    conversation_id = request.conversation_id
+
+    # Check if there's an active stream for this conversation
+    existing_job = get_job(conversation_id) if conversation_id else None
+
+    if existing_job and existing_job.status == "active":
+        # Resume from existing stream
+        return StreamingResponse(
+            generate_stream(request.message, conversation_id, resume=True),
+            media_type="text/event-stream",
+        )
+
+    # Save user message to storage BEFORE starting stream (so conversation appears in list immediately)
+    if conversation_id:
+        file_storage.append_message(conversation_id, "user", request.message)
+
+    # Start new stream
     return StreamingResponse(
-        generate_stream(request.message, request.conversation_id),
+        generate_stream(request.message, conversation_id, resume=False),
         media_type="text/event-stream",
     )
 
@@ -52,3 +109,55 @@ async def get_chat_history(conversation_id: str):
     if history is None:
         return ChatHistoryResponse(conversation_id=conversation_id, messages=[])
     return ChatHistoryResponse(**history)
+
+
+@router.get("/conversations", response_model=ConversationListResponse)
+async def list_conversations():
+    """List all conversations with metadata."""
+    conversations = file_storage.get_conversation_list()
+    return ConversationListResponse(conversations=conversations)
+
+
+@router.delete("/conversation/{conversation_id}", response_model=DeleteResponse)
+async def delete_conversation(conversation_id: str):
+    """Delete a conversation and clear any active stream."""
+    clear_job(conversation_id)
+    deleted = file_storage.delete_conversation(conversation_id)
+    return DeleteResponse(deleted=deleted)
+
+
+@router.get("/stream/resume/{conversation_id}")
+async def resume_stream(conversation_id: str):
+    """
+    Resume a stream for an existing conversation.
+    Returns SSE stream of the existing partial content plus any new tokens.
+    """
+    job = get_job(conversation_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="No stream job found for this conversation")
+
+    return StreamingResponse(
+        generate_stream("", conversation_id, resume=True),
+        media_type="text/event-stream",
+    )
+
+
+@router.get("/stream/status/{conversation_id}", response_model=StreamStatusResponse)
+async def get_stream_status(conversation_id: str):
+    """Check if a conversation has an active or completed stream."""
+    job = get_job(conversation_id)
+    if job is None:
+        return StreamStatusResponse(
+            streaming=False,
+            status="none",
+            tokens_count=0,
+            is_complete=False,
+            partial_content=None
+        )
+    return StreamStatusResponse(
+        streaming=job.status == "active",
+        status=job.status,
+        tokens_count=len(job.tokens),
+        is_complete=job.status == "completed",
+        partial_content=job.get_full_content() if job.tokens else None
+    )

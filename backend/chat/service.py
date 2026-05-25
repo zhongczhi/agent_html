@@ -1,9 +1,9 @@
-# backend/chat/service.py
 import logging
 import uuid
 from typing import AsyncGenerator, Optional
 
 from backend.storage import file_storage
+from backend.chat.stream_manager import get_or_create_job, get_job
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,7 @@ class ChatService:
         self.chain = chain
 
     async def generate(
-        self, message: str, conversation_id: Optional[str] = None
+        self, message: str, conversation_id: Optional[str] = None, resume: bool = False
     ) -> AsyncGenerator[str, None]:
         if conversation_id is None:
             conversation_id = str(uuid.uuid4())
@@ -21,7 +21,12 @@ class ChatService:
         history = file_storage.get_conversation(conversation_id)
         messages = history["messages"] if history else []
 
-        messages.append({"role": "user", "content": message})
+        # Only append user message if not resuming (user message already saved by routes.py for new streams)
+        if not resume:
+            messages.append({"role": "user", "content": message})
+
+        # Get or create stream job for this conversation
+        job = get_or_create_job(conversation_id, messages)
 
         try:
             async for chunk in self.chain.astream(messages):
@@ -33,19 +38,37 @@ class ChatService:
                 elif isinstance(chunk, str):
                     content = chunk
 
-                # Handle LangChain content blocks (list of text/image blocks)
+                # Handle LangChain content blocks
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
-                            yield block.get("text", "")
+                            token = block.get("text", "")
+                            job.append_token(token)
+                            yield token
                 elif isinstance(content, str):
+                    job.append_token(content)
                     yield content
+
         except Exception as e:
             logger.error(f"Error generating response: {e}")
+            job.mark_failed(str(e))
             raise
 
-        messages.append({"role": "assistant", "content": ""})
+        # Mark completed and save to storage
+        job.mark_completed()
+        messages.append({"role": "assistant", "content": job.get_full_content()})
         file_storage.save_conversation(conversation_id, messages)
 
     def get_history(self, conversation_id: str) -> Optional[dict]:
         return file_storage.get_conversation(conversation_id)
+
+    def get_stream_status(self, conversation_id: str) -> dict:
+        job = get_job(conversation_id)
+        if job is None:
+            return {"streaming": False, "status": "none", "tokens_count": 0, "is_complete": False}
+        return {
+            "streaming": job.status == "active",
+            "status": job.status,
+            "tokens_count": len(job.tokens),
+            "is_complete": job.status == "completed"
+        }

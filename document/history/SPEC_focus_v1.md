@@ -51,7 +51,6 @@ project/
 │   ├── __init__.py
 │   ├── conftest.py             # Pytest fixtures
 │   ├── test_chat_service.py    # Chat service unit tests
-│   ├── test_chat_chain.py      # LangChain chain tests
 │   └── test_storage.py          # Storage layer tests
 └── SPEC.md                     # This file
 ```

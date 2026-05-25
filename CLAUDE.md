@@ -69,9 +69,9 @@ idea → SPEC.md → DESI.md → implementation → testing → assessment → m
 
 | File | Purpose |
 |------|---------|
-| `SPEC.md` | Full project specification (all features, past and future) |
+| `SPEC.md` | Full project specification (all features, past and future, explains what the system does) |
 | `SPEC_focus.md` | Current iteration's spec (active working document) |
-| `DESI.md` | Full project detailed design (all decisions) |
+| `DESI.md` | Full project detailed design (all decisions, explains how the system implements it) |
 | `DESI_focus.md` | Current iteration's design (active working document) |
 
 ### Iteration Process
@@ -81,9 +81,10 @@ idea → SPEC.md → DESI.md → implementation → testing → assessment → m
 3. **Test**: Verify implementation against `_focus.md` specifications
 4. **Full Test**: Run full test suite to ensure existing functionality is not broken
 5. **Merge**: On success, merge `_focus.md` changes into main `SPEC.md`/`DESI.md`
-6. **Archive**: Rename completed `_focus.md` as `SPEC_focus_v{N}.md` / `DESI_focus_v{N}.md` and move to `./document/history`
-7. **Reset**: Create fresh `_focus.md` files for next iteration
+6. **Archive**: Rename completed `_focus.md` as `SPEC_focus_v{N}.md` / `DESI_focus_v{N}.md` and move to `./document/history`, delete the old files.
 
 ### Key Principle
 
-The `_focus.md` files are the **working documents** during an development iteration. The main `SPEC.md`/`DESI.md` files represent the "done" state. This separation prevents distraction from future backlog items during active development.
+- ALWAYS ask the user to determine whether to proceed to the next step.
+
+- The `_focus.md` files are the **working documents** during an development iteration. The main `SPEC.md`/`DESI.md` files represent the "done" state. This separation prevents distraction from future backlog items during active development.

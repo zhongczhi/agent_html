@@ -7,7 +7,8 @@
       "Bash(pytest ../tests/ -v)",
       "Bash(python -c ' *)",
       "Bash(pip show *)",
-      "Bash(pytest tests/ -v)"
+      "Bash(pytest tests/ -v)",
+      "Bash(python -m pytest ../tests/test_stream_manager.py -v)"
     ]
   }
 }

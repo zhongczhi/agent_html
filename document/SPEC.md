@@ -1,66 +1,95 @@
-# Chatbot Project Specification
+# Chatbot Project - Requirements Specification
 
-## Context
+## Overview
 
-Building a modular, extensible chatbot application from scratch. Initial version: users type questions, chatbot generates answers via streaming. Future additions: RAG, file uploads, conversation memory persistence. Architecture priority: clear, modular, easy to add new features, scalable.
+A modular chatbot application that provides streaming AI responses with conversation history persistence. Users type questions and receive real-time streaming answers from an LLM. The system supports multiple conversations and persists history across sessions.
 
-## Architecture
+**Core Goal:** Deliver a chat interface with real-time streaming responses and persistent conversation history.
 
-```
-┌─────────────┐     SSE/HTTP      ┌─────────────────┐
-│   Frontend  │ ◄───────────────► │   FastAPI       │
-│  (Plain     │                   │   Backend       │
-│   HTML/JS)  │                   │   (LangChain)   │
-└─────────────┘                   └────────┬────────┘
-                                           │
-┌──────────────────────────────────────────┼──────────────────────────────────────────┐
-│                                          │                                           │
-│              ┌───────────────┐          │          ┌───────────────┐                │
-│              │  chat domain  │          │          │ storage domain │               │
-│              └───────────────┘          │          └───────────────┘                │
-└─────────────────────────────────────────┘
-```
+---
 
-- **Frontend:** Plain HTML/JS (no framework), served by FastAPI at `/`
-- **Backend:** Python + FastAPI + LangChain
-- **LLM:** Anthropic Claude via MiniMax endpoint
-- **Storage:** JSON files (future: PostgreSQL)
+## Functional Requirements
 
-## Project Structure
+### FR-1: Chat Streaming
 
-```
-project/
-├── backend/
-│   ├── __init__.py
-│   ├── main.py                 # FastAPI app, serves frontend + API
-│   ├── config.py               # Typed settings from env vars
-│   ├── chat/
-│   │   ├── __init__.py
-│   │   ├── routes.py           # /api/chat/stream endpoint
-│   │   ├── chain.py            # LangChain LCEL chain definition
-│   │   └── service.py          # Chat business logic
-│   └── storage/
-│       ├── __init__.py
-│       └── file_storage.py     # JSON file read/write
-├── frontend/
-│   └── index.html              # Chat UI with streaming JS
-├── .env                        # Secrets (gitignored)
-├── .env.example                # Template for .env
-├── requirements.txt            # Python dependencies
-├── tests/                      # Test module
-│   ├── __init__.py
-│   ├── conftest.py             # Pytest fixtures
-│   ├── test_chat_service.py    # Chat service unit tests
-│   ├── test_chat_chain.py      # LangChain chain tests
-│   └── test_storage.py          # Storage layer tests
-└── SPEC.md                     # This file
-```
+| ID | Requirement |
+|----|-------------|
+| FR-1.1 | Users can send a text message to the chatbot |
+| FR-1.2 | The chatbot streams AI response tokens in real-time as they are generated |
+| FR-1.3 | Streaming completes with an end signal (`token: null`) |
+| FR-1.4 | Users can initiate a new conversation when no `conversation_id` is provided |
 
-## API Endpoints
+### FR-2: Conversation History
 
-### `POST /api/chat/stream`
+| ID | Requirement |
+|----|-------------|
+| FR-2.1 | Each conversation is identified by a unique `conversation_id` (UUID) |
+| FR-2.2 | User and assistant messages are stored with role and content |
+| FR-2.3 | Users can retrieve the full message history of any conversation |
+| FR-2.4 | Unknown conversation IDs return an empty messages array |
 
-Stream chat responses as SSE.
+### FR-3: Multi-Conversation Support
+
+| ID | Requirement |
+|----|-------------|
+| FR-3.1 | Users can create new conversations at any time |
+| FR-3.2 | Users can switch between existing conversations |
+| FR-3.3 | Conversation list shows title (first message preview) and last updated time |
+
+### FR-4: Frontend Chat Interface
+
+| ID | Requirement |
+|----|-------------|
+| FR-4.1 | Display a text input for composing messages |
+| FR-4.2 | Submit messages via Enter key or button click |
+| FR-4.3 | Display conversation history with user/assistant message distinction |
+| FR-4.4 | Show loading indicator ("Thinking...") during streaming |
+| FR-4.5 | Display error message on fetch failure |
+| FR-4.6 | Maintain `conversation_id` across messages in a session |
+
+---
+
+## Non-Functional Requirements
+
+### NFR-1: Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ANTHROPIC_BASE_URL` | `https://api.minimax.chat/v1` | LLM API base URL |
+| `ANTHROPIC_API_KEY` | `""` | API key for authentication |
+
+### NFR-2: Performance
+
+- Streaming latency: tokens delivered as generated, not batched
+- Model: `minimax-2.7-highspeed`
+- Max tokens per response: 4096
+
+### NFR-3: Reliability
+
+- Invalid JSON in storage file returns empty dict with warning log
+- LLM generation errors are logged
+- Storage directory auto-created if missing
+
+### NFR-4: Security
+
+- No authentication for initial version
+- API key stored in environment variables, not in code
+
+---
+
+## Interface Requirements
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/chat/stream` | Send message, receive streaming response |
+| `GET` | `/api/chat/history/{conversation_id}` | Get conversation history |
+| `GET` | `/api/chat/conversations` | List all conversations |
+| `DELETE` | `/api/chat/conversation/{conversation_id}` | Delete a conversation |
+| `GET` | `/api/chat/stream/status/{conversation_id}` | Check stream status |
+
+### POST /api/chat/stream
 
 **Request:**
 ```json
@@ -77,9 +106,7 @@ data: {"token": "!"}
 data: {"token": null}
 ```
 
-### `GET /api/chat/history/{conversation_id}`
-
-Retrieve conversation history.
+### GET /api/chat/history/{conversation_id}
 
 **Response:**
 ```json
@@ -92,34 +119,85 @@ Retrieve conversation history.
 }
 ```
 
-## Environment Variables
+### GET /api/chat/conversations
 
-```env
-ANTHROPIC_BASE_URL=https://api.minimax.chat/v1
-ANTHROPIC_API_KEY=your-api-key-here
+**Response:**
+```json
+{
+  "conversations": [
+    {
+      "conversation_id": "uuid",
+      "title": "First 50 chars of first message...",
+      "message_count": 5,
+      "updated_at": "ISO"
+    }
+  ]
+}
 ```
 
-## Dependencies
+### GET /api/chat/stream/status/{conversation_id}
 
-```
-# runtime
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-langchain>=0.1.0
-langchain-anthropic>=0.1.0
-pydantic>=2.0
-pydantic-settings>=2.0
-python-multipart>=0.0.6
-
-# dev (tests)
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
-httpx>=0.25.0
+**Response:**
+```json
+{
+  "streaming": true,
+  "status": "active",
+  "tokens_count": 42,
+  "is_complete": false,
+  "partial_content": "Hello, I'm..."
+}
 ```
 
-## Future Extensibility
+### DELETE /api/chat/conversation/{conversation_id}
 
-- **RAG:** Create `backend/rag/` domain, integrate into `chat/chain.py`
-- **File upload:** Create `backend/files/` domain
-- **Auth:** Create `backend/auth/` domain with FastAPI dependency
-- **PostgreSQL:** Replace JSON storage with database
+**Response:**
+```json
+{ "deleted": true }
+```
+
+---
+
+## Data Requirements
+
+### Conversation Storage Schema
+
+```json
+{
+  "conversations": {
+    "uuid-1": {
+      "conversation_id": "uuid-1",
+      "messages": [
+        {"role": "user"|"assistant", "content": "..."}
+      ],
+      "created_at": "ISO",
+      "updated_at": "ISO"
+    }
+  }
+}
+```
+
+### Stream Status Schema
+
+```json
+{
+  "streaming": "boolean",
+  "status": "active|completed|failed",
+  "tokens_count": "integer",
+  "is_complete": "boolean",
+  "partial_content": "string",
+  "error": "string|null"
+}
+```
+
+---
+
+## Out of Scope (Future)
+
+- RAG (Retrieval-Augmented Generation)
+- File upload
+- Authentication / API key management
+- PostgreSQL storage (current: JSON file)
+- Conversation memory buffer
+- Cross-browser tab synchronization
+- Conversation search/filter
+- Stream backpressure handling
