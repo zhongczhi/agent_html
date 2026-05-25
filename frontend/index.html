@@ -135,11 +135,35 @@
             flex-direction: column;
             gap: 16px;
         }
+        /* Empty state - centered input */
+        .chat-messages.empty {
+            justify-content: center;
+            align-items: center;
+        }
+        .chat-messages:not(.empty) {
+            justify-content: flex-start;
+        }
         .message {
             max-width: 80%;
             padding: 12px 16px;
             border-radius: 12px;
             line-height: 1.5;
+            max-height: 400px;
+            overflow-y: auto;
+            /* Scrollbar auto-hide */
+            scrollbar-width: none; /* Firefox */
+            -ms-overflow-style: none;  /* IE/Edge */
+        }
+        /* Scrollbar visible class - applied on wheel */
+        .message::-webkit-scrollbar {
+            display: none;
+        }
+        .message.scrollbar-visible::-webkit-scrollbar {
+            display: block;
+        }
+        .message.scrollbar-visible {
+            scrollbar-width: auto; /* Firefox */
+            -ms-overflow-style: auto; /* IE/Edge */
         }
         .message.user {
             align-self: flex-end;
@@ -153,12 +177,75 @@
             color: #333;
             border-bottom-left-radius: 4px;
         }
+        /* Thinking section */
+        .thinking-section {
+            margin-bottom: 8px;
+            padding: 8px;
+            background: rgba(0,0,0,0.05);
+            border-radius: 8px;
+            font-size: 13px;
+            color: #666;
+        }
+        .thinking-content {
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .thinking-collapsed .thinking-content {
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        .thinking-toggle {
+            background: none;
+            border: none;
+            color: #4a90d9;
+            font-size: 12px;
+            cursor: pointer;
+            padding: 4px 0;
+            margin-top: 4px;
+        }
+        .thinking-toggle:hover {
+            text-decoration: underline;
+        }
+        /* Message content - markdown */
+        .message-content {
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .message-content code {
+            background: rgba(0,0,0,0.08);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Consolas', monospace;
+            font-size: 13px;
+        }
+        .message-content pre {
+            background: #1a1a1a;
+            color: #f5f5f5;
+            padding: 12px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 8px 0;
+        }
+        .message-content pre code {
+            background: none;
+            padding: 0;
+            color: inherit;
+        }
+        .message-content a {
+            color: #4a90d9;
+        }
+        .message-content ul, .message-content ol {
+            margin-left: 20px;
+        }
         .chat-input-container {
             padding: 20px;
             border-top: 1px solid #eee;
             display: flex;
             gap: 12px;
         }
+        /* Change input to textarea for auto-expand */
         .chat-input {
             flex: 1;
             padding: 12px 16px;
@@ -166,6 +253,13 @@
             border-radius: 24px;
             font-size: 14px;
             outline: none;
+            font-family: inherit;
+            field-sizing: content; /* Chrome 123+, Firefox 129+ */
+            min-height: 120px; /* ~5 lines */
+            max-height: 50vh;
+            overflow-y: auto;
+            resize: none;
+            line-height: 1.5;
         }
         .chat-input:focus {
             border-color: #4a90d9;
@@ -180,6 +274,7 @@
             font-weight: 600;
             cursor: pointer;
             transition: background 0.2s;
+            align-self: flex-end;
         }
         .send-button:hover {
             background: #3a7bc8;
@@ -213,6 +308,7 @@
             40% { transform: scale(1); }
         }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
     <div class="sidebar" id="sidebar">
@@ -231,7 +327,7 @@
             </div>
             <div class="chat-messages" id="messages"></div>
             <div class="chat-input-container">
-                <input type="text" class="chat-input" id="messageInput" placeholder="Type your message..." autocomplete="off">
+                <textarea class="chat-input" id="messageInput" placeholder="Type your message..." rows="1"></textarea>
                 <button class="send-button" id="sendButton">Send</button>
             </div>
         </div>
@@ -258,6 +354,9 @@
             if (currentConversationId) {
                 await loadConversation(currentConversationId);
                 await checkStreamStatus();
+            } else {
+                // No conversation - show empty state
+                messagesContainer.classList.add('empty');
             }
         }
 
@@ -332,8 +431,29 @@
                 const data = await response.json();
 
                 messagesContainer.innerHTML = '';
+
                 for (const msg of data.messages) {
-                    addMessage(msg.role, msg.content);
+                    if (msg.role === 'assistant') {
+                        const messageDiv = addMessage(msg.role, msg.content || '');
+
+                        // If there's thinking content, add it
+                        if (msg.thinking) {
+                            const thinkingSection = messageDiv.querySelector('.thinking-section');
+                            const thinkingContent = messageDiv.querySelector('.thinking-content');
+                            if (thinkingContent) {
+                                thinkingContent.textContent = msg.thinking;
+                                updateThinkingDisplay(messageDiv);
+                            }
+                        }
+
+                        // Render markdown for content
+                        const contentDiv = messageDiv.querySelector('.message-content');
+                        if (contentDiv && contentDiv.textContent) {
+                            contentDiv.innerHTML = marked.parse(contentDiv.textContent);
+                        }
+                    } else {
+                        addMessage(msg.role, msg.content);
+                    }
                 }
             } catch (error) {
                 console.error('Failed to load conversation:', error);
@@ -409,6 +529,7 @@
             currentConversationId = null;
             localStorage.removeItem('currentConversationId');
             messagesContainer.innerHTML = '';
+            messagesContainer.classList.add('empty');  // Add empty class
             document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
             messageInput.focus();
         }
@@ -438,6 +559,7 @@
             if (!message || isStreaming) return;
 
             messageInput.value = '';
+            messageInput.style.height = '';
             sendButton.disabled = true;
 
             addMessage('user', message);
@@ -491,6 +613,10 @@
             const decoder = new TextDecoder();
             let assistantMessage = null;
             let partialReceived = false;
+            let thinkingContent = '';
+            let thinkingElement = null;
+            let thinkingSection = null;
+            let thinkingComplete = false;
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -504,10 +630,33 @@
                         try {
                             const data = JSON.parse(line.slice(6));
 
-                            if (data.partial && !partialReceived) {
+                            if (data.partial_thinking && !partialReceived) {
+                                // Resume with existing thinking
+                                thinkingContent = data.partial_thinking;
+                            } else if (data.partial && !partialReceived) {
                                 // First message is partial content from resume
                                 partialReceived = true;
                                 assistantMessage = addMessage('assistant', data.partial);
+                                thinkingSection = assistantMessage.querySelector('.thinking-section');
+                                thinkingElement = assistantMessage.querySelector('.thinking-content');
+                            } else if (data.thinking) {
+                                // Accumulate thinking content
+                                if (!assistantMessage) {
+                                    assistantMessage = addMessage('assistant', '');
+                                    thinkingSection = assistantMessage.querySelector('.thinking-section');
+                                    thinkingElement = assistantMessage.querySelector('.thinking-content');
+                                }
+                                thinkingContent += data.thinking;
+                                if (thinkingElement) {
+                                    thinkingElement.textContent = thinkingContent;
+                                    updateThinkingDisplay(assistantMessage);
+                                }
+                            } else if (data.thinking_end) {
+                                thinkingComplete = true;
+                                if (thinkingElement) {
+                                    thinkingElement.textContent = thinkingContent;
+                                    updateThinkingDisplay(assistantMessage);
+                                }
                             } else if (data.token === null) {
                                 // End of stream
                                 break;
@@ -515,8 +664,14 @@
                                 if (!assistantMessage) {
                                     assistantMessage = addMessage('assistant', '');
                                 }
-                                assistantMessage.textContent += data.token;
+                                const contentDiv = assistantMessage.querySelector('.message-content');
+                                if (contentDiv) {
+                                    contentDiv.textContent += data.token;
+                                    // Render markdown
+                                    contentDiv.innerHTML = marked.parse(contentDiv.textContent);
+                                }
                                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                                setupScrollbarAutoHide(assistantMessage);
                             }
                         } catch (e) {
                             // Ignore parse errors for incomplete chunks
@@ -529,10 +684,107 @@
         function addMessage(role, content) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${role}`;
-            messageDiv.textContent = content;
+
+            if (role === 'assistant') {
+                // Create thinking section
+                const thinkingSection = document.createElement('div');
+                thinkingSection.className = 'thinking-section';
+
+                const thinkingContent = document.createElement('div');
+                thinkingContent.className = 'thinking-content';
+                thinkingContent.textContent = '';
+
+                const toggleBtn = document.createElement('button');
+                toggleBtn.className = 'thinking-toggle';
+                toggleBtn.textContent = 'Show more';
+                toggleBtn.style.display = 'none';
+
+                thinkingSection.appendChild(thinkingContent);
+                thinkingSection.appendChild(toggleBtn);
+
+                // Create message content
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-content';
+                contentDiv.textContent = content;
+
+                messageDiv.appendChild(thinkingSection);
+                messageDiv.appendChild(contentDiv);
+            } else {
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-content';
+                contentDiv.textContent = content;
+                messageDiv.appendChild(contentDiv);
+            }
+
             messagesContainer.appendChild(messageDiv);
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+            // Remove empty class when messages exist
+            messagesContainer.classList.remove('empty');
+
+            // Setup scrollbar auto-hide for assistant messages
+            if (role === 'assistant') {
+                setupScrollbarAutoHide(messageDiv);
+            }
+
             return messageDiv;
+        }
+
+        function updateThinkingDisplay(messageElement) {
+            const thinkingSection = messageElement.querySelector('.thinking-section');
+            if (!thinkingSection) return;
+
+            const thinkingContent = thinkingSection.querySelector('.thinking-content');
+            const toggleBtn = thinkingSection.querySelector('.thinking-toggle');
+            if (!thinkingContent || !toggleBtn) return;
+
+            // Check if content exceeds 3 lines
+            const lines = countLines(thinkingContent);
+            const shouldCollapse = lines > 3;
+
+            if (shouldCollapse) {
+                thinkingSection.classList.add('thinking-collapsed');
+                toggleBtn.style.display = 'block';
+                toggleBtn.textContent = 'Show more';
+            } else {
+                thinkingSection.classList.remove('thinking-collapsed');
+                toggleBtn.style.display = 'none';
+            }
+
+            // Setup toggle button handler
+            toggleBtn.onclick = () => {
+                const isCollapsed = thinkingSection.classList.contains('thinking-collapsed');
+                if (isCollapsed) {
+                    thinkingSection.classList.remove('thinking-collapsed');
+                    toggleBtn.textContent = 'Show less';
+                } else {
+                    thinkingSection.classList.add('thinking-collapsed');
+                    toggleBtn.textContent = 'Show more';
+                }
+            };
+        }
+
+        function countLines(element) {
+            const style = window.getComputedStyle(element);
+            const lineHeight = parseFloat(style.lineHeight);
+            const height = element.scrollHeight;
+            return Math.round(height / lineHeight);
+        }
+
+        function setupScrollbarAutoHide(messageElement) {
+            if (!messageElement) return;
+
+            // Check if already has scrollbar (content overflows)
+            const hasOverflow = messageElement.scrollHeight > messageElement.clientHeight;
+            if (!hasOverflow) return;
+
+            messageElement.addEventListener('wheel', function() {
+                this.classList.add('scrollbar-visible');
+                clearTimeout(this._hideTimer);
+                this._hideTimer = setTimeout(() => {
+                    this.classList.remove('scrollbar-visible');
+                }, 3000);
+            }, { passive: true });
         }
 
         function showLoading() {
@@ -551,12 +803,40 @@
 
         // Event listeners
         sendButton.addEventListener('click', sendMessage);
-        messageInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') sendMessage();
+        messageInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+        messageInput.addEventListener('input', function() {
+            // Auto-resize using field-sizing or fallback
+            autoResizeInput(this);
         });
         newChatBtn.addEventListener('click', startNewChat);
         toggleSidebar.addEventListener('click', () => sidebar.classList.toggle('collapsed'));
         toggleSidebarMain.addEventListener('click', () => sidebar.classList.toggle('collapsed'));
+
+        function autoResizeInput(textarea) {
+            // Check if field-sizing is supported
+            if (typeof CSS !== 'undefined' && CSS.supports('field-sizing', 'content')) {
+                // Native support, no action needed
+                return;
+            }
+
+            // Fallback: adjust height based on content
+            const minHeight = 120; // ~5 lines
+            const clone = textarea.cloneNode();
+            clone.style.position = 'absolute';
+            clone.style.visibility = 'hidden';
+            clone.style.width = textarea.offsetWidth + 'px';
+            clone.style.height = 'auto';
+            clone.style.minHeight = '0';
+            document.body.appendChild(clone);
+            const newHeight = Math.max(minHeight, clone.scrollHeight);
+            document.body.removeChild(clone);
+            textarea.style.height = newHeight + 'px';
+        }
 
         // Initialize
         init();
