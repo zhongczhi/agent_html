@@ -8,11 +8,11 @@ def test_generate_yields_thinking_dicts():
     mock_chain = MagicMock()
     service = ChatService(mock_chain)
 
-    # Simulate LLM chunk with reasoning block (NOT thinking - MiniMax uses 'reasoning')
+    # Simulate LLM chunk with thinking block (MiniMax uses 'thinking' type)
     reasoning_chunk = MagicMock()
     reasoning_chunk.content = [
-        {"type": "reasoning", "thinking": "User asks about Python..."},
-        {"type": "reasoning", "thinking": "Let me think..."},
+        {"type": "thinking", "thinking": "User asks about Python..."},
+        {"type": "thinking", "thinking": "Let me think..."},
         {"type": "text", "text": "Python is a programming language."}
     ]
 

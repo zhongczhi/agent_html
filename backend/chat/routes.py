@@ -60,15 +60,17 @@ async def generate_stream(
 ) -> AsyncGenerator[str, None]:
     job = get_job(conversation_id) if resume else get_or_create_job(conversation_id, [])
     thinking_complete = False  # Track when thinking phase ends
+    has_seen_thinking = False  # Track if we've received any thinking content
 
     if not resume:
         async for event in chat_service.generate(message, conversation_id, resume=False):
             if isinstance(event, dict):
                 if "thinking" in event:
                     yield f"data: {json.dumps({'thinking': event['thinking']})}\n\n"
+                    has_seen_thinking = True
                 elif "token" in event:
-                    if not thinking_complete:
-                        # First token - emit thinking_end first
+                    if not thinking_complete and has_seen_thinking:
+                        # Only emit thinking_end if we've seen thinking and now receiving token
                         yield f"data: {json.dumps({'thinking_end': True})}\n\n"
                         thinking_complete = True
                     yield f"data: {json.dumps({'token': event['token']})}\n\n"

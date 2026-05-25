@@ -39,11 +39,11 @@ class ChatService:
 
                 if isinstance(content, list):
                     for block in content:
-                        # Handle reasoning blocks (MiniMax uses 'reasoning' type, not 'thinking')
-                        if block.get("type") == "reasoning":
-                            reasoning_text = block.get("thinking", "")
-                            job.append_thinking(reasoning_text)
-                            yield {"thinking": reasoning_text}
+                        # Handle thinking blocks from LLM
+                        if block.get("type") == "thinking":
+                            thinking_text = block.get("thinking", "")
+                            job.append_thinking(thinking_text)
+                            yield {"thinking": thinking_text}
                         elif block.get("type") == "text":
                             token = block.get("text", "")
                             job.append_token(token)
