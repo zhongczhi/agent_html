@@ -50,6 +50,7 @@ class StreamStatusResponse(BaseModel):
     tokens_count: int
     is_complete: bool
     partial_content: Optional[str] = None
+    partial_thinking: Optional[str] = None
 
 
 async def generate_stream(
@@ -57,23 +58,53 @@ async def generate_stream(
     conversation_id: str | None = None,
     resume: bool = False
 ) -> AsyncGenerator[str, None]:
-    # For resume, get existing job
     job = get_job(conversation_id) if resume else get_or_create_job(conversation_id, [])
+    thinking_complete = False  # Track when thinking phase ends
 
     if not resume:
-        # Normal start: generate new
-        async for token in chat_service.generate(message, conversation_id, resume=False):
-            yield f"data: {json.dumps({'token': token})}\n\n"
+        async for event in chat_service.generate(message, conversation_id, resume=False):
+            if isinstance(event, dict):
+                if "thinking" in event:
+                    yield f"data: {json.dumps({'thinking': event['thinking']})}\n\n"
+                elif "token" in event:
+                    if not thinking_complete:
+                        # First token - emit thinking_end first
+                        yield f"data: {json.dumps({'thinking_end': True})}\n\n"
+                        thinking_complete = True
+                    yield f"data: {json.dumps({'token': event['token']})}\n\n"
+            elif isinstance(event, str):
+                # Legacy: plain string token
+                if not thinking_complete:
+                    yield f"data: {json.dumps({'thinking_end': True})}\n\n"
+                    thinking_complete = True
+                yield f"data: {json.dumps({'token': event})}\n\n"
     else:
-        # Resume: send existing tokens first, then continue if active
+        # Resume: send existing tokens first
         if job and job.tokens:
             full_content = job.get_full_content()
             yield f"data: {json.dumps({'partial': full_content})}\n\n"
+        # Send partial thinking if available
+        if job and hasattr(job, 'get_full_thinking'):
+            thinking = job.get_full_thinking()
+            if thinking:
+                yield f"data: {json.dumps({'partial_thinking': thinking})}\n\n"
+                thinking_complete = True  # Already have thinking, mark complete
 
         if job and job.status == "active":
-            # Continue streaming - generate new tokens from current position
-            async for token in chat_service.generate(message, conversation_id, resume=True):
-                yield f"data: {json.dumps({'token': token})}\n\n"
+            async for event in chat_service.generate(message, conversation_id, resume=True):
+                if isinstance(event, dict):
+                    if "thinking" in event:
+                        yield f"data: {json.dumps({'thinking': event['thinking']})}\n\n"
+                    elif "token" in event:
+                        if not thinking_complete:
+                            yield f"data: {json.dumps({'thinking_end': True})}\n\n"
+                            thinking_complete = True
+                        yield f"data: {json.dumps({'token': event['token']})}\n\n"
+                elif isinstance(event, str):
+                    if not thinking_complete:
+                        yield f"data: {json.dumps({'thinking_end': True})}\n\n"
+                        thinking_complete = True
+                    yield f"data: {json.dumps({'token': event})}\n\n"
 
     yield f"data: {json.dumps({'token': None})}\n\n"
 
@@ -152,12 +183,14 @@ async def get_stream_status(conversation_id: str):
             status="none",
             tokens_count=0,
             is_complete=False,
-            partial_content=None
+            partial_content=None,
+            partial_thinking=None
         )
     return StreamStatusResponse(
         streaming=job.status == "active",
         status=job.status,
         tokens_count=len(job.tokens),
         is_complete=job.status == "completed",
-        partial_content=job.get_full_content() if job.tokens else None
+        partial_content=job.get_full_content() if job.tokens else None,
+        partial_thinking=job.get_full_thinking() if hasattr(job, 'get_full_thinking') else None
     )
