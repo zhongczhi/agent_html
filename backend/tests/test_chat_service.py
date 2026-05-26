@@ -32,12 +32,14 @@ def test_generate_background_stores_thinking_in_job():
 
     asyncio.run(run())
 
-    # Check job has the thinking tokens
+    # Check job has the thinking tokens via chunks
     from backend.chat.stream_manager import get_job
     job = get_job("test-conv-123")
     assert job is not None
-    assert len(job.thinking_tokens) == 2
-    assert job.get_full_thinking() == "User asks about Python...Let me think..."
+    thinking_chunks = [c for c in job.chunks if c["type"] == "thinking"]
+    assert len(thinking_chunks) == 2
+    full_thinking = "".join(c["chunk"] for c in thinking_chunks)
+    assert full_thinking == "User asks about Python...Let me think..."
 
     # Clean up
     clear_job("test-conv-123")
@@ -71,31 +73,33 @@ def test_generate_background_stores_tokens_in_job():
     from backend.chat.stream_manager import get_job
     job = get_job("test-conv-456")
     assert job is not None
-    assert len(job.tokens) == 3
-    assert job.get_full_content() == "Python is great."
+    token_chunks = [c for c in job.chunks if c["type"] == "token"]
+    assert len(token_chunks) == 3
+    full_content = "".join(c["chunk"] for c in token_chunks)
+    assert full_content == "Python is great."
 
     clear_job("test-conv-456")
 
 
-def test_get_stream_status_returns_thinking_count():
-    """Test get_stream_status includes thinking_count."""
+def test_get_stream_status_returns_chunks_count():
+    """Test get_stream_status returns chunks_count and status."""
     mock_chain = MagicMock()
     service = ChatService(mock_chain)
 
     clear_job("test-status")
 
-    # Create a job with some tokens
+    # Create a job with some chunks using the new API
     from backend.chat.stream_manager import get_or_create_job
     job = get_or_create_job("test-status", [])
-    job.append_thinking("thinking 1")
-    job.append_thinking("thinking 2")
-    job.append_token("token 1")
+    job.append_chunk("thinking", "thinking 1")
+    job.append_chunk("thinking", "thinking 2")
+    job.append_chunk("token", "token 1")
 
     status = service.get_stream_status("test-status")
-    assert status["thinking_count"] == 2
-    assert status["tokens_count"] == 1
-    assert status["thinking_pointer"] == 0
-    assert status["pointer"] == 0
+    assert status["chunks_count"] == 3
+    assert status["status"] == "pending"
+    assert status["streaming"] == False
+    assert status["is_complete"] == False
 
     clear_job("test-status")
 
@@ -124,7 +128,9 @@ def test_generate_background_handles_string_content():
     from backend.chat.stream_manager import get_job
     job = get_job("test-string-content")
     assert job is not None
-    assert job.get_full_content() == "Hello world"
+    token_chunks = [c for c in job.chunks if c["type"] == "token"]
+    full_content = "".join(c["chunk"] for c in token_chunks)
+    assert full_content == "Hello world"
 
     clear_job("test-string-content")
 
