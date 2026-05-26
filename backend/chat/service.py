@@ -77,18 +77,12 @@ class ChatService:
             return {
                 "streaming": False,
                 "status": "none",
-                "tokens_count": 0,
-                "thinking_count": 0,
-                "is_complete": False,
-                "pointer": 0,
-                "thinking_pointer": 0
+                "chunks_count": 0,
+                "is_complete": False
             }
         return {
             "streaming": job.status == "active",
             "status": job.status,
-            "tokens_count": len(job.tokens),
-            "thinking_count": len(job.thinking_tokens),
-            "is_complete": job.status == "completed",
-            "pointer": job.sent_pointer,
-            "thinking_pointer": job.thinking_sent_pointer
+            "chunks_count": len(job.chunks),
+            "is_complete": job.status == "completed"
         }
