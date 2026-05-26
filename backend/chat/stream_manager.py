@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
-from typing import AsyncGenerator, Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 
 class StreamJob:
@@ -35,30 +35,6 @@ class StreamJob:
         self.error = error
         self.chunk_queue.put_nowait(None)
         self.updated_at = datetime.now(timezone.utc)
-
-    async def stream_tokens(self, from_position: int = 0) -> AsyncGenerator[str, None]:
-        """Async generator that yields tokens from queue after from_position."""
-        # First, yield accumulated tokens after from_position
-        if from_position < len(self.tokens):
-            yield "".join(self.tokens[from_position:])
-
-        # Then wait for new tokens from queue
-        while True:
-            token = await self.token_queue.get()
-            if token is None:
-                break
-            yield token
-
-    async def stream_thinking(self, from_position: int = 0) -> AsyncGenerator[str, None]:
-        """Async generator for thinking tokens."""
-        if from_position < len(self.thinking_tokens):
-            yield "".join(self.thinking_tokens[from_position:])
-
-        while True:
-            token = await self.thinking_queue.get()
-            if token is None:
-                break
-            yield token
 
 
 STREAM_REGISTRY: Dict[str, StreamJob] = {}
