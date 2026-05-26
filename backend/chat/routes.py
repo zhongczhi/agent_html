@@ -1,8 +1,9 @@
+import asyncio
 import json
-import logging
-from typing import AsyncGenerator, List, Optional
+import uuid
+from typing import AsyncGenerator
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
@@ -11,10 +12,7 @@ from backend.chat.service import ChatService
 from backend.chat.stream_manager import get_job, clear_job, get_or_create_job
 from backend.storage import file_storage
 
-logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api/chat", tags=["chat"])
-
 chain = create_chain()
 chat_service = ChatService(chain)
 
@@ -37,7 +35,7 @@ class ConversationSummary(BaseModel):
 
 
 class ConversationListResponse(BaseModel):
-    conversations: List[ConversationSummary]
+    conversations: list[ConversationSummary]
 
 
 class DeleteResponse(BaseModel):
@@ -47,92 +45,94 @@ class DeleteResponse(BaseModel):
 class StreamStatusResponse(BaseModel):
     streaming: bool
     status: str
-    tokens_count: int
+    chunks_count: int
     is_complete: bool
-    partial_content: Optional[str] = None
-    partial_thinking: Optional[str] = None
+    partial_content: str | None = None
 
 
-async def generate_stream(
-    message: str,
-    conversation_id: str | None = None,
-    resume: bool = False
+async def stream_from_job(
+    job,
+    from_pointer: int = 0
 ) -> AsyncGenerator[str, None]:
-    job = get_job(conversation_id) if resume else get_or_create_job(conversation_id, [])
-    thinking_complete = False  # Track when thinking phase ends
-    has_seen_thinking = False  # Track if we've received any thinking content
+    """Read chunks from StreamJob and yield SSE events.
+    from_pointer is provided by frontend to resume from a specific position.
+    Backend does NOT track sent_pointer.
+    """
+    # Yield accumulated chunks from from_pointer position
+    if from_pointer < len(job.chunks):
+        for chunk in job.chunks[from_pointer:]:
+            yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type']})}\n\n"
 
-    if not resume:
-        async for event in chat_service.generate(message, conversation_id, resume=False):
-            if isinstance(event, dict):
-                if "thinking" in event:
-                    yield f"data: {json.dumps({'thinking': event['thinking']})}\n\n"
-                    has_seen_thinking = True
-                elif "token" in event:
-                    if not thinking_complete and has_seen_thinking:
-                        # Only emit thinking_end if we've seen thinking and now receiving token
-                        yield f"data: {json.dumps({'thinking_end': True})}\n\n"
-                        thinking_complete = True
-                    yield f"data: {json.dumps({'token': event['token']})}\n\n"
-            elif isinstance(event, str):
-                # Legacy: plain string token
-                if not thinking_complete:
-                    yield f"data: {json.dumps({'thinking_end': True})}\n\n"
-                    thinking_complete = True
-                yield f"data: {json.dumps({'token': event})}\n\n"
-    else:
-        # Resume: send existing tokens first
-        if job and job.tokens:
-            full_content = job.get_full_content()
-            yield f"data: {json.dumps({'partial': full_content})}\n\n"
-        # Send partial thinking if available
-        if job and hasattr(job, 'get_full_thinking'):
-            thinking = job.get_full_thinking()
-            if thinking:
-                yield f"data: {json.dumps({'partial_thinking': thinking})}\n\n"
-                thinking_complete = True  # Already have thinking, mark complete
-
-        if job and job.status == "active":
-            async for event in chat_service.generate(message, conversation_id, resume=True):
-                if isinstance(event, dict):
-                    if "thinking" in event:
-                        yield f"data: {json.dumps({'thinking': event['thinking']})}\n\n"
-                    elif "token" in event:
-                        if not thinking_complete:
-                            yield f"data: {json.dumps({'thinking_end': True})}\n\n"
-                            thinking_complete = True
-                        yield f"data: {json.dumps({'token': event['token']})}\n\n"
-                elif isinstance(event, str):
-                    if not thinking_complete:
-                        yield f"data: {json.dumps({'thinking_end': True})}\n\n"
-                        thinking_complete = True
-                    yield f"data: {json.dumps({'token': event})}\n\n"
-
-    yield f"data: {json.dumps({'token': None})}\n\n"
+    # Stream from queue (new chunks being generated)
+    while True:
+        try:
+            chunk = await asyncio.wait_for(job.chunk_queue.get(), timeout=0.5)
+            if chunk is None:
+                yield f"data: {json.dumps({'end': True})}\n\n"
+                break
+            yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type']})}\n\n"
+        except asyncio.TimeoutError:
+            if job.status != "active":
+                break
 
 
 @router.post("/stream")
 async def stream_chat(request: ChatRequest):
     conversation_id = request.conversation_id
 
-    # Check if there's an active stream for this conversation
-    existing_job = get_job(conversation_id) if conversation_id else None
+    if conversation_id is None:
+        conversation_id = str(uuid.uuid4())
 
-    if existing_job and existing_job.status == "active":
-        # Resume from existing stream
-        return StreamingResponse(
-            generate_stream(request.message, conversation_id, resume=True),
-            media_type="text/event-stream",
+    job = get_or_create_job(conversation_id, [])
+
+    # If job is not active, start background task
+    if job.status != "active":
+        job.status = "active"
+        job.tokens = []
+        job.thinking_tokens = []
+        job.sent_pointer = 0
+        job.thinking_sent_pointer = 0
+        asyncio.create_task(
+            chat_service.generate_background(request.message, conversation_id)
         )
 
-    # Save user message to storage BEFORE starting stream (so conversation appears in list immediately)
-    if conversation_id:
-        file_storage.append_message(conversation_id, "user", request.message)
-
-    # Start new stream
     return StreamingResponse(
-        generate_stream(request.message, conversation_id, resume=False),
+        stream_from_job(job),
         media_type="text/event-stream",
+    )
+
+
+@router.get("/stream/{conversation_id}")
+async def stream_resume(
+    conversation_id: str,
+    from_pointer: int = Query(default=0)
+):
+    job = get_job(conversation_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="No stream job found")
+
+    return StreamingResponse(
+        stream_from_job(job, from_pointer=from_pointer),
+        media_type="text/event-stream",
+    )
+
+
+@router.get("/stream/status/{conversation_id}", response_model=StreamStatusResponse)
+async def get_stream_status(conversation_id: str):
+    job = get_job(conversation_id)
+    if job is None:
+        return StreamStatusResponse(
+            streaming=False,
+            status="none",
+            chunks_count=0,
+            is_complete=False,
+        )
+    return StreamStatusResponse(
+        streaming=job.status == "active",
+        status=job.status,
+        chunks_count=len(job.chunks),
+        is_complete=job.status == "completed",
+        partial_content="".join(c["chunk"] for c in job.chunks if c["type"] == "token") if job.chunks else None
     )
 
 
@@ -157,42 +157,3 @@ async def delete_conversation(conversation_id: str):
     clear_job(conversation_id)
     deleted = file_storage.delete_conversation(conversation_id)
     return DeleteResponse(deleted=deleted)
-
-
-@router.get("/stream/resume/{conversation_id}")
-async def resume_stream(conversation_id: str):
-    """
-    Resume a stream for an existing conversation.
-    Returns SSE stream of the existing partial content plus any new tokens.
-    """
-    job = get_job(conversation_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="No stream job found for this conversation")
-
-    return StreamingResponse(
-        generate_stream("", conversation_id, resume=True),
-        media_type="text/event-stream",
-    )
-
-
-@router.get("/stream/status/{conversation_id}", response_model=StreamStatusResponse)
-async def get_stream_status(conversation_id: str):
-    """Check if a conversation has an active or completed stream."""
-    job = get_job(conversation_id)
-    if job is None:
-        return StreamStatusResponse(
-            streaming=False,
-            status="none",
-            tokens_count=0,
-            is_complete=False,
-            partial_content=None,
-            partial_thinking=None
-        )
-    return StreamStatusResponse(
-        streaming=job.status == "active",
-        status=job.status,
-        tokens_count=len(job.tokens),
-        is_complete=job.status == "completed",
-        partial_content=job.get_full_content() if job.tokens else None,
-        partial_thinking=job.get_full_thinking() if hasattr(job, 'get_full_thinking') else None
-    )
