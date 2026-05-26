@@ -10,7 +10,7 @@ Current implementation uses two separate queues (`thinking_queue`, `token_queue`
 
 ## Solution
 
-Use a single `chunk_queue` with chunks tagged by type:
+Use a single `chunk_queue` with chunks tagged by type. Pointer tracking is done entirely by frontend via localStorage - backend only stores chunks.
 
 ```json
 {"chunk": "text", "type": "thinking"}
@@ -29,16 +29,16 @@ Use a single `chunk_queue` with chunks tagged by type:
 - `thinking_tokens: List[str]`
 - `thinking_sent_pointer: int`
 - `_thinking_content: str`
+- `sent_pointer: int`
+- `append_token()`
+- `append_thinking()`
+- `get_full_thinking()`
+- `stream_tokens()`
+- `stream_thinking()`
 
 **Add:**
 - `chunks: List[dict]` - accumulated chunks with type
 - `chunk_queue: asyncio.Queue` - unified queue
-- `sent_pointer: int` - single pointer for resume
-
-**Remove methods:**
-- `append_thinking()`
-- `get_full_thinking()`
-- `stream_thinking()`
 
 **Add method:**
 - `append_chunk(chunk_type: str, text: str)` - adds to `chunks` list and `chunk_queue`
@@ -46,6 +46,9 @@ Use a single `chunk_queue` with chunks tagged by type:
 **Update methods:**
 - `mark_completed()` - puts `None` in single queue
 - `mark_failed()` - puts `None` in single queue
+
+**Removed properties:**
+- No `sent_pointer` on backend - frontend tracks pointer
 
 ### 2. `backend/chat/service.py` - ChatService.generate_background
 
@@ -71,17 +74,21 @@ elif block.get("type") == "text":
 
 **Before:** Complex dual-queue handling with `thinking_sent_end`, `token_sent_end` flags
 
-**After:** Simple single-queue loop:
+**After:** Simple single-queue loop. No pointer tracking on backend.
+
 ```python
 async def stream_from_job(job, from_pointer: int = 0) -> AsyncGenerator[str, None]:
-    # Send partial from accumulated chunks
+    """
+    Read tokens from StreamJob and yield SSE events.
+    from_pointer is provided by frontend to resume from a specific position.
+    Backend does NOT track sent_pointer - it only stores chunks.
+    """
+    # Send accumulated chunks from from_pointer position
     if from_pointer < len(job.chunks):
-        partial = "".join(c["chunk"] for c in job.chunks[from_pointer:] if c["type"] == "token")
-        if partial:
-            yield f"data: {json.dumps({'partial': partial})}\n\n"
-        job.sent_pointer = len(job.chunks)
+        for c in job.chunks[from_pointer:]:
+            yield f"data: {json.dumps({'chunk': c['chunk'], 'type': c['type']})}\n\n"
 
-    # Stream from queue
+    # Stream from queue (new chunks being generated)
     while True:
         try:
             chunk = await asyncio.wait_for(job.chunk_queue.get(), timeout=0.5)
@@ -89,7 +96,6 @@ async def stream_from_job(job, from_pointer: int = 0) -> AsyncGenerator[str, Non
                 yield f"data: {json.dumps({'end': True})}\n\n"
                 break
             yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type']})}\n\n"
-            job.sent_pointer += 1
         except asyncio.TimeoutError:
             if job.status != "active":
                 break
@@ -110,9 +116,8 @@ class StreamStatusResponse(BaseModel):
 **After:**
 ```python
 class StreamStatusResponse(BaseModel):
-    chunks_count: int
-    pointer: int
-    partial_content: str | None  # derived from chunks
+    chunks_count: int  # total chunks in job.chunks
+    # pointer is tracked by frontend in localStorage
 ```
 
 ---
@@ -120,6 +125,11 @@ class StreamStatusResponse(BaseModel):
 ## Frontend Changes
 
 ### `frontend/index.html`
+
+**Pointer tracking:**
+- `pointer_{convId}` in localStorage stores the resume position (integer)
+- Frontend reads this on page load / stream resume
+- Frontend increments this as it receives and processes each chunk
 
 **processStreamResponse:**
 
@@ -140,15 +150,17 @@ if (data.chunk) {
         contentDiv.textContent += data.chunk;
         contentDiv.innerHTML = marked.parse(contentDiv.textContent);
     }
-    // Cache chunk
+    // Increment pointer and cache chunk
+    currentPointer++;
+    localStorage.setItem(STORAGE_KEYS.POINTER(currentConversationId), currentPointer.toString());
 } else if (data.end) {
     // Clear cache, complete
 }
 ```
 
 **localStorage keys:**
-- `chunks_{convId}` - array of `{chunk, type}` objects
-- `pointer_{convId}` - single integer pointer
+- `chunks_{convId}` - array of `{chunk, type}` objects (optional cache, can also re-fetch from backend)
+- `pointer_{convId}` - single integer pointer (frontend-only tracking)
 
 ---
 
@@ -156,10 +168,10 @@ if (data.chunk) {
 
 | File | Changes |
 |------|---------|
-| `backend/chat/stream_manager.py` | Remove thinking queue, add unified chunk queue |
+| `backend/chat/stream_manager.py` | Remove thinking queue, add unified chunk queue. No sent_pointer |
 | `backend/chat/service.py` | Use `append_chunk` instead of separate append methods |
-| `backend/chat/routes.py` | Simplify stream generator, update status model |
-| `frontend/index.html` | Single-path chunk handling, simplified localStorage |
+| `backend/chat/routes.py` | Simplify stream generator, no pointer tracking |
+| `frontend/index.html` | Single-path chunk handling, pointer tracked in localStorage |
 
 ---
 
