@@ -38,6 +38,21 @@ def get_conversation(conversation_id: str) -> Optional[dict]:
     return conversations.get(conversation_id)
 
 
+def create_conversation(conversation_id: str) -> None:
+    """Create an empty conversation entry so it appears in the conversation list."""
+    data = _load_conversations()
+    if "conversations" not in data:
+        data["conversations"] = {}
+    if conversation_id not in data["conversations"]:
+        data["conversations"][conversation_id] = {
+            "conversation_id": conversation_id,
+            "messages": [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        _save_conversations(data)
+
+
 def save_conversation(conversation_id: str, messages: list) -> None:
     data = _load_conversations()
     if "conversations" not in data:

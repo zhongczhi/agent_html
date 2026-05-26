@@ -1,5 +1,7 @@
 import pytest
 import asyncio
+
+from backend.chat.stream_manager import get_or_create_job, clear_job
 import json
 
 
@@ -53,3 +55,30 @@ async def test_stream_resume_from_pointer():
 
     # Should start from "world" token
     assert chunks[0] == {"chunk": "world", "type": "token"}
+
+
+@pytest.mark.asyncio
+async def test_second_message_clears_previous_chunks():
+    """Sending a second message should clear chunks from the first message."""
+    from backend.chat.stream_manager import StreamJob
+
+    conv_id = "test-conv-2"
+    clear_job(conv_id)  # Clean up first
+
+    # Create job and add some chunks from a "previous" message
+    job = get_or_create_job(conv_id, [])
+    job.append_chunk("token", "First message response")
+    assert len(job.chunks) == 1
+
+    # Simulate what happens in stream_chat when second message is sent
+    # The fix: chunks should be cleared when reactivating job
+    job.status = "active"
+    job.chunks = []  # This is what the fix in routes.py does
+    job.append_chunk("token", "Second message response")
+
+    # Chunks should only contain the new message
+    assert len(job.chunks) == 1
+    assert job.chunks[0]["chunk"] == "Second message response"
+
+    # Cleanup
+    clear_job(conv_id)

@@ -12,7 +12,7 @@ A modular chatbot application using FastAPI backend + plain HTML/JS frontend wit
 ```bash
 cd backend
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --port 8080
 ```
 Frontend served at `/`, API at `/api/chat/stream`
 
@@ -69,9 +69,9 @@ idea → SPEC.md → DESI.md → implementation → testing → assessment → m
 
 | File | Purpose |
 |------|---------|
-| `SPEC.md` | Full project specification (all features, past and future, explains what the system does) |
+| `SPEC.md` | Full project specification (all features, past and future, explains what the system does, nothing more) |
 | `SPEC_focus.md` | Current iteration's spec (active working document) |
-| `DESI.md` | Full project detailed design (all decisions, explains how the system implements it) |
+| `DESI.md` | Full project detailed design (all decisions, explains how the system implements it, nothing more) |
 | `DESI_focus.md` | Current iteration's design (active working document) |
 
 ### Iteration Process
@@ -85,6 +85,6 @@ idea → SPEC.md → DESI.md → implementation → testing → assessment → m
 
 ### Key Principle
 
-- ALWAYS ask the user to determine whether to proceed to the next step.
+- ALWAYS ask the user to determine whether to proceed to the next step. Specifically. for bug-fixing, step 1: figure out the problem and locate, present possible solution for user to determine. step 2: proceed on implementing
 
 - The `_focus.md` files are the **working documents** during an development iteration. The main `SPEC.md`/`DESI.md` files represent the "done" state. This separation prevents distraction from future backlog items during active development.

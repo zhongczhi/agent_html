@@ -24,3 +24,6 @@ htmlcov/
 
 # Storage (runtime data)
 storage/conversations.json
+
+# Todo
+todo.md

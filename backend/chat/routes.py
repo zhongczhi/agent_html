@@ -92,6 +92,7 @@ async def stream_chat(request: ChatRequest):
         job.thinking_tokens = []
         job.sent_pointer = 0
         job.thinking_sent_pointer = 0
+        job.chunks = []  # Clear chunks from previous message
         asyncio.create_task(
             chat_service.generate_background(request.message, conversation_id)
         )

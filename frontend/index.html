@@ -361,7 +361,8 @@
     <script>
         const STORAGE_KEYS = {
             CHUNKS: (convId) => `chunks_${convId}`,
-            POINTER: (convId) => `pointer_${convId}`
+            POINTER: (convId) => `pointer_${convId}`,
+            STREAMING: (convId) => `streaming_${convId}`
         };
 
         const messagesContainer = document.getElementById('messages');
@@ -375,19 +376,28 @@
 
         let currentConversationId = localStorage.getItem('currentConversationId');
         let conversations = {};
-        let isStreaming = false;
-        let currentEventSource = null;
+
+        // Per-conversation streaming state helpers
+        function isStreamingForConv(convId) {
+            return localStorage.getItem(STORAGE_KEYS.STREAMING(convId)) === 'true';
+        }
+        function setStreamingForConv(convId, value) {
+            if (convId) {
+                localStorage.setItem(STORAGE_KEYS.STREAMING(convId), value ? 'true' : 'false');
+            }
+        }
 
         // Initialize
         async function init() {
             await loadConversationList();
 
             if (currentConversationId) {
+                // Check if stream is still active
+                status = await checkStreamStatus();
+                // skip the history if is active
+                if (status === true) return;
                 // Load displayed content from history
                 await loadConversation(currentConversationId);
-
-                // Check if stream is still active
-                await checkStreamStatus();
             } else {
                 messagesContainer.classList.add('empty');
             }
@@ -439,11 +449,8 @@
         async function switchConversation(convId) {
             if (convId === currentConversationId) return;
 
-            // Close current stream if any
-            if (currentEventSource) {
-                currentEventSource.close();
-                currentEventSource = null;
-            }
+            // Clear displayed messages first
+            messagesContainer.innerHTML = '';
 
             currentConversationId = convId;
             localStorage.setItem('currentConversationId', convId);
@@ -453,8 +460,10 @@
                 el.classList.toggle('active', el.dataset.id === convId);
             });
 
+            status = await checkStreamStatus();
+            // if the conversation is resuming, skip the history logic
+            if (status === true) return;
             await loadConversation(convId);
-            await checkStreamStatus();
         }
 
         // Load conversation history
@@ -510,7 +519,7 @@
                         10
                     );
 
-                    await resumeStreamFromPosition(pointer);
+                    return await resumeStreamFromPosition(pointer);
                 } else if (status.is_complete) {
                     showStreamingBadge(false);
                 }
@@ -519,29 +528,83 @@
             }
         }
 
+        // Render cached chunks from localStorage before resuming stream
+        function renderCachedChunks(convId) {
+            const chunksCache = JSON.parse(
+                localStorage.getItem(STORAGE_KEYS.CHUNKS(convId)) || '[]'
+            );
+
+            let assistantMessage = null;
+            let rawContent = '';
+            let hasReceivedTokens = false;
+
+            for (const data of chunksCache) {
+                if (data.type === 'user') {
+                    // Render user message
+                    addMessage('user', data.content);
+                } else if (data.chunk) {
+                    if (!assistantMessage) {
+                        assistantMessage = addMessage('assistant', '');
+                    }
+
+                    if (data.type === 'thinking') {
+                        const thinkingElement = assistantMessage.querySelector('.thinking-content');
+                        if (thinkingElement) {
+                            thinkingElement.textContent += data.chunk;
+                            updateThinkingDisplay(assistantMessage);
+                        }
+                    } else if (data.type === 'token') {
+                        hasReceivedTokens = true;
+                        rawContent += data.chunk;
+                        const contentDiv = assistantMessage.querySelector('.message-content');
+                        if (contentDiv) {
+                            contentDiv.innerHTML = marked.parse(rawContent);
+                        }
+                    }
+                }
+            }
+
+            // Show loading indicator on assistant message if no tokens received yet
+            if (assistantMessage && !hasReceivedTokens) {
+                const contentDiv = assistantMessage.querySelector('.message-content');
+                if (contentDiv) {
+                    contentDiv.classList.add('loading');
+                    contentDiv.innerHTML = '<span>Thinking</span><div class="loading-dots"><span></span><span></span><span></span></div>';
+                }
+            }
+
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            return { assistantMessage, rawContent };
+        }
+
         // Resume stream from specific position
+        // case 1: switch off and back to the running conversation
+        // case 2: refresh the page
         async function resumeStreamFromPosition(pointer) {
-            if (isStreaming || !currentConversationId) return;
+            if (!currentConversationId) return;
 
-            isStreaming = true;
+            // First, render cached chunks from localStorage
+            const { assistantMessage: cachedAssistant, rawContent: cachedRawContent } = renderCachedChunks(currentConversationId);
+
+            // Mark this conversation as streaming (for safety check in processStreamResponse)
+            setStreamingForConv(currentConversationId, true);
             showStreamingBadge(true);
-
-            // Find existing assistant message in DOM (from loadConversation)
-            const existingMessages = messagesContainer.querySelectorAll('.message.assistant');
-            const lastAssistantMessage = existingMessages.length > 0 ? existingMessages[existingMessages.length - 1] : null;
 
             try {
                 // Call stream with single pointer parameter
                 const url = `/api/chat/stream/${currentConversationId}?from_pointer=${pointer}`;
                 const response = await fetch(url);
-                await processStreamResponse(response, true, lastAssistantMessage);
+                // Pass cached assistant message and raw content to continue from where we left off
+                await processStreamResponse(response, true, cachedAssistant, cachedRawContent);
             } catch (error) {
                 console.error('Stream error:', error);
                 showStreamingBadge(false);
             }
 
-            isStreaming = false;
+            // Clear streaming state when done
+            setStreamingForConv(currentConversationId, false);
             showStreamingBadge(false);
+            return true;
         }
 
         // Show/hide streaming badge on conversation item
@@ -562,11 +625,6 @@
 
         // Start new chat
         async function startNewChat() {
-            if (currentEventSource) {
-                currentEventSource.close();
-                currentEventSource = null;
-            }
-
             currentConversationId = null;
             localStorage.removeItem('currentConversationId');
             messagesContainer.innerHTML = '';
@@ -597,7 +655,10 @@
         // Send message
         async function sendMessage() {
             const message = messageInput.value.trim();
-            if (!message || isStreaming) return;
+            if (!message) return;
+
+            // Check if this conversation is already streaming
+            if (isStreamingForConv(currentConversationId)) return;
 
             messageInput.value = '';
             messageInput.style.height = '';
@@ -614,14 +675,24 @@
                 localStorage.setItem('currentConversationId', currentConversationId);
             }
 
-            // Clear previous cache for new stream
-            localStorage.removeItem(STORAGE_KEYS.CHUNKS(currentConversationId));
+            // Cache user message
+            const userChunksCache = JSON.parse(
+                localStorage.getItem(STORAGE_KEYS.CHUNKS(currentConversationId)) || '[]'
+            );
+            userChunksCache.push({ type: 'user', content: message });
+            localStorage.setItem(
+                STORAGE_KEYS.CHUNKS(currentConversationId),
+                JSON.stringify(userChunksCache)
+            );
+
+            // Clear pointer for new stream
             localStorage.setItem(
                 STORAGE_KEYS.POINTER(currentConversationId),
                 '0'
             );
 
-            isStreaming = true;
+            // Mark this conversation as streaming
+            setStreamingForConv(currentConversationId, true);
             showStreamingBadge(true);
 
             try {
@@ -650,26 +721,42 @@
                 console.error('Error:', error);
             }
 
-            isStreaming = false;
+            // Clear streaming state when done (normal completion or error)
+            setStreamingForConv(currentConversationId, false);
             showStreamingBadge(false);
             sendButton.disabled = false;
             messageInput.focus();
         }
 
         // Process SSE stream response
-        async function processStreamResponse(response, isResume, existingMessage = null) {
+        async function processStreamResponse(response, isResume, existingMessage = null, existingRawContent = '') {
+            // Capture conversationId at start - only process if this conversation is still current
+            const convId = currentConversationId;
+            if (!convId) return;
+
+            // For non-resume streams, check if this conversation is still marked as streaming
+            // For resume, we always process (resume is explicitly requested)
+            if (!isResume && !isStreamingForConv(convId)) {
+                return;
+            }
+
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let assistantMessage = existingMessage;
             let partialReceived = existingMessage !== null;
             let currentPointer = 0;
+            let rawContent = existingRawContent;
 
             // Get current pointer from localStorage
-            if (currentConversationId) {
-                currentPointer = parseInt(localStorage.getItem(STORAGE_KEYS.POINTER(currentConversationId)) || '0', 10);
-            }
+            currentPointer = parseInt(localStorage.getItem(STORAGE_KEYS.POINTER(convId)) || '0', 10);
 
             while (true) {
+                // Check if we're still on the same conversation (user may have switched)
+                if (convId !== currentConversationId) {
+                    // Conversation changed, stop processing this stream but keep it cached for later resume
+                    return;
+                }
+
                 const { done, value } = await reader.read();
                 if (done) break;
 
@@ -694,43 +781,64 @@
                                         updateThinkingDisplay(assistantMessage);
                                     }
                                 } else if (data.type === 'token') {
-                                    // Update content section
+                                    // Remove loading indicator when receiving tokens
                                     const contentDiv = assistantMessage.querySelector('.message-content');
                                     if (contentDiv) {
-                                        contentDiv.textContent += data.chunk;
-                                        contentDiv.innerHTML = marked.parse(contentDiv.textContent);
+                                        contentDiv.classList.remove('loading');
+                                    }
+                                    // Accumulate raw content during streaming
+                                    rawContent += data.chunk;
+                                    // Update content section with raw text (no markdown parsing during stream)
+                                    if (contentDiv) {
+                                        // contentDiv.textContent = rawContent;
+                                        contentDiv.innerHTML = marked.parse(rawContent)
                                     }
                                     messagesContainer.scrollTop = messagesContainer.scrollHeight;
                                     setupScrollbarAutoHide(assistantMessage);
                                 }
 
-                                // Cache chunk and increment pointer
-                                if (currentConversationId) {
-                                    const chunksCache = JSON.parse(
-                                        localStorage.getItem(STORAGE_KEYS.CHUNKS(currentConversationId)) || '[]'
-                                    );
-                                    chunksCache.push(data);
-                                    localStorage.setItem(
-                                        STORAGE_KEYS.CHUNKS(currentConversationId),
-                                        JSON.stringify(chunksCache)
-                                    );
-                                    currentPointer++;
-                                    localStorage.setItem(
-                                        STORAGE_KEYS.POINTER(currentConversationId),
-                                        currentPointer.toString()
-                                    );
-                                }
+                                // Cache chunk and increment pointer using captured convId
+                                const chunksCache = JSON.parse(
+                                    localStorage.getItem(STORAGE_KEYS.CHUNKS(convId)) || '[]'
+                                );
+                                chunksCache.push(data);
+                                localStorage.setItem(
+                                    STORAGE_KEYS.CHUNKS(convId),
+                                    JSON.stringify(chunksCache)
+                                );
+                                currentPointer++;
+                                localStorage.setItem(
+                                    STORAGE_KEYS.POINTER(convId),
+                                    currentPointer.toString()
+                                );
                             } else if (data.end) {
-                                // End of stream - clear cache
-                                if (currentConversationId) {
-                                    localStorage.removeItem(STORAGE_KEYS.CHUNKS(currentConversationId));
-                                    localStorage.removeItem(STORAGE_KEYS.POINTER(currentConversationId));
-                                }
-                                // Replace loading indicator with final content
+                                // End of stream - clear pointer and streaming state (keep chunks cached)
+                                localStorage.removeItem(STORAGE_KEYS.POINTER(convId));
+                                setStreamingForConv(convId, false);
+                                // Final markdown parse and cleanup
                                 if (assistantMessage) {
                                     const contentDiv = assistantMessage.querySelector('.message-content');
-                                    if (contentDiv && contentDiv.classList.contains('loading')) {
+                                    const thinkingSection = assistantMessage.querySelector('.thinking-section');
+                                    const thinkingContent = thinkingSection?.querySelector('.thinking-content');
+
+                                    if (contentDiv) {
                                         contentDiv.classList.remove('loading');
+                                        // Filter out any thinking content that might have leaked into rawContent
+                                        const finalContent = rawContent.trim();
+                                        if (finalContent) {
+                                            contentDiv.innerHTML = marked.parse(finalContent);
+                                        } else {
+                                            contentDiv.innerHTML = '';
+                                        }
+                                    }
+
+                                    // Hide thinking section if it only contains the thinking indicator text
+                                    if (thinkingContent && thinkingSection) {
+                                        const thinkingText = thinkingContent.textContent.trim();
+                                        // If thinking content is empty or just placeholder, hide the section
+                                        if (!thinkingText) {
+                                            thinkingSection.style.display = 'none';
+                                        }
                                     }
                                 }
                                 return;
