@@ -213,6 +213,31 @@
             white-space: pre-wrap;
             word-break: break-word;
         }
+        .message-content.loading {
+            white-space: normal;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #666;
+            font-size: 14px;
+        }
+        .message-content.loading .loading-dots {
+            display: flex;
+            gap: 4px;
+        }
+        .message-content.loading .loading-dots span {
+            width: 8px;
+            height: 8px;
+            background: #666;
+            border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+        .message-content.loading .loading-dots span:nth-child(1) { animation-delay: -0.32s; }
+        .message-content.loading .loading-dots span:nth-child(2) { animation-delay: -0.16s; }
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
         .message-content code {
             background: rgba(0,0,0,0.08);
             padding: 2px 6px;
@@ -334,6 +359,11 @@
     </div>
 
     <script>
+        const STORAGE_KEYS = {
+            CHUNKS: (convId) => `chunks_${convId}`,
+            POINTER: (convId) => `pointer_${convId}`
+        };
+
         const messagesContainer = document.getElementById('messages');
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
@@ -351,11 +381,14 @@
         // Initialize
         async function init() {
             await loadConversationList();
+
             if (currentConversationId) {
+                // Load displayed content from history
                 await loadConversation(currentConversationId);
+
+                // Check if stream is still active
                 await checkStreamStatus();
             } else {
-                // No conversation - show empty state
                 messagesContainer.classList.add('empty');
             }
         }
@@ -469,17 +502,46 @@
                 const status = await response.json();
 
                 if (status.streaming) {
-                    // Show streaming indicator
                     showStreamingBadge(true);
-                    // Resume stream
-                    await resumeStream();
-                } else if (status.partial_content && !status.is_complete) {
-                    // Partial content but not streaming - might need resume
-                    // This is handled by the resume logic on send
+
+                    // Get pointer from localStorage
+                    const pointer = parseInt(
+                        localStorage.getItem(STORAGE_KEYS.POINTER(currentConversationId)) || '0',
+                        10
+                    );
+
+                    await resumeStreamFromPosition(pointer);
+                } else if (status.is_complete) {
+                    showStreamingBadge(false);
                 }
             } catch (error) {
                 console.error('Failed to check stream status:', error);
             }
+        }
+
+        // Resume stream from specific position
+        async function resumeStreamFromPosition(pointer) {
+            if (isStreaming || !currentConversationId) return;
+
+            isStreaming = true;
+            showStreamingBadge(true);
+
+            // Find existing assistant message in DOM (from loadConversation)
+            const existingMessages = messagesContainer.querySelectorAll('.message.assistant');
+            const lastAssistantMessage = existingMessages.length > 0 ? existingMessages[existingMessages.length - 1] : null;
+
+            try {
+                // Call stream with single pointer parameter
+                const url = `/api/chat/stream/${currentConversationId}?from_pointer=${pointer}`;
+                const response = await fetch(url);
+                await processStreamResponse(response, true, lastAssistantMessage);
+            } catch (error) {
+                console.error('Stream error:', error);
+                showStreamingBadge(false);
+            }
+
+            isStreaming = false;
+            showStreamingBadge(false);
         }
 
         // Show/hide streaming badge on conversation item
@@ -498,27 +560,6 @@
             }
         }
 
-        // Resume stream for current conversation
-        async function resumeStream() {
-            if (isStreaming || !currentConversationId) return;
-
-            isStreaming = true;
-            showLoading();
-            showStreamingBadge(true);
-
-            try {
-                const response = await fetch(`/api/chat/stream/resume/${currentConversationId}`);
-                await processStreamResponse(response, true);
-            } catch (error) {
-                console.error('Stream error:', error);
-                removeLoading();
-                showStreamingBadge(false);
-            }
-
-            isStreaming = false;
-            showStreamingBadge(false);
-        }
-
         // Start new chat
         async function startNewChat() {
             if (currentEventSource) {
@@ -529,7 +570,7 @@
             currentConversationId = null;
             localStorage.removeItem('currentConversationId');
             messagesContainer.innerHTML = '';
-            messagesContainer.classList.add('empty');  // Add empty class
+            messagesContainer.classList.add('empty');
             document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
             messageInput.focus();
         }
@@ -563,13 +604,22 @@
             sendButton.disabled = true;
 
             addMessage('user', message);
-            showLoading();
+
+            // Create assistant message placeholder immediately
+            const assistantMessage = addAssistantPlaceholder();
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
             if (!currentConversationId) {
-                // Create new conversation from first message
                 currentConversationId = crypto.randomUUID();
                 localStorage.setItem('currentConversationId', currentConversationId);
             }
+
+            // Clear previous cache for new stream
+            localStorage.removeItem(STORAGE_KEYS.CHUNKS(currentConversationId));
+            localStorage.setItem(
+                STORAGE_KEYS.POINTER(currentConversationId),
+                '0'
+            );
 
             isStreaming = true;
             showStreamingBadge(true);
@@ -584,19 +634,18 @@
                     })
                 });
 
-                removeLoading();
-
                 if (!response.ok) {
                     throw new Error('Failed to get response');
                 }
 
-                // Refresh conversation list immediately after sending (conversation is saved on backend before streaming starts)
                 await loadConversationList();
-
-                await processStreamResponse(response, false);
+                await processStreamResponse(response, false, assistantMessage);
 
             } catch (error) {
-                removeLoading();
+                // Remove placeholder on error
+                if (assistantMessage && assistantMessage.parentNode) {
+                    assistantMessage.remove();
+                }
                 addMessage('assistant', 'Sorry, an error occurred. Please try again.');
                 console.error('Error:', error);
             }
@@ -608,15 +657,17 @@
         }
 
         // Process SSE stream response
-        async function processStreamResponse(response, isResume) {
+        async function processStreamResponse(response, isResume, existingMessage = null) {
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
-            let assistantMessage = null;
-            let partialReceived = false;
-            let thinkingContent = '';
-            let thinkingElement = null;
-            let thinkingSection = null;
-            let thinkingComplete = false;
+            let assistantMessage = existingMessage;
+            let partialReceived = existingMessage !== null;
+            let currentPointer = 0;
+
+            // Get current pointer from localStorage
+            if (currentConversationId) {
+                currentPointer = parseInt(localStorage.getItem(STORAGE_KEYS.POINTER(currentConversationId)) || '0', 10);
+            }
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -630,51 +681,62 @@
                         try {
                             const data = JSON.parse(line.slice(6));
 
-                            if (data.partial_thinking && !partialReceived) {
-                                // Resume with existing thinking
-                                thinkingContent = data.partial_thinking;
-                            } else if (data.partial && !partialReceived) {
-                                // First message is partial content from resume
-                                partialReceived = true;
-                                assistantMessage = addMessage('assistant', data.partial);
-                                thinkingSection = assistantMessage.querySelector('.thinking-section');
-                                thinkingElement = assistantMessage.querySelector('.thinking-content');
-                            } else if (data.thinking) {
-                                // Accumulate thinking content
+                            if (data.chunk) {
                                 if (!assistantMessage) {
                                     assistantMessage = addMessage('assistant', '');
-                                    thinkingSection = assistantMessage.querySelector('.thinking-section');
-                                    thinkingElement = assistantMessage.querySelector('.thinking-content');
                                 }
-                                thinkingContent += data.thinking;
-                                if (thinkingElement) {
-                                    thinkingElement.textContent = thinkingContent;
-                                    updateThinkingDisplay(assistantMessage);
+
+                                if (data.type === 'thinking') {
+                                    // Update thinking section
+                                    const thinkingElement = assistantMessage.querySelector('.thinking-content');
+                                    if (thinkingElement) {
+                                        thinkingElement.textContent += data.chunk;
+                                        updateThinkingDisplay(assistantMessage);
+                                    }
+                                } else if (data.type === 'token') {
+                                    // Update content section
+                                    const contentDiv = assistantMessage.querySelector('.message-content');
+                                    if (contentDiv) {
+                                        contentDiv.textContent += data.chunk;
+                                        contentDiv.innerHTML = marked.parse(contentDiv.textContent);
+                                    }
+                                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                                    setupScrollbarAutoHide(assistantMessage);
                                 }
-                            } else if (data.thinking_end) {
-                                thinkingComplete = true;
-                                if (thinkingElement) {
-                                    thinkingElement.textContent = thinkingContent;
-                                    updateThinkingDisplay(assistantMessage);
+
+                                // Cache chunk and increment pointer
+                                if (currentConversationId) {
+                                    const chunksCache = JSON.parse(
+                                        localStorage.getItem(STORAGE_KEYS.CHUNKS(currentConversationId)) || '[]'
+                                    );
+                                    chunksCache.push(data);
+                                    localStorage.setItem(
+                                        STORAGE_KEYS.CHUNKS(currentConversationId),
+                                        JSON.stringify(chunksCache)
+                                    );
+                                    currentPointer++;
+                                    localStorage.setItem(
+                                        STORAGE_KEYS.POINTER(currentConversationId),
+                                        currentPointer.toString()
+                                    );
                                 }
-                            } else if (data.token === null) {
-                                // End of stream
+                            } else if (data.end) {
+                                // End of stream - clear cache
+                                if (currentConversationId) {
+                                    localStorage.removeItem(STORAGE_KEYS.CHUNKS(currentConversationId));
+                                    localStorage.removeItem(STORAGE_KEYS.POINTER(currentConversationId));
+                                }
+                                // Replace loading indicator with final content
+                                if (assistantMessage) {
+                                    const contentDiv = assistantMessage.querySelector('.message-content');
+                                    if (contentDiv && contentDiv.classList.contains('loading')) {
+                                        contentDiv.classList.remove('loading');
+                                    }
+                                }
                                 break;
-                            } else if (data.token) {
-                                if (!assistantMessage) {
-                                    assistantMessage = addMessage('assistant', '');
-                                }
-                                const contentDiv = assistantMessage.querySelector('.message-content');
-                                if (contentDiv) {
-                                    contentDiv.textContent += data.token;
-                                    // Render markdown
-                                    contentDiv.innerHTML = marked.parse(contentDiv.textContent);
-                                }
-                                messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                                setupScrollbarAutoHide(assistantMessage);
                             }
                         } catch (e) {
-                            // Ignore parse errors for incomplete chunks
+                            // Ignore parse errors
                         }
                     }
                 }
@@ -726,6 +788,42 @@
             if (role === 'assistant') {
                 setupScrollbarAutoHide(messageDiv);
             }
+
+            return messageDiv;
+        }
+
+        // Create assistant message placeholder with loading indicator
+        function addAssistantPlaceholder() {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+
+            // Create thinking section
+            const thinkingSection = document.createElement('div');
+            thinkingSection.className = 'thinking-section';
+
+            const thinkingContent = document.createElement('div');
+            thinkingContent.className = 'thinking-content';
+            thinkingContent.textContent = '';
+
+            const toggleBtn = document.createElement('button');
+            toggleBtn.className = 'thinking-toggle';
+            toggleBtn.textContent = 'Show more';
+            toggleBtn.style.display = 'none';
+
+            thinkingSection.appendChild(thinkingContent);
+            thinkingSection.appendChild(toggleBtn);
+
+            // Create message content with loading state
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content loading';
+            contentDiv.innerHTML = '<span>Thinking</span><div class="loading-dots"><span></span><span></span><span></span></div>';
+
+            messageDiv.appendChild(thinkingSection);
+            messageDiv.appendChild(contentDiv);
+
+            messagesContainer.appendChild(messageDiv);
+            messagesContainer.classList.remove('empty');
+            setupScrollbarAutoHide(messageDiv);
 
             return messageDiv;
         }
@@ -810,7 +908,6 @@
             }
         });
         messageInput.addEventListener('input', function() {
-            // Auto-resize using field-sizing or fallback
             autoResizeInput(this);
         });
         newChatBtn.addEventListener('click', startNewChat);
@@ -820,12 +917,11 @@
         function autoResizeInput(textarea) {
             // Check if field-sizing is supported
             if (typeof CSS !== 'undefined' && CSS.supports('field-sizing', 'content')) {
-                // Native support, no action needed
                 return;
             }
 
             // Fallback: adjust height based on content
-            const minHeight = 120; // ~5 lines
+            const minHeight = 120;
             const clone = textarea.cloneNode();
             clone.style.position = 'absolute';
             clone.style.visibility = 'hidden';
