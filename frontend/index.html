@@ -818,6 +818,41 @@
             }
         }
 
+        // Render messages from cache (or fetched data)
+        function renderMessagesFromCache(messages) {
+            messagesContainer.innerHTML = '';
+
+            for (const msg of messages) {
+                if (msg.role === 'assistant') {
+                    const messageDiv = addMessage(msg.role, '');
+
+                    // If there's thinking content, add it
+                    if (msg.thinking) {
+                        const thinkingContent = messageDiv.querySelector('.thinking-content');
+                        if (thinkingContent) {
+                            thinkingContent.textContent = msg.thinking;
+                            updateThinkingDisplay(messageDiv);
+                        }
+                    }
+
+                    // Render markdown for content
+                    const contentDiv = messageDiv.querySelector('.message-content');
+                    let content = msg.content;
+                    if (contentDiv) {
+                        // contentDiv.innerHTML = renderMarkdown(contentDiv.textContent);
+                        const renderer = smd.default_renderer(contentDiv);
+                        const parser = smd.parser(renderer);
+                        DOMPurify.sanitize(content);
+                        smd.parser_write(parser, content);
+                        smd.parser_end(parser);
+                        applyLaTeX(contentDiv);
+                    }
+                } else {
+                    addMessage(msg.role, msg.content);
+                }
+            }
+        }
+
         // Check stream status and resume if needed
         async function checkStreamStatus() {
             if (!currentConversationId) return;
