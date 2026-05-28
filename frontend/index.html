@@ -972,6 +972,12 @@
             if (!confirm('Delete this conversation?')) return;
 
             try {
+                // Clear all caches including history
+                clearHistoryCache(convId);
+                localStorage.removeItem(STORAGE_KEYS.CHUNKS(convId));
+                localStorage.removeItem(STORAGE_KEYS.POINTER(convId));
+                localStorage.removeItem(STORAGE_KEYS.STREAMING(convId));
+
                 await fetch(`/api/chat/conversation/${convId}`, { method: 'DELETE' });
 
                 delete conversations[convId];
