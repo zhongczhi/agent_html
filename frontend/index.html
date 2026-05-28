@@ -1082,6 +1082,7 @@
             let assistantMessage = existingMessage;
             let currentPointer = 0;
             let rawContent = existingRawContent;
+            let thinkingContent = '';
 
             // Get current pointer from localStorage
             currentPointer = parseInt(localStorage.getItem(STORAGE_KEYS.POINTER(convId)) || '0', 10);
@@ -1115,6 +1116,7 @@
                                     const thinkingElement = assistantMessage.querySelector('.thinking-content');
                                     if (thinkingElement) {
                                         thinkingElement.textContent += data.chunk;
+                                        thinkingContent += data.chunk;
                                         updateThinkingDisplay(assistantMessage);
                                     }
                                 } else if (data.type === 'token') {
@@ -1185,6 +1187,12 @@
                                         }
                                     }
                                 }
+                                // Append assistant message to history cache
+                                appendToHistoryCache(convId, {
+                                    role: 'assistant',
+                                    content: rawContent.trim(),
+                                    thinking: thinkingContent || undefined
+                                });
                                 return;
                             }
                         } catch (e) {
