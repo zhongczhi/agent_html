@@ -1000,6 +1000,9 @@
 
             addMessage('user', message);
 
+            // Cache user message in history cache
+            appendToHistoryCache(currentConversationId, { role: 'user', content: message });
+
             // Create assistant message placeholder immediately
             const assistantMessage = addAssistantPlaceholder();
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
