@@ -673,6 +673,29 @@
             }
         }
 
+        // Get history cache for a conversation
+        function getHistoryCache(convId) {
+            const cached = localStorage.getItem(STORAGE_KEYS.HISTORY(convId));
+            return cached ? JSON.parse(cached) : null;
+        }
+
+        // Set history cache for a conversation
+        function setHistoryCache(convId, messages) {
+            localStorage.setItem(STORAGE_KEYS.HISTORY(convId), JSON.stringify(messages));
+        }
+
+        // Append a message to history cache
+        function appendToHistoryCache(convId, message) {
+            const cache = getHistoryCache(convId) || [];
+            cache.push(message);
+            setHistoryCache(convId, cache);
+        }
+
+        // Clear history cache for a conversation
+        function clearHistoryCache(convId) {
+            localStorage.removeItem(STORAGE_KEYS.HISTORY(convId));
+        }
+
         // Initialize
         async function init() {
             await loadConversationList();
