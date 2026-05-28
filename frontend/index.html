@@ -778,41 +778,23 @@
         // Load conversation history
         async function loadConversation(convId) {
             try {
+                // Check cache first
+                const cached = getHistoryCache(convId);
+                if (cached) {
+                    // Render from cache — no fetch needed
+                    renderMessagesFromCache(cached);
+                    return;
+                }
+
+                // Fetch from backend
                 const response = await fetch(`/api/chat/history/${convId}`);
                 const data = await response.json();
 
-                messagesContainer.innerHTML = '';
+                // Store in cache
+                setHistoryCache(convId, data.messages);
 
-                for (const msg of data.messages) {
-                    if (msg.role === 'assistant') {
-                        const messageDiv = addMessage(msg.role, '');
-
-                        // If there's thinking content, add it
-                        if (msg.thinking) {
-                            // const thinkingSection = messageDiv.querySelector('.thinking-section');
-                            const thinkingContent = messageDiv.querySelector('.thinking-content');
-                            if (thinkingContent) {
-                                thinkingContent.textContent = msg.thinking;
-                                updateThinkingDisplay(messageDiv);
-                            }
-                        }
-
-                        // Render markdown for content
-                        const contentDiv = messageDiv.querySelector('.message-content');
-                        let content = msg.content;
-                        if (contentDiv) {
-                            // contentDiv.innerHTML = renderMarkdown(contentDiv.textContent);
-                            const renderer = smd.default_renderer(contentDiv);
-                            const parser = smd.parser(renderer);
-                            DOMPurify(content);
-                            smd.parser_write(parser, content);
-                            smd.parser_end(parser);
-                            applyLaTeX(contentDiv);
-                        }
-                    } else {
-                        addMessage(msg.role, msg.content);
-                    }
-                }
+                // Render
+                renderMessagesFromCache(data.messages);
             } catch (error) {
                 console.error('Failed to load conversation:', error);
             }
