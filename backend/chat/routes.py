@@ -83,6 +83,10 @@ async def stream_chat(request: ChatRequest):
     if conversation_id is None:
         conversation_id = str(uuid.uuid4())
 
+    # Check if this is a new conversation (not yet in storage)
+    existing_conv = file_storage.get_conversation(conversation_id)
+    is_new_conversation = existing_conv is None
+
     job = get_or_create_job(conversation_id, [])
 
     # If job is not active, start background task
@@ -93,6 +97,12 @@ async def stream_chat(request: ChatRequest):
         job.sent_pointer = 0
         job.thinking_sent_pointer = 0
         job.chunks = []  # Clear chunks from previous message
+
+        # Append message to storage immediately for new conversations
+        # so the conversation appears in the list with correct title
+        if is_new_conversation:
+            file_storage.append_message(conversation_id, "user", request.message)
+
         asyncio.create_task(
             chat_service.generate_background(request.message, conversation_id)
         )

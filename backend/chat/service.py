@@ -24,10 +24,12 @@ class ChatService:
         """
         job = get_or_create_job(conversation_id, [])
 
-        # Load history and append user message
+        # Load history and append user message (if not already last message)
+        # This avoids duplicates when message was already appended in stream_chat for new conversations
         history = file_storage.get_conversation(conversation_id)
         messages = history["messages"] if history else []
-        messages.append({"role": "user", "content": message})
+        if not messages or messages[-1]["content"] != message:
+            messages.append({"role": "user", "content": message})
         job.messages = messages
 
         try:

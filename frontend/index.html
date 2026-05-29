@@ -997,6 +997,11 @@
             const message = messageInput.value.trim();
             if (!message) return;
 
+            if (!currentConversationId) {
+                currentConversationId = crypto.randomUUID();
+                localStorage.setItem('currentConversationId', currentConversationId);
+            }
+
             // Check if this conversation is already streaming
             if (isStreamingForConv(currentConversationId)) return;
 
@@ -1012,11 +1017,6 @@
             // Create assistant message placeholder immediately
             const assistantMessage = addAssistantPlaceholder();
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
-
-            if (!currentConversationId) {
-                currentConversationId = crypto.randomUUID();
-                localStorage.setItem('currentConversationId', currentConversationId);
-            }
 
             // Cache user message
             const userChunksCache = JSON.parse(
