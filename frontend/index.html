@@ -775,6 +775,8 @@
 
         // Switch to a conversation
         async function switchConversation(convId) {
+            const switchStartTime = Date.now();
+            console.log(`[switchConversation] Start switching to conversation: ${convId} at ${new Date().toISOString()}`);
             if (convId === currentConversationId) return;
 
             // Clear displayed messages first
@@ -790,8 +792,12 @@
 
             status = await checkStreamStatus();
             // if the conversation is resuming, skip the history logic
-            if (status === true) return;
+            if (status === true) {
+                console.log(`[switchConversation] Done (resuming stream) for ${convId} in ${Date.now() - switchStartTime}ms at ${new Date().toISOString()}`);
+                return;
+            }
             await loadConversation(convId);
+            console.log(`[switchConversation] Done for ${convId} in ${Date.now() - switchStartTime}ms at ${new Date().toISOString()}`);
         }
 
         // Load conversation history
@@ -1116,13 +1122,20 @@
 
         // Process SSE stream response
         async function processStreamResponse(response, isResume, existingMessage = null, existingRawContent = '') {
+            const procStartTime = Date.now();
+            const procStartId = crypto.randomUUID();
+            console.log(`[processStreamResponse] Start (id: ${procStartId}) for conv: ${currentConversationId} at ${new Date().toISOString()}`);
             // Capture conversationId at start - only process if this conversation is still current
             const convId = currentConversationId;
-            if (!convId) return;
+            if (!convId) {
+                console.log(`[processStreamResponse] End (id: ${procStartId}) - no convId, ${Date.now() - procStartTime}ms at ${new Date().toISOString()}`);
+                return;
+            }
 
             // For non-resume streams, check if this conversation is still marked as streaming
             // For resume, we always process (resume is explicitly requested)
             if (!isResume && !isStreamingForConv(convId)) {
+                console.log(`[processStreamResponse] End (id: ${procStartId}) - not streaming, ${Date.now() - procStartTime}ms at ${new Date().toISOString()}`);
                 return;
             }
 
@@ -1136,6 +1149,7 @@
             let currentPointer = 0;
             let rawContent = existingRawContent;
             let thinkingContent = thinkingElement ? thinkingElement.textContent : '';
+            let sseBuffer = '';  // Accumulator for incomplete SSE events
 
             // Get current pointer from localStorage
             currentPointer = parseInt(localStorage.getItem(STORAGE_KEYS.POINTER(convId)) || '0', 10);
@@ -1144,120 +1158,122 @@
                 // Check if we're still on the same conversation (user may have switched)
                 if (convId !== currentConversationId) {
                     // Conversation changed, stop processing this stream but keep it cached for later resume
+                    console.log(`[processStreamResponse] End (id: ${procStartId}) - conversation changed, ${Date.now() - procStartTime}ms at ${new Date().toISOString()}`);
                     return;
                 }
 
                 const { done, value } = await reader.read();
-                if (done) {
-                    console.log('Reader done, breaking. Unprocessed lines in current chunk will be lost.');
-                    break;
-                }
+                if (done) break;
 
                 const chunk = decoder.decode(value);
-                const lines = chunk.split('\n');
+                // debug
+                console.log(chunk);
+                sseBuffer += chunk;
+
+                // SSE events are delimited by \n\n (double newline)
+                // Split and process complete events, keep remainder in buffer
+                const events = sseBuffer.split('\n\n');
+                sseBuffer = events.pop() || '';  // Keep incomplete event in buffer
+
                 let renderer = null, parser = null;
 
-                console.log('raw chunk received:', chunk.length, 'bytes, lines:', lines.length, 'chunk:', chunk);
-                let lineNum = 0;
-                for (const line of lines) {
-                    lineNum++;
-                    if (line.startsWith('data: ')) {
-                        try {
-                            const data = JSON.parse(line.slice(6));
-                            // debug
-                            console.log('Processing line', lineNum, 'of', lines.length, ':', data);
+                for (const event of events) {
+                    if (!event.startsWith('data: ')) continue;
+                    try {
+                        const data = JSON.parse(event.slice(6));
+                        // debug
+                        // console.log('Processing line',  'of', event.length, ':', data);
 
-                            if (data.chunk) {
-                                if (data.type === 'thinking') {
-                                    // Update thinking section
-                                    if (thinkingElement) {
-                                        thinkingElement.textContent += data.chunk;
-                                        thinkingContent += data.chunk;
-                                        updateThinkingDisplay(assistantMessage);
-                                    }
-                                } else if (data.type === 'token') {
-                                    // Remove loading indicator when receiving tokens
-                                    const contentDiv = assistantMessage.querySelector('.message-content');
-                                    if (contentDiv) {
-                                        // Clear loading innerHTML only once on first token
-                                        if (contentDiv.classList.contains('loading')) {
-                                            contentDiv.innerHTML = '';
-                                        }
-                                        contentDiv.classList.remove('loading');
-                                    }
-                                    // Accumulate raw content during streaming
-                                    rawContent += data.chunk;
-                                    // Use insertAdjacentText for efficient text appending during streaming
-                                    // (following Chrome best practices - avoids re-parsing entire content)
-                                    if (contentDiv) {
-                                        //contentDiv.insertAdjacentText('beforeend', data.chunk);
-                                        // contentDiv.innerHTML = renderMarkdown(rawContent);
-                                        [renderer, parser] = renderContent(contentDiv, data.chunk, renderer, parser);
-                                    }
-                                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                        if (data.chunk) {
+                            if (data.type === 'thinking') {
+                                // Update thinking section
+                                if (thinkingElement) {
+                                    thinkingElement.textContent += data.chunk;
+                                    thinkingContent += data.chunk;
+                                    updateThinkingDisplay(assistantMessage);
                                 }
-
-                                // Cache chunk and increment pointer using captured convId
-                                const chunksCache = JSON.parse(
-                                    localStorage.getItem(STORAGE_KEYS.CHUNKS(convId)) || '[]'
-                                );
-                                chunksCache.push(data);
-                                localStorage.setItem(
-                                    STORAGE_KEYS.CHUNKS(convId),
-                                    JSON.stringify(chunksCache)
-                                );
-                                currentPointer++;
-                                localStorage.setItem(
-                                    STORAGE_KEYS.POINTER(convId),
-                                    currentPointer.toString()
-                                );
-                            } else if (data.end) {
-                                // End of stream - clear pointer and streaming state (keep chunks cached)
-                                localStorage.removeItem(STORAGE_KEYS.POINTER(convId));
-                                setStreamingForConv(convId, false);
-                                // Final markdown parse and cleanup
-                                if (assistantMessage) {
-                                    const contentDiv = assistantMessage.querySelector('.message-content');
-                                    const thinkingSection = assistantMessage.querySelector('.thinking-section');
-                                    const thinkingContent = thinkingSection.querySelector('.thinking-content');
-
-                                    if (contentDiv) {
-                                        // contentDiv.classList.remove('loading');
-                                        // Filter out any thinking content that might have leaked into rawContent
-                                        const finalContent = rawContent.trim();
-                                        if (finalContent) {
-                                            // contentDiv.innerHTML = renderMarkdown(finalContent);
-                                            // renderer, parser = renderContent(contentDiv, rawContent, renderer, parser);
-                                            end_parser(parser);
-                                        } else {
-                                            contentDiv.innerHTML = '';
-                                        }
+                            } else if (data.type === 'token') {
+                                // Remove loading indicator when receiving tokens
+                                const contentDiv = assistantMessage.querySelector('.message-content');
+                                if (contentDiv) {
+                                    // Clear loading innerHTML only once on first token
+                                    if (contentDiv.classList.contains('loading')) {
+                                        contentDiv.innerHTML = '';
                                     }
-
-                                    // Hide thinking section if it only contains the thinking indicator text
-                                    if (thinkingContent && thinkingSection) {
-                                        const thinkingText = thinkingContent.textContent.trim();
-                                        // If thinking content is empty or just placeholder, hide the section
-                                        if (!thinkingText) {
-                                            thinkingSection.style.display = 'none';
-                                        }
-                                    }
+                                    contentDiv.classList.remove('loading');
                                 }
-                                // Append assistant message to history cache
-                                appendToHistoryCache(convId, {
-                                    role: 'assistant',
-                                    content: rawContent.trim(),
-                                    thinking: thinkingContent || ''
-                                });
-                                clearChunkCache(convId);
-                                return true;
+                                // Accumulate raw content during streaming
+                                rawContent += data.chunk;
+                                // Use insertAdjacentText for efficient text appending during streaming
+                                // (following Chrome best practices - avoids re-parsing entire content)
+                                if (contentDiv) {
+                                    //contentDiv.insertAdjacentText('beforeend', data.chunk);
+                                    // contentDiv.innerHTML = renderMarkdown(rawContent);
+                                    [renderer, parser] = renderContent(contentDiv, data.chunk, renderer, parser);
+                                }
+                                messagesContainer.scrollTop = messagesContainer.scrollHeight;
                             }
-                        } catch (e) {
-                            console.error('Chunk processing error:', e, 'Line was:', line);
+
+                            // Cache chunk and increment pointer using captured convId
+                            const chunksCache = JSON.parse(
+                                localStorage.getItem(STORAGE_KEYS.CHUNKS(convId)) || '[]'
+                            );
+                            chunksCache.push(data);
+                            localStorage.setItem(
+                                STORAGE_KEYS.CHUNKS(convId),
+                                JSON.stringify(chunksCache)
+                            );
+                            currentPointer++;
+                            localStorage.setItem(
+                                STORAGE_KEYS.POINTER(convId),
+                                currentPointer.toString()
+                            );
+                        } else if (data.end) {
+                            // End of stream - clear pointer and streaming state (keep chunks cached)
+                            localStorage.removeItem(STORAGE_KEYS.POINTER(convId));
+                            setStreamingForConv(convId, false);
+                            // Final markdown parse and cleanup
+                            if (assistantMessage) {
+                                const contentDiv = assistantMessage.querySelector('.message-content');
+                                const thinkingSection = assistantMessage.querySelector('.thinking-section');
+                                const thinkingContent = thinkingSection.querySelector('.thinking-content');
+
+                                if (contentDiv) {
+                                    // contentDiv.classList.remove('loading');
+                                    // Filter out any thinking content that might have leaked into rawContent
+                                    const finalContent = rawContent.trim();
+                                    if (finalContent) {
+                                        // contentDiv.innerHTML = renderMarkdown(finalContent);
+                                        // renderer, parser = renderContent(contentDiv, rawContent, renderer, parser);
+                                        end_parser(parser);
+                                    } else {
+                                        contentDiv.innerHTML = '';
+                                    }
+                                }
+
+                                // Hide thinking section if it only contains the thinking indicator text
+                                if (thinkingContent && thinkingSection) {
+                                    const thinkingText = thinkingContent.textContent.trim();
+                                    // If thinking content is empty or just placeholder, hide the section
+                                    if (!thinkingText) {
+                                        thinkingSection.style.display = 'none';
+                                    }
+                                }
+                            }
+                            // Append assistant message to history cache
+                            appendToHistoryCache(convId, {
+                                role: 'assistant',
+                                content: rawContent.trim(),
+                                thinking: thinkingContent || ''
+                            });
+                            clearChunkCache(convId);
+                            console.log(`[processStreamResponse] End (id: ${procStartId}) - stream complete, ${Date.now() - procStartTime}ms at ${new Date().toISOString()}`);
+                            return true;
                         }
+                    } catch (e) {
+                        console.error('Chunk processing error:', e, 'Event was:', event);
                     }
                 }
-                console.log('Finished processing', lines.length, 'lines, loop ended normally');
             }
         }
 

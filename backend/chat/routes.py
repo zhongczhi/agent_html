@@ -67,6 +67,7 @@ async def stream_from_job(
         for chunk in job.chunks[from_pointer:]:
             yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
             print("ts: ", chunk['message_id'])
+        yield f"data: {json.dumps({'end': True})}\n\n"
         return
 
     # first load from chunks when fetch from the queue
