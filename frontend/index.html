@@ -619,21 +619,32 @@
         let currentConversationId = localStorage.getItem('currentConversationId');
         let conversations = {};
 
+        // Track rendered equation elements per div to avoid O(N²) re-rendering
+        const renderedEquations = new WeakMap();
+
         function applyLaTeX(div) {
+            const rendered = renderedEquations.get(div) || new Set();
             // Manually render inline math in <equation-inline> tags
             div.querySelectorAll('equation-inline').forEach(el => {
-            katex.render(el.textContent, el, {
-                displayMode: false,  // Inline mode
-                throwOnError: false  // Optional: Don't throw errors on invalid LaTeX
-            });
+                if (!rendered.has(el)) {
+                    katex.render(el.textContent, el, {
+                        displayMode: false,  // Inline mode
+                        throwOnError: false  // Optional: Don't throw errors on invalid LaTeX
+                    });
+                    rendered.add(el);
+                }
             });
             // Manually render block math in <equation-block> tags
             div.querySelectorAll('equation-block').forEach(el => {
-            katex.render(el.textContent, el, {
-                displayMode: true,   // Display (block) mode
-                throwOnError: false  // Optional: Don't throw errors on invalid LaTeX
+                if (!rendered.has(el)) {
+                    katex.render(el.textContent, el, {
+                        displayMode: true,   // Display (block) mode
+                        throwOnError: false  // Optional: Don't throw errors on invalid LaTeX
+                    });
+                    rendered.add(el);
+                }
             });
-            });
+            renderedEquations.set(div, rendered);
         }
 
         function renderContent(div, content, renderer=null, parser=null){
@@ -648,8 +659,8 @@
             return [renderer, parser];
         }
 
-        function end_parser(smd, parser){
-            if (smd && parser) smd.parser_end(parser);
+        function end_parser(parser){
+            if (parser) smd.parser_end(parser);
         }
 
         // Simple markdown rendering with marked + DOMPurify
@@ -666,6 +677,9 @@
         // Per-conversation streaming state helpers
         function isStreamingForConv(convId) {
             return localStorage.getItem(STORAGE_KEYS.STREAMING(convId)) === 'true';
+        }
+        function getStreamingForConv(convId){
+            return localStorage.getItem(STORAGE_KEYS.STREAMING(convId));
         }
         function setStreamingForConv(convId, value) {
             if (convId) {
@@ -694,6 +708,11 @@
         // Clear history cache for a conversation
         function clearHistoryCache(convId) {
             localStorage.removeItem(STORAGE_KEYS.HISTORY(convId));
+        }
+
+        // Clear chunk cache for a conversation
+        function clearChunkCache(convId){
+            localStorage.removeItem(STORAGE_KEYS.CHUNKS(convId));
         }
 
         // Initialize
@@ -795,6 +814,9 @@
 
                 // Render
                 renderMessagesFromCache(data.messages);
+
+                // remove chunk cache if exist
+                clearChunkCache(convId);
             } catch (error) {
                 console.error('Failed to load conversation:', error);
             }
@@ -837,7 +859,9 @@
 
         // Check stream status and resume if needed
         async function checkStreamStatus() {
-            if (!currentConversationId) return;
+            // if no currentConversationId or streaming == false
+            // note: when streaming is not set, should consider when the cache is cleared
+            if (!currentConversationId || getStreamingForConv(currentConversationId) === 'false') return;
 
             try {
                 const response = await fetch(`/api/chat/stream/status/${currentConversationId}`);
@@ -862,10 +886,13 @@
         }
 
         // Render cached chunks from localStorage before resuming stream
+        // Remerber to render the history message before the cached chunks
         function renderCachedChunks(convId) {
             const chunksCache = JSON.parse(
                 localStorage.getItem(STORAGE_KEYS.CHUNKS(convId)) || '[]'
             );
+            //debug
+            //console.log(chunksCache);
 
             let assistantMessage = null;
             let rawContent = '';
@@ -875,7 +902,8 @@
             for (const data of chunksCache) {
                 if (data.type === 'user') {
                     // Render user message
-                    addMessage('user', data.content);
+                    // addMessage('user', data.content);
+                    continue;
                 } else if (data.chunk) {
                     if (!assistantMessage) {
                         assistantMessage = addMessage('assistant', '');
@@ -892,10 +920,10 @@
                         rawContent += data.chunk;
                         const contentDiv = assistantMessage.querySelector('.message-content');
                         if (contentDiv) {
-                            const result = renderContent(contentDiv, rawContent, renderer, parser);
+                            const result = renderContent(contentDiv, data.chunk, renderer, parser);
                             if (result) {
                                 [renderer, parser] = result;
-                                end_parser(smd, parser);
+                                end_parser(parser);
                             }
                         }
                     }
@@ -911,10 +939,20 @@
         // case 2: refresh the page
         async function resumeStreamFromPosition(pointer) {
             if (!currentConversationId) return;
+            
+            // Load the cache history first
+            const cached = getHistoryCache(currentConversationId);
+                if (cached) {
+                    // Render from cache — no fetch needed
+                    renderMessagesFromCache(cached);
+                }
 
             // First, render cached chunks from localStorage
             const { assistantMessage: cachedAssistant, rawContent: cachedRawContent } = renderCachedChunks(currentConversationId);
-
+            
+            // for debug
+            // console.log("cachedRawContent:", cachedRawContent);
+            // console.log("pointer: ", pointer);
             // Mark this conversation as streaming (for safety check in processStreamResponse)
             setStreamingForConv(currentConversationId, true);
             showStreamingBadge(true);
@@ -938,6 +976,7 @@
             // Clear streaming state when done
             setStreamingForConv(currentConversationId, false);
             showStreamingBadge(false);
+            clearChunkCache(currentConversationId);
             return true;
         }
 
@@ -1037,6 +1076,7 @@
             // Mark this conversation as streaming
             setStreamingForConv(currentConversationId, true);
             showStreamingBadge(true);
+            let result = null;
 
             try {
                 const response = await fetch('/api/chat/stream', {
@@ -1053,7 +1093,7 @@
                 }
 
                 await loadConversationList();
-                await processStreamResponse(response, false, assistantMessage);
+                result = await processStreamResponse(response, false, assistantMessage);
 
             } catch (error) {
                 // Remove placeholder on error
@@ -1062,13 +1102,16 @@
                 }
                 addMessage('assistant', 'Sorry, an error occurred. Please try again.');
                 console.error('Error:', error);
+                result = true;
             }
-
-            // Clear streaming state when done (normal completion or error)
-            setStreamingForConv(currentConversationId, false);
-            showStreamingBadge(false);
-            sendButton.disabled = false;
-            messageInput.focus();
+            if (result === true){
+                localStorage.setItem("test", "1111111");
+                // Clear streaming state when done (normal completion or error)
+                setStreamingForConv(currentConversationId, false);
+                showStreamingBadge(false);
+                sendButton.disabled = false;
+                messageInput.focus();
+            }
         }
 
         // Process SSE stream response
@@ -1086,9 +1129,13 @@
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let assistantMessage = existingMessage;
+            if (!assistantMessage) {
+                assistantMessage = addMessage('assistant', '');
+            }
+            const thinkingElement = assistantMessage.querySelector('.thinking-content');
             let currentPointer = 0;
             let rawContent = existingRawContent;
-            let thinkingContent = '';
+            let thinkingContent = thinkingElement ? thinkingElement.textContent : '';
 
             // Get current pointer from localStorage
             currentPointer = parseInt(localStorage.getItem(STORAGE_KEYS.POINTER(convId)) || '0', 10);
@@ -1101,25 +1148,28 @@
                 }
 
                 const { done, value } = await reader.read();
-                if (done) break;
+                if (done) {
+                    console.log('Reader done, breaking. Unprocessed lines in current chunk will be lost.');
+                    break;
+                }
 
                 const chunk = decoder.decode(value);
                 const lines = chunk.split('\n');
                 let renderer = null, parser = null;
 
+                console.log('raw chunk received:', chunk.length, 'bytes, lines:', lines.length, 'chunk:', chunk);
+                let lineNum = 0;
                 for (const line of lines) {
+                    lineNum++;
                     if (line.startsWith('data: ')) {
                         try {
                             const data = JSON.parse(line.slice(6));
+                            // debug
+                            console.log('Processing line', lineNum, 'of', lines.length, ':', data);
 
                             if (data.chunk) {
-                                if (!assistantMessage) {
-                                    assistantMessage = addMessage('assistant', '');
-                                }
-
                                 if (data.type === 'thinking') {
                                     // Update thinking section
-                                    const thinkingElement = assistantMessage.querySelector('.thinking-content');
                                     if (thinkingElement) {
                                         thinkingElement.textContent += data.chunk;
                                         thinkingContent += data.chunk;
@@ -1141,8 +1191,8 @@
                                     // (following Chrome best practices - avoids re-parsing entire content)
                                     if (contentDiv) {
                                         //contentDiv.insertAdjacentText('beforeend', data.chunk);
-                                        contentDiv.innerHTML = renderMarkdown(rawContent);
-                                        // renderer, parser = renderContent(contentDiv, rawContent, renderer, parser);
+                                        // contentDiv.innerHTML = renderMarkdown(rawContent);
+                                        [renderer, parser] = renderContent(contentDiv, data.chunk, renderer, parser);
                                     }
                                     messagesContainer.scrollTop = messagesContainer.scrollHeight;
                                 }
@@ -1169,16 +1219,16 @@
                                 if (assistantMessage) {
                                     const contentDiv = assistantMessage.querySelector('.message-content');
                                     const thinkingSection = assistantMessage.querySelector('.thinking-section');
-                                    const thinkingContent = thinkingSection?.querySelector('.thinking-content');
+                                    const thinkingContent = thinkingSection.querySelector('.thinking-content');
 
                                     if (contentDiv) {
                                         // contentDiv.classList.remove('loading');
                                         // Filter out any thinking content that might have leaked into rawContent
                                         const finalContent = rawContent.trim();
                                         if (finalContent) {
-                                            contentDiv.innerHTML = renderMarkdown(finalContent);
+                                            // contentDiv.innerHTML = renderMarkdown(finalContent);
                                             // renderer, parser = renderContent(contentDiv, rawContent, renderer, parser);
-                                            // end_parser(smd, parser);
+                                            end_parser(parser);
                                         } else {
                                             contentDiv.innerHTML = '';
                                         }
@@ -1197,15 +1247,17 @@
                                 appendToHistoryCache(convId, {
                                     role: 'assistant',
                                     content: rawContent.trim(),
-                                    thinking: thinkingContent || undefined
+                                    thinking: thinkingContent || ''
                                 });
-                                return;
+                                clearChunkCache(convId);
+                                return true;
                             }
                         } catch (e) {
-                            // Ignore parse errors
+                            console.error('Chunk processing error:', e, 'Line was:', line);
                         }
                     }
                 }
+                console.log('Finished processing', lines.length, 'lines, loop ended normally');
             }
         }
 

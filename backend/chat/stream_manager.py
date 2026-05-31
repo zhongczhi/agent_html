@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional
 
@@ -11,7 +12,7 @@ class StreamJob:
     ):
         self.conversation_id = conversation_id
         self.status: Literal["pending", "active", "completed", "failed"] = "pending"
-        self.chunks: List[dict] = []  # [{"chunk": "text", "type": "thinking|token"}]
+        self.chunks: List[dict] = []  # [{"chunk": "text", "type": "thinking|token", "message_id": "..."}]
         self.chunk_queue: asyncio.Queue = asyncio.Queue()
         self.messages: List[dict] = messages or []
         self.error: Optional[str] = None
@@ -20,7 +21,8 @@ class StreamJob:
 
     def append_chunk(self, chunk_type: str, text: str) -> None:
         """Add a chunk to both the chunks list and chunk_queue."""
-        chunk = {"chunk": text, "type": chunk_type}
+        message_id = str(time.time_ns())
+        chunk = {"chunk": text, "type": chunk_type, "message_id": message_id}
         self.chunks.append(chunk)
         self.chunk_queue.put_nowait(chunk)
         self.updated_at = datetime.now(timezone.utc)

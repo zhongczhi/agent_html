@@ -58,10 +58,26 @@ async def stream_from_job(
     from_pointer is provided by frontend to resume from a specific position.
     Backend does NOT track sent_pointer.
     """
-    # Yield accumulated chunks from from_pointer position
-    if from_pointer < len(job.chunks):
+    # Error handling
+    if from_pointer > len(job.chunks) or (from_pointer == len(job.chunks) and len(job.chunks) != 0):
+        return
+
+    # load strictly from chunks if inactive
+    if job.status != "active":
         for chunk in job.chunks[from_pointer:]:
-            yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type']})}\n\n"
+            yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
+            print("ts: ", chunk['message_id'])
+        return
+
+    # first load from chunks when fetch from the queue
+    for chunk in job.chunks[from_pointer:]:
+        yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
+        print("ts: ", chunk['message_id'])
+
+    if len(job.chunks) > 0:
+        last = int(job.chunks[-1]['message_id'])
+    else:
+        last = 0
 
     # Stream from queue (new chunks being generated)
     while True:
@@ -70,9 +86,15 @@ async def stream_from_job(
             if chunk is None:
                 yield f"data: {json.dumps({'end': True})}\n\n"
                 break
-            yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type']})}\n\n"
+            if int(chunk['message_id']) <= last:
+                continue
+            yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
+            print("ts: ", chunk['message_id'])
         except asyncio.TimeoutError:
             if job.status != "active":
+                yield f"data: {json.dumps({'end': True})}\n\n"
+                for i, chunk in enumerate(job.chunks):
+                    print(f"{i}: {chunk['message_id']}, len={len(chunk['chunk'])}") # check the data content
                 break
 
 
