@@ -85,6 +85,6 @@ idea → SPEC.md → DESI.md → implementation → testing → assessment → m
 
 ### Key Principle
 
-- ALWAYS ask the user to determine whether to proceed to the next step. Specifically. for bug-fixing, step 1: figure out the problem and locate, present possible solution for user to determine. step 2: proceed on implementing
+- ALWAYS ask the user to determine whether to proceed to the next step that may involves editing. Specifically. for bug-fixing, step 1: figure out the problem and locate, present possible solution for user to determine. step 2: proceed on implementing.
 
 - The `_focus.md` files are the **working documents** during an development iteration. The main `SPEC.md`/`DESI.md` files represent the "done" state. This separation prevents distraction from future backlog items during active development.
