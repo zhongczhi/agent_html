@@ -66,15 +66,12 @@ async def stream_from_job(
     if job.status != "active":
         for chunk in job.chunks[from_pointer:]:
             yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
-            print("ts: ", chunk['message_id'])
         yield f"data: {json.dumps({'end': True})}\n\n"
         return
 
     # first load from chunks when fetch from the queue
     for chunk in job.chunks[from_pointer:]:
         yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
-        print("ts: ", chunk['message_id'], " ", f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n")
-        print("ts: ", chunk['message_id'], " ", json.dumps({'chunk': chunk['chunk']}))
     if len(job.chunks) > 0:
         last = int(job.chunks[-1]['message_id'])
     else:
@@ -90,13 +87,9 @@ async def stream_from_job(
             if int(chunk['message_id']) <= last:
                 continue
             yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
-            print("ts: ", chunk['message_id'], " ", f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n")
-            print("ts: ", chunk['message_id'], " ", json.dumps({'chunk': chunk['chunk']}))
         except asyncio.TimeoutError:
             if job.status != "active":
                 yield f"data: {json.dumps({'end': True})}\n\n"
-                for i, chunk in enumerate(job.chunks):
-                    print(f"{i}: {chunk['message_id']}, len={len(chunk['chunk'])}") # check the data content
                 break
 
 

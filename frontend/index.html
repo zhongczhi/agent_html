@@ -776,8 +776,6 @@
 
         // Switch to a conversation
         async function switchConversation(convId) {
-            const switchStartTime = Date.now();
-            console.log(`[switchConversation] Start switching to conversation: ${convId} at ${new Date().toISOString()}`);
             if (convId === currentConversationId) return;
 
             // Abort any ongoing stream for current conversation before switching
@@ -800,11 +798,9 @@
             status = await checkStreamStatus();
             // if the conversation is resuming, skip the history logic
             if (status === true) {
-                console.log(`[switchConversation] Done (resuming stream) for ${convId} in ${Date.now() - switchStartTime}ms at ${new Date().toISOString()}`);
                 return;
             }
             await loadConversation(convId);
-            console.log(`[switchConversation] Done for ${convId} in ${Date.now() - switchStartTime}ms at ${new Date().toISOString()}`);
         }
 
         // Load conversation history
@@ -904,8 +900,6 @@
             const chunksCache = JSON.parse(
                 localStorage.getItem(STORAGE_KEYS.CHUNKS(convId)) || '[]'
             );
-            //debug
-            console.log("chunksCache: ", chunksCache);
 
             let assistantMessage = null;
             let rawContent = '';
@@ -961,10 +955,7 @@
 
             // First, render cached chunks from localStorage
             const { assistantMessage: cachedAssistant, rawContent: cachedRawContent } = renderCachedChunks(currentConversationId);
-            
-            // for debug
-            // console.log("cachedRawContent:", cachedRawContent);
-            // console.log("pointer: ", pointer);
+
             // Mark this conversation as streaming (for safety check in processStreamResponse)
             setStreamingForConv(currentConversationId, true);
             showStreamingBadge(true);
@@ -984,7 +975,7 @@
                 result = await processStreamResponse(response, true, cachedAssistant, cachedRawContent);
             } catch (error) {
                 if (error.name === 'AbortError') {
-                    console.log('[stream] Aborted (switch or new stream started)');
+                    // Stream was aborted (user switched conversation or started a new stream)
                 } else {
                     console.error('Stream error:', error);
                     setStreamingForConv(currentConversationId, false);
@@ -1129,12 +1120,11 @@
                     addMessage('assistant', 'Sorry, an error occurred. Please try again.');
                     console.error('Error:', error);
                 } else {
-                    console.log('[stream] Aborted (switch or new stream started)');
                     if (assistantMessage && assistantMessage.parentNode) {
                         assistantMessage.remove();
                     }
                     result = true;
-                }  
+                }
             }
             if (result === true){
                 localStorage.setItem("test", "1111111");
@@ -1148,20 +1138,15 @@
 
         // Process SSE stream response
         async function processStreamResponse(response, isResume, existingMessage = null, existingRawContent = '') {
-            const procStartTime = Date.now();
-            const procStartId = crypto.randomUUID();
-            console.log(`[processStreamResponse] Start (id: ${procStartId}) for conv: ${currentConversationId} at ${new Date().toISOString()}`);
             // Capture conversationId at start - only process if this conversation is still current
             const convId = currentConversationId;
             if (!convId) {
-                console.log(`[processStreamResponse] End (id: ${procStartId}) - no convId, ${Date.now() - procStartTime}ms at ${new Date().toISOString()}`);
                 return;
             }
 
             // For non-resume streams, check if this conversation is still marked as streaming
             // For resume, we always process (resume is explicitly requested)
             if (!isResume && !isStreamingForConv(convId)) {
-                console.log(`[processStreamResponse] End (id: ${procStartId}) - not streaming, ${Date.now() - procStartTime}ms at ${new Date().toISOString()}`);
                 return;
             }
 
@@ -1186,7 +1171,6 @@
                 // Check if we're still on the same conversation (user may have switched)
                 if (convId !== currentConversationId) {
                     // Conversation changed, stop processing this stream but keep it cached for later resume
-                    console.log(`[processStreamResponse] End (id: ${procStartId}) - conversation changed, ${Date.now() - procStartTime}ms at ${new Date().toISOString()}`);
                     return;
                 }
 
@@ -1194,8 +1178,6 @@
                 if (done) break;
 
                 const chunk = decoder.decode(value);
-                // debug
-                console.log(chunk);
                 sseBuffer += chunk;
 
                 // SSE events are delimited by \n\n (double newline)
@@ -1207,8 +1189,6 @@
                     if (!event.startsWith('data: ')) continue;
                     try {
                         const data = JSON.parse(event.slice(6));
-                        // debug
-                        // console.log('Processing line',  'of', event.length, ':', data);
 
                         if (data.chunk) {
                             if (data.type === 'thinking') {
@@ -1293,7 +1273,6 @@
                                 thinking: thinkingContent || ''
                             });
                             clearChunkCache(convId);
-                            console.log(`[processStreamResponse] End (id: ${procStartId}) - stream complete, ${Date.now() - procStartTime}ms at ${new Date().toISOString()}`);
                             return true;
                         }
                     } catch (e) {
