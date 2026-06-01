@@ -46,11 +46,13 @@ class ChatService:
                     for block in content:
                         if block.get("type") == "thinking":
                             thinking_text = block.get("thinking", "")
-                            job.append_chunk("thinking", thinking_text)
+                            if thinking_text:
+                                job.append_chunk("thinking", thinking_text)
                         elif block.get("type") == "text":
                             token = block.get("text", "")
-                            job.append_chunk("token", token)
-                elif isinstance(content, str):
+                            if token:
+                                job.append_chunk("token", token)
+                elif isinstance(content, str) and content:
                     job.append_chunk("token", content)
 
         except Exception as e:

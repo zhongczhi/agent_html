@@ -618,6 +618,7 @@
 
         let currentConversationId = localStorage.getItem('currentConversationId');
         let conversations = {};
+        let currentAbortController = null;  // For cancelling ongoing streams
 
         // Track rendered equation elements per div to avoid O(N²) re-rendering
         const renderedEquations = new WeakMap();
@@ -664,15 +665,15 @@
         }
 
         // Simple markdown rendering with marked + DOMPurify
-        function renderMarkdown(content) {
-            if (!content || !content.trim()) return '';
-            const rawHtml = marked.parse(content);
-            return DOMPurify.sanitize(rawHtml, {
-                ALLOWED_TAGS: ['p', 'em', 'strong', 'a', 'code', 'pre', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
-                ALLOWED_ATTR: ['href', 'class'],
-                ALLOWED_URI_REGEXP: /^(?:https?|mailto):/i,
-            });
-        }
+        // function renderMarkdown(content) {
+        //     if (!content || !content.trim()) return '';
+        //     const rawHtml = marked.parse(content);
+        //     return DOMPurify.sanitize(rawHtml, {
+        //         ALLOWED_TAGS: ['p', 'em', 'strong', 'a', 'code', 'pre', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
+        //         ALLOWED_ATTR: ['href', 'class'],
+        //         ALLOWED_URI_REGEXP: /^(?:https?|mailto):/i,
+        //     });
+        // }
 
         // Per-conversation streaming state helpers
         function isStreamingForConv(convId) {
@@ -778,6 +779,12 @@
             const switchStartTime = Date.now();
             console.log(`[switchConversation] Start switching to conversation: ${convId} at ${new Date().toISOString()}`);
             if (convId === currentConversationId) return;
+
+            // Abort any ongoing stream for current conversation before switching
+            if (currentAbortController) {
+                currentAbortController.abort();
+                currentAbortController = null;
+            }
 
             // Clear displayed messages first
             messagesContainer.innerHTML = '';
@@ -898,7 +905,7 @@
                 localStorage.getItem(STORAGE_KEYS.CHUNKS(convId)) || '[]'
             );
             //debug
-            //console.log(chunksCache);
+            console.log("chunksCache: ", chunksCache);
 
             let assistantMessage = null;
             let rawContent = '';
@@ -963,27 +970,36 @@
             setStreamingForConv(currentConversationId, true);
             showStreamingBadge(true);
 
+            // Create abort controller for this resume stream
+            currentAbortController = new AbortController();
+            let result = null;
+
             try {
                 // Call stream with single pointer parameter
                 const url = `/api/chat/stream/${currentConversationId}?from_pointer=${pointer}`;
-                const response = await fetch(url);
+                const response = await fetch(url, { signal: currentAbortController.signal });
                 if (!response.ok) {
                     throw new Error(`Stream request failed: ${response.status} ${response.statusText}`);
                 }
                 // Pass cached assistant message and raw content to continue from where we left off
-                await processStreamResponse(response, true, cachedAssistant, cachedRawContent);
+                result = await processStreamResponse(response, true, cachedAssistant, cachedRawContent);
             } catch (error) {
-                console.error('Stream error:', error);
-                setStreamingForConv(currentConversationId, false);
-                showStreamingBadge(false);
+                if (error.name === 'AbortError') {
+                    console.log('[stream] Aborted (switch or new stream started)');
+                } else {
+                    console.error('Stream error:', error);
+                    setStreamingForConv(currentConversationId, false);
+                    showStreamingBadge(false);
+                }
                 return false;
             }
-
-            // Clear streaming state when done
-            setStreamingForConv(currentConversationId, false);
-            showStreamingBadge(false);
-            clearChunkCache(currentConversationId);
-            return true;
+            if (result === true){
+                // Clear streaming state when done
+                setStreamingForConv(currentConversationId, false);
+                showStreamingBadge(false);
+                clearChunkCache(currentConversationId);
+                return true;
+            }
         }
 
         // Show/hide streaming badge on conversation item
@@ -1084,6 +1100,9 @@
             showStreamingBadge(true);
             let result = null;
 
+            // Create abort controller for this stream
+            currentAbortController = new AbortController();
+
             try {
                 const response = await fetch('/api/chat/stream', {
                     method: 'POST',
@@ -1091,7 +1110,8 @@
                     body: JSON.stringify({
                         message,
                         conversation_id: currentConversationId
-                    })
+                    }),
+                    signal: currentAbortController.signal
                 });
 
                 if (!response.ok) {
@@ -1102,13 +1122,20 @@
                 result = await processStreamResponse(response, false, assistantMessage);
 
             } catch (error) {
-                // Remove placeholder on error
-                if (assistantMessage && assistantMessage.parentNode) {
-                    assistantMessage.remove();
-                }
-                addMessage('assistant', 'Sorry, an error occurred. Please try again.');
-                console.error('Error:', error);
-                result = true;
+                if (error.name !== 'AbortError') {
+                    // Remove placeholder on error
+                    if (assistantMessage && assistantMessage.parentNode) {
+                        assistantMessage.remove();
+                    }
+                    addMessage('assistant', 'Sorry, an error occurred. Please try again.');
+                    console.error('Error:', error);
+                } else {
+                    console.log('[stream] Aborted (switch or new stream started)');
+                    if (assistantMessage && assistantMessage.parentNode) {
+                        assistantMessage.remove();
+                    }
+                    result = true;
+                }  
             }
             if (result === true){
                 localStorage.setItem("test", "1111111");
