@@ -921,7 +921,6 @@
                     if (!assistantMessage) {
                         assistantMessage = addMessage('assistant', '');
                     }
-
                     if (data.type === 'thinking') {
                         const thinkingElement = assistantMessage.querySelector('.thinking-content');
                         if (thinkingElement) {
@@ -1177,6 +1176,8 @@
             let rawContent = existingRawContent;
             let thinkingContent = thinkingElement ? thinkingElement.textContent : '';
             let sseBuffer = '';  // Accumulator for incomplete SSE events
+            // note: this renderer should not be ended during one continuous streaming (no switch or refresh)
+            let renderer = null, parser = null;
 
             // Get current pointer from localStorage
             currentPointer = parseInt(localStorage.getItem(STORAGE_KEYS.POINTER(convId)) || '0', 10);
@@ -1201,8 +1202,6 @@
                 // Split and process complete events, keep remainder in buffer
                 const events = sseBuffer.split('\n\n');
                 sseBuffer = events.pop() || '';  // Keep incomplete event in buffer
-
-                let renderer = null, parser = null;
 
                 for (const event of events) {
                     if (!event.startsWith('data: ')) continue;
