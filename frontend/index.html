@@ -654,6 +654,7 @@
                 renderer = smd.default_renderer(div);
                 parser = smd.parser(renderer);
             }
+            // not used for now
             DOMPurify(content);
             smd.parser_write(parser, content);
             applyLaTeX(div);
@@ -722,7 +723,7 @@
 
             if (currentConversationId) {
                 // Check if stream is still active
-                status = await checkStreamStatus();
+                let status = await checkStreamStatus();
                 // skip the history if it is active
                 if (status === true) return;
                 // Load displayed content from history
@@ -769,6 +770,17 @@
 
             div.appendChild(titleSpan);
             div.appendChild(deleteBtn);
+
+            // Derive streaming badge from localStorage so the badge is applied
+            // on every sidebar render — including the new-conversation case
+            // where the item didn't exist when showStreamingBadge was first called.
+            if (isStreamingForConv(conv.conversation_id)) {
+                const badge = document.createElement('span');
+                badge.className = 'streaming-badge';
+                badge.textContent = 'Streaming';
+                div.appendChild(badge);
+            }
+
             div.onclick = () => switchConversation(conv.conversation_id);
 
             conversationList.appendChild(div);
@@ -795,7 +807,7 @@
                 el.classList.toggle('active', el.dataset.id === convId);
             });
 
-            status = await checkStreamStatus();
+            let status = await checkStreamStatus();
             // if the conversation is resuming, skip the history logic
             if (status === true) {
                 return;
@@ -929,7 +941,7 @@
                             const result = renderContent(contentDiv, data.chunk, renderer, parser);
                             if (result) {
                                 [renderer, parser] = result;
-                                end_parser(parser);
+                                // end_parser(parser);
                             }
                         }
                     }
@@ -937,7 +949,7 @@
             }
 
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            return {assistantMessage, rawContent};
+            return {assistantMessage, rawContent, renderer, parser};
         }
 
         // Resume stream from specific position
@@ -954,7 +966,7 @@
                 }
 
             // First, render cached chunks from localStorage
-            const { assistantMessage: cachedAssistant, rawContent: cachedRawContent } = renderCachedChunks(currentConversationId);
+            const { assistantMessage: cachedAssistant, rawContent: cachedRawContent, renderer: cachedRenderer, parser: cachedParser } = renderCachedChunks(currentConversationId);
 
             // Mark this conversation as streaming (for safety check in processStreamResponse)
             setStreamingForConv(currentConversationId, true);
@@ -971,8 +983,9 @@
                 if (!response.ok) {
                     throw new Error(`Stream request failed: ${response.status} ${response.statusText}`);
                 }
-                // Pass cached assistant message and raw content to continue from where we left off
-                result = await processStreamResponse(response, true, cachedAssistant, cachedRawContent);
+                // Pass cached assistant message, raw content, and parser/renderer to continue from where we left off
+                // so the markdown parser state (tables, code blocks) carries across the cache-replay → live-stream boundary.
+                result = await processStreamResponse(response, true, cachedAssistant, cachedRawContent, cachedRenderer, cachedParser);
             } catch (error) {
                 if (error.name === 'AbortError') {
                     // Stream was aborted (user switched conversation or started a new stream)
@@ -1010,11 +1023,24 @@
 
         // Start new chat
         async function startNewChat() {
+            // Abort any ongoing stream for the current conversation so the user
+            // is not stuck waiting for it before they can send in the new chat.
+            if (currentAbortController) {
+                currentAbortController.abort();
+                currentAbortController = null;
+            }
+
             currentConversationId = null;
             localStorage.removeItem('currentConversationId');
             messagesContainer.innerHTML = '';
             messagesContainer.classList.add('empty');
             document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
+
+            // Reset UI state so the user can immediately send in the new conversation
+            sendButton.disabled = false;
+            messageInput.value = '';
+            messageInput.style.height = '';
+
             messageInput.focus();
         }
 
@@ -1137,7 +1163,7 @@
         }
 
         // Process SSE stream response
-        async function processStreamResponse(response, isResume, existingMessage = null, existingRawContent = '') {
+        async function processStreamResponse(response, isResume, existingMessage = null, existingRawContent = '', existingRenderer = null, existingParser = null) {
             // Capture conversationId at start - only process if this conversation is still current
             const convId = currentConversationId;
             if (!convId) {
@@ -1162,7 +1188,9 @@
             let thinkingContent = thinkingElement ? thinkingElement.textContent : '';
             let sseBuffer = '';  // Accumulator for incomplete SSE events
             // note: this renderer should not be ended during one continuous streaming (no switch or refresh)
-            let renderer = null, parser = null;
+            // If a parser/renderer was already created (e.g. by renderCachedChunks during resume),
+            // reuse it so markdown state (tables, code blocks) carries across the cache/new boundary.
+            let renderer = existingRenderer, parser = existingParser;
 
             // Get current pointer from localStorage
             currentPointer = parseInt(localStorage.getItem(STORAGE_KEYS.POINTER(convId)) || '0', 10);

@@ -12,9 +12,10 @@ def create_chain():
     os.environ["ANTHROPIC_API_BASE"] = settings.anthropic_base_url
 
     llm = ChatAnthropic(
-        model="minimax-2.7-highspeed",
+        model="minimax-3",
         anthropic_api_key=settings.anthropic_api_key,
-        max_tokens=4096,
+        max_tokens=16000,
+        thinking={"type": "enabled", "budget_tokens": 10000},
     )
 
     def convert_messages(messages: list) -> list:

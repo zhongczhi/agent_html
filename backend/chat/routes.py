@@ -58,8 +58,10 @@ async def stream_from_job(
     from_pointer is provided by frontend to resume from a specific position.
     Backend does NOT track sent_pointer.
     """
-    # Error handling
-    if from_pointer > len(job.chunks) or (from_pointer == len(job.chunks) and len(job.chunks) != 0):
+    # Error handling: from_pointer must be within valid range.
+    # from_pointer == len(job.chunks) is a VALID boundary (all current chunks
+    # already sent); we still need to wait for queued chunks and the end marker.
+    if from_pointer < 0 or from_pointer > len(job.chunks):
         return
 
     # load strictly from chunks if inactive

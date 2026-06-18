@@ -33,9 +33,19 @@ def test_append_chunk_adds_to_chunks_and_queue():
     job.append_chunk("token", "Hello")
 
     assert len(job.chunks) == 2
-    assert job.chunks[0] == {"chunk": "First thought", "type": "thinking"}
-    assert job.chunks[1] == {"chunk": "Hello", "type": "token"}
+    assert job.chunks[0]["chunk"] == "First thought"
+    assert job.chunks[0]["type"] == "thinking"
+    assert "message_id" in job.chunks[0]
+    assert job.chunks[1]["chunk"] == "Hello"
+    assert job.chunks[1]["type"] == "token"
+    assert "message_id" in job.chunks[1]
 
     # Queue should have same items
-    assert job.chunk_queue.get_nowait() == {"chunk": "First thought", "type": "thinking"}
-    assert job.chunk_queue.get_nowait() == {"chunk": "Hello", "type": "token"}
+    q0 = job.chunk_queue.get_nowait()
+    assert q0["chunk"] == "First thought"
+    assert q0["type"] == "thinking"
+    assert "message_id" in q0
+    q1 = job.chunk_queue.get_nowait()
+    assert q1["chunk"] == "Hello"
+    assert q1["type"] == "token"
+    assert "message_id" in q1
