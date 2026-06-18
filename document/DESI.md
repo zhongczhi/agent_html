@@ -75,6 +75,42 @@
 
 **Rationale:** Allows seamless continuation when user switches tabs/refreshes during streaming. Background task continues generating while frontend reconnects.
 
+### 1.10 Two-Cache Frontend Architecture
+
+**Choice:** Maintain two separate localStorage caches — `history_{convId}` for full message lists and `chunks_{convId}` for in-flight streaming chunks.
+
+**Rationale:** History cache stores the "done" state (complete messages, updated on stream end via append); chunks cache stores the "in-flight" state (individual tokens, updated per chunk). Different update patterns and different consumers (`loadConversation` vs. `processStreamResponse`). Separation makes invalidation explicit and avoids mixing concerns. The history cache is loaded cache-first by `loadConversation`, with a backend fetch on miss and a stale-chunks-cache clear on success.
+
+### 1.11 New Conversation Sidebar Visibility
+
+**Choice:** When a brand-new conversation is created, the backend appends the user message to storage synchronously in `stream_chat` (before the background LLM task starts).
+
+**Rationale:** Without this, the new conversation only appears in the sidebar after the LLM finishes streaming (5-30+ seconds later) and lacks a user-message-derived title. The synchronous append also relies on `get_or_create_job` calling `file_storage.create_conversation(conversation_id)` to ensure an empty entry exists. The background task has an idempotency check to avoid duplicating the user message.
+
+### 1.12 SSE Event Boundary Handling
+
+**Choice:** The frontend SSE parser accumulates chunks in an `sseBuffer` variable, splits on `\n\n` per SSE spec, and retains the trailing incomplete event in the buffer for the next chunk.
+
+**Rationale:** A single network read can split events across chunks. Without buffering, JSON payloads straddling a boundary would produce parse errors or dropped data. Buffering by the actual `\n\n` boundary (not chunk boundary) correctly handles any chunk size.
+
+### 1.13 Streaming Markdown Parser State Preservation
+
+**Choice:** The `streaming-markdown` parser/renderer is hoisted to function scope in `processStreamResponse` and created once per stream.
+
+**Rationale:** The library is stateful — `parser_write` accumulates tokens so multi-line constructs (tables, fenced code blocks, math blocks, lists, blockquotes) render correctly when their tokens arrive in multiple chunks. Hoisting prevents the parser from being recreated on every chunk batch. `parser_end` is called exactly once on stream completion (in the `data.end` handler). On resume, the parser created during `renderCachedChunks` is reused by `processStreamResponse` so multi-line constructs spanning the cache-replay → live-stream boundary render correctly.
+
+### 1.14 Backend Stream Resume Boundary Case
+
+**Choice:** The `stream_from_job` `from_pointer` guard treats `from_pointer == len(chunks)` as a valid boundary (all current chunks already sent), not as an out-of-range error. Only negative or strictly-greater-than pointers are rejected.
+
+**Rationale:** The frontend's pointer always lands at exactly `len(job.chunks)` during active streaming (because the user-entered message is only in `chunksCache`, not yet committed to history). Treating this as an error would cause the resume to return immediately and drop the live stream.
+
+### 1.15 LLM Model Configuration
+
+**Choice:** The backend LLM is configured as `minimax-3` with `max_tokens=16000` and `thinking={"type": "enabled", "budget_tokens": 10000}`.
+
+**Rationale:** The larger output budget (4× the previous 4096) supports long code blocks and multi-paragraph answers. Explicit extended thinking with a 10k budget reserves reasoning capacity; visible answer has ~6k tokens. Frontend already supports `thinking` blocks via the unified chunk format.
+
 ---
 
 ## 2. System Architecture
@@ -146,12 +182,12 @@ data: {"end": true}\n\n
 
 **New Stream:**
 1. Parse request body (`message`, `conversation_id`)
-2. Generate UUID for new conversation if needed
-3. Retrieve existing history or start fresh
-4. Append user message to history
+2. Generate UUID for new conversation if `conversation_id` is None
+3. Call `get_or_create_job(conversation_id, [])` — creates a `StreamJob` and ensures an empty conversation entry exists via `file_storage.create_conversation(conversation_id)`
+4. If the conversation is new (`existing_conv is None`), append the user message to storage synchronously in `stream_chat` before the background task starts (so the conversation appears in the sidebar with the correct title while the LLM is still generating)
 5. Start background task for LLM streaming
 6. Stream thinking chunks first, then token chunks via SSE
-7. Save assistant response (with thinking) on completion
+7. Save assistant response (with thinking) on completion (with idempotency check to skip duplicate user message append)
 
 **Resume Stream:**
 1. Check `STREAM_REGISTRY` for active job
@@ -226,11 +262,14 @@ Note: `thinking` field is optional. History API returns thinking field for assis
 
 ### localStorage Keys
 
+The frontend maintains two separate caches per conversation: a **chunks cache** for in-flight streaming state and a **history cache** for the full message list (see Section 1.10).
+
 | Key | Purpose |
 |-----|---------|
 | `chunks_{conv_id}` | Cached chunks for resume |
 | `pointer_{conv_id}` | Current position in stream |
 | `streaming_{conv_id}` | Active streaming state per conversation |
+| `history_{conv_id}` | Full message list for fast load on conversation switch/refresh |
 
 ### Conversation Switch Flow
 
@@ -286,13 +325,21 @@ Note: `thinking` field is optional. History API returns thinking field for assis
 
 | Function | Responsibility |
 |----------|---------------|
-| `processStreamResponse()` | Parse SSE, handle thinking + token events |
+| `processStreamResponse()` | Parse SSE via `sseBuffer` accumulator; handle thinking + token events; reuse parser/renderer across chunks; accept `existingRenderer` / `existingParser` and return `{renderer, parser}` for parser handoff on resume |
+| `renderContent()` | Lazy-create parser/renderer; write streaming-markdown tokens; apply LaTeX |
 | `addMessage()` | Create message element with proper structure |
 | `updateThinkingDisplay()` | Handle thinking content and fold/unfold |
 | `setupScrollbarAutoHide()` | Attach wheel listener to message blocks |
 | `autoResizeInput()` | Expand textarea with content |
-| `marked.parse()` | Render markdown |
-| `resumeStreamFromPosition()` | Resume stream from localStorage cache |
+| `resumeStreamFromPosition()` | Resume stream from localStorage cache; thread parser/renderer to `processStreamResponse` for handoff |
+| `loadConversation()` | Cache-first load: read `history_{convId}`; fetch from backend on miss and store; clear stale `chunks_{convId}` on success |
+| `sendMessage()` | Append user message to UI, then to history cache; trigger stream and `loadConversationList()` |
+| `deleteConversation()` | Remove conversation + all related caches (history + chunks + pointer + streaming) |
+| `loadConversationList()` | Derive streaming badge from `isStreamingForConv()` on every render (not just once at send time) |
+| `startNewChat()` | Abort in-flight stream via `currentAbortController`; clear current conversation; reset input + send button; refocus input |
+| `getHistoryCache()` / `setHistoryCache()` / `appendToHistoryCache()` / `clearHistoryCache()` / `clearChunkCache()` | History cache helpers |
+| `renderMessagesFromCache()` | Re-render message list from cached or fetched messages array |
+| `isStreamingForConv()` | Check whether the streaming flag is set in localStorage for a given conversation |
 
 ---
 
@@ -309,7 +356,7 @@ class StreamJob:
     ):
         self.conversation_id = conversation_id
         self.status: Literal["pending", "active", "completed", "failed"] = "pending"
-        self.chunks: List[dict] = []  # [{"chunk": "text", "type": "thinking|token"}]
+        self.chunks: List[dict] = []  # [{"chunk": "text", "type": "thinking|token", "message_id": str}] — message_id is for debug tracing; frontend does not depend on it
         self.chunk_queue: asyncio.Queue = asyncio.Queue()
         self.messages: List[dict] = messages or []
         self.error: Optional[str] = None
@@ -420,6 +467,54 @@ resumeStream() → GET /api/chat/stream/{id}?from_pointer=N
 Receive remaining chunks via SSE
 Append to displayed content
 ```
+
+### 8.9 Two-Cache Architecture
+
+The frontend maintains separate history and chunks caches with different update patterns and consumers. Edge cases:
+
+- **Empty cache on first load**: `getHistoryCache()` returns null; `loadConversation` falls through to backend and populates the cache.
+- **Cache exists but conversation was deleted on another tab**: Local cache remains; backend returns empty array on next load. Cross-tab invalidation is out of scope.
+- **Resume streaming after refresh**: `checkStreamStatus` → `resumeStreamFromPosition` continues to use `chunks_{convId}` and `pointer_{convId}`. After resume, the new assistant message is appended to `history_{convId}`.
+- **Switching conversations mid-stream**: Only the streaming conversation's chunks/pointer are updated. Other conversations' history cache is untouched. On switch back, `loadConversation` reads from cache.
+- **Stale chunks cleared on history load**: `loadConversation` calls `clearChunkCache(convId)` after a successful backend fetch so a stale in-flight chunk cache cannot replay on top of fresh history.
+
+### 8.10 SSE Event Boundary Handling
+
+The frontend SSE parser uses an `sseBuffer` accumulator to handle events that straddle chunk boundaries.
+
+- **Chunk ends mid-event**: Incomplete event kept in buffer, combined with next chunk.
+- **Multiple events in one chunk**: All complete events processed; only the trailing partial is buffered.
+- **Stream ends mid-event**: Partial is silently dropped (per SSE spec — incomplete events are dropped).
+- **Empty `\n\n` at end of chunk**: Produces empty string in events list; ignored by the `event.startsWith('data: ')` guard.
+- **Conversation switch mid-stream**: `convId !== currentConversationId` returns early, dropping partial work cleanly.
+
+### 8.11 Parser State Across Chunks and Resume
+
+The streaming markdown parser is hoisted to function scope so it persists across chunks within a single stream, and survives the cache-replay → live-stream boundary on resume.
+
+- **Markdown table split across chunks**: Parser accumulates all rows; table renders correctly when complete.
+- **Fenced code block split across chunks**: Parser accumulates opening fence, content, closing fence.
+- **Multi-line math block split across chunks**: `applyLaTeX` finds `<equation-block>` tags after parser finalizes.
+- **Conversation switch during stream**: `processStreamResponse` returns early; parser is discarded with the message element. On resume, a new parser is created (or the one from cache replay is reused).
+- **Cache replay from localStorage**: `renderCachedChunks` reuses the same `renderContent` path; the parser is created once and reused for all cached chunks, then handed off to `processStreamResponse`.
+- **Empty content chunk**: `renderContent` early-returns; parser state untouched.
+- **No thinking block**: `smd.parser_write` is still called on every token chunk; render path is unchanged.
+
+### 8.12 New Chat UX
+
+- **No in-flight stream**: `currentAbortController` is null; abort block is a no-op.
+- **Stream in-flight when new chat clicked**: Stream aborts; new chat is immediate; previous stream's `data.end` handler is a no-op because `currentConversationId` has changed.
+- **Sidebar re-render mid-stream**: Streaming badge derived from `isStreamingForConv()`; appears correctly on the active conversation item.
+- **Sidebar re-render post-stream**: `isStreamingForConv` returns false; no badge.
+- **Rapid double-click on New Chat**: First call aborts; second call sees null controller; both safely no-op.
+
+### 8.13 Backend Stream Resume Boundary Case
+
+- **`from_pointer == 0`, no chunks yet**: Valid; queue loop runs until chunks arrive or end marker.
+- **`from_pointer == len(chunks)`, stream still active**: Valid boundary (previously bug); slice is empty, queue loop streams new chunks.
+- **`from_pointer == len(chunks)`, stream completed**: Valid; slice is empty, queue loop terminates immediately on `status != "active"`.
+- **`from_pointer > len(chunks)`**: Reject (returns nothing).
+- **`from_pointer < 0`**: Reject (defensive — frontends should never send negative).
 
 ---
 
@@ -572,8 +667,11 @@ httpx>=0.25.0
 |------|---------|
 | `backend/chat/stream_manager.py` | Unified chunks list + chunk_queue (vs separate token/thinking) |
 | `backend/chat/service.py` | Uses `append_chunk(chunk_type, text)` for both thinking and tokens |
-| `backend/chat/routes.py` | Single `from_pointer` param, unified chunk events, `end: true` sentinel |
-| `frontend/index.html` | Unified chunk handling, cached chunks rendering, streaming state per conversation |
+| `backend/chat/routes.py` | Single `from_pointer` param, unified chunk events, `end: true` sentinel; `stream_chat` synchronously appends user message for new conversations; `stream_from_job` `from_pointer` guard relaxed so boundary case is valid |
+| `backend/chat/chain.py` | LLM configured as `minimax-3` with `max_tokens=16000` and extended thinking (`budget_tokens=10000`) |
+| `backend/chat/stream_manager.py` | `get_or_create_job` calls `file_storage.create_conversation(conversation_id)` to ensure an empty entry exists in the conversations list |
+| `backend/tests/test_chat_routes.py` | Added regression tests for `stream_from_job` boundary behavior (boundary yields end marker, boundary streams new chunks, out-of-range returns empty) |
+| `frontend/index.html` | Unified chunk handling, cached chunks rendering, streaming state per conversation; history cache (`history_{convId}`) with helpers; cache-first `loadConversation`; SSE event buffering; streaming markdown parser state preservation across chunks and across the cache-replay → live-stream resume boundary; streaming badge derived per-render; `startNewChat` aborts in-flight stream and resets UI state |
 
 ---
 

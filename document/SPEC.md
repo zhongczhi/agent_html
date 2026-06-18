@@ -6,6 +6,8 @@ A modular chatbot application that provides streaming AI responses with conversa
 
 **Core Goal:** Deliver a chat interface with real-time streaming responses, persistent conversation history, and LLM thinking content display.
 
+**Recent Improvements:** The system now includes a frontend conversation history cache for fast load, immediate sidebar visibility for new conversations, robust SSE event boundary handling, streaming markdown parser state preservation, an updated LLM model configuration with extended thinking, refined stream resume boundary semantics, and a streamlined new-chat UX.
+
 ---
 
 ## Functional Requirements
@@ -64,6 +66,79 @@ A modular chatbot application that provides streaming AI responses with conversa
 | FR-5.3 | Page refresh resumes from cached position |
 | FR-5.4 | Backend continues LLM generation when frontend disconnects |
 
+### FR-6: Frontend Conversation History Cache
+
+| ID | Requirement |
+|----|-------------|
+| FR-6.1 | Conversation message lists are cached in localStorage on first load |
+| FR-6.2 | `loadConversation` reads from cache if available, otherwise fetches from backend |
+| FR-6.3 | Cache persists across page refreshes |
+| FR-6.4 | Cache is invalidated when user deletes a conversation |
+| FR-6.5 | When a backend fetch succeeds, any stale `chunks_{conv_id}` is cleared so a leftover in-flight chunk cache cannot replay on top of fresh history |
+| FR-6.6 | When user sends a message, append `{role: 'user', content}` to history cache |
+| FR-6.7 | When streaming completes, append `{role: 'assistant', content, thinking?}` to history cache |
+| FR-6.8 | Cache grows via append only — no full replacement after new exchanges |
+| FR-6.9 | When streaming completes, the chunks cache (`chunks_{conv_id}`) is cleared |
+
+### FR-7: New Conversation Sidebar Visibility
+
+| ID | Requirement |
+|----|-------------|
+| FR-7.1 | A brand-new conversation appears in the sidebar immediately after the user sends the first message — before the LLM response is generated |
+| FR-7.2 | The sidebar title is derived from the user message (first 50 characters) |
+| FR-7.3 | The user message is appended to backend storage synchronously when the stream is initiated, so the conversation is visible in `GET /api/chat/conversations` right away |
+| FR-7.4 | The background LLM task does not duplicate the user message in conversation history |
+
+### FR-8: SSE Event Boundary Handling
+
+| ID | Requirement |
+|----|-------------|
+| FR-8.1 | The frontend SSE parser correctly handles events whose payload straddles two network chunks |
+| FR-8.2 | Partial events at the end of a chunk are buffered and combined with the next chunk |
+| FR-8.3 | Multiple complete events in one chunk are all processed |
+
+### FR-9: Streaming Markdown Parser State
+
+| ID | Requirement |
+|----|-------------|
+| FR-9.1 | Markdown with multi-line constructs (tables, fenced code blocks, math blocks, lists, blockquotes) renders correctly when the tokens for a single construct arrive in multiple SSE chunks |
+| FR-9.2 | The streaming markdown parser is created once per stream and reused across chunks so its state accumulates correctly |
+| FR-9.3 | The parser is finalized (`parser_end`) on stream completion, not during streaming |
+| FR-9.4 | Markdown parser state persists across the transition from cache replay to live streaming during a resume, so multi-line constructs spanning the resume boundary render correctly |
+
+### FR-10: Model Configuration
+
+| ID | Requirement |
+|----|-------------|
+| FR-10.1 | The backend LLM is configured to use the `minimax-3` model |
+| FR-10.2 | The maximum output tokens per response is 16000 |
+| FR-10.3 | Extended thinking is enabled with a budget of 10000 tokens |
+| FR-10.4 | The model name is recorded in the main SPEC document NFR-2 |
+
+### FR-11: Stream Resume Boundary
+
+| ID | Requirement |
+|----|-------------|
+| FR-11.1 | Resuming a stream with `from_pointer` equal to the current chunk count (the boundary case) yields queued chunks and the end marker instead of returning immediately |
+| FR-11.2 | Resuming a stream with a genuinely out-of-range `from_pointer` (greater than the current chunk count) returns immediately with no events |
+| FR-11.3 | A chunk appended to a stream after a boundary resume is yielded to the new resume request |
+
+### FR-12: New Chat UX
+
+| ID | Requirement |
+|----|-------------|
+| FR-12.1 | Starting a new chat aborts any in-flight stream for the current conversation before clearing UI state |
+| FR-12.2 | After starting a new chat, the input field is empty, the send button is enabled, and the input is focused for immediate typing |
+| FR-12.3 | The message input's auto-grow height is reset to default on new chat |
+
+### FR-13: Streaming Badge
+
+| ID | Requirement |
+|----|-------------|
+| FR-13.1 | The streaming badge is shown on a sidebar conversation item whenever that conversation is actively streaming |
+| FR-13.2 | The streaming badge is derived from localStorage state on every sidebar render (not just once when the message is sent), so brand-new conversations display the badge correctly on their first appearance in the sidebar |
+| FR-13.3 | The streaming badge is removed from a sidebar item once streaming completes for that conversation |
+
 ---
 
 ## Non-Functional Requirements
@@ -78,8 +153,9 @@ A modular chatbot application that provides streaming AI responses with conversa
 ### NFR-2: Performance
 
 - Streaming latency: tokens delivered as generated, not batched
-- Model: `minimax-2.7-highspeed`
-- Max tokens per response: 4096
+- Model: `minimax-3`
+- Max output tokens per response: 16000
+- Extended thinking is enabled with a 10000-token budget (visible answer has ~6000 tokens after reasoning)
 
 ### NFR-3: Reliability
 
@@ -239,11 +315,14 @@ Note: `thinking` field is optional and only present on assistant messages when t
 
 ### localStorage Schema (Frontend)
 
+The frontend maintains two separate caches per conversation: a **history cache** for the full message list (the "done" state) and a **chunks cache** for in-flight streaming chunks (the "in-flight" state).
+
 | Key | Content |
 |-----|---------|
-| `chunks_{conv_id}` | JSON array of chunks `[{"chunk": str, "type": "thinking|token"}]` |
+| `chunks_{conv_id}` | JSON array of stream chunks `[{"chunk": str, "type": "thinking\|token", "message_id": str?}]` — `message_id` is emitted by the backend for debug tracing; the frontend does not depend on or consume it |
 | `pointer_{conv_id}` | Integer position for resume |
 | `streaming_{conv_id}` | Boolean flag for active streaming |
+| `history_{conv_id}` | JSON array of complete messages `[{"role": "user"\|"assistant", "content": "...", "thinking": "..."?}]` |
 
 ---
 
@@ -295,6 +374,9 @@ Note: `thinking` field is optional and only present on assistant messages when t
 - Authentication / API key management
 - PostgreSQL storage (current: JSON file)
 - Conversation memory buffer
-- Cross-browser tab synchronization
+- Cross-browser tab synchronization (cross-tab cache invalidation included)
 - Conversation search/filter
 - Stream backpressure handling
+- Cache expiration / TTL
+- Cache size limits
+- Preloading caches for multiple conversations
