@@ -16,6 +16,7 @@ class StreamJob:
         self.chunk_queue: asyncio.Queue = asyncio.Queue()
         self.messages: List[dict] = messages or []
         self.error: Optional[str] = None
+        self.cancelled: bool = False  # Set by clear_job when the user deletes the conversation
         self.created_at = datetime.now(timezone.utc)
         self.updated_at = datetime.now(timezone.utc)
 
@@ -59,4 +60,5 @@ def get_job(conversation_id: str) -> Optional[StreamJob]:
 
 def clear_job(conversation_id: str) -> None:
     if conversation_id in STREAM_REGISTRY:
+        STREAM_REGISTRY[conversation_id].cancelled = True
         del STREAM_REGISTRY[conversation_id]

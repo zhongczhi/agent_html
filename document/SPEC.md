@@ -6,7 +6,7 @@ A modular chatbot application that provides streaming AI responses with conversa
 
 **Core Goal:** Deliver a chat interface with real-time streaming responses, persistent conversation history, and LLM thinking content display.
 
-**Recent Improvements:** The system now includes a frontend conversation history cache for fast load, immediate sidebar visibility for new conversations, robust SSE event boundary handling, streaming markdown parser state preservation, an updated LLM model configuration with extended thinking, refined stream resume boundary semantics, and a streamlined new-chat UX.
+**Recent Improvements:** The system now includes a frontend conversation history cache for fast load, immediate sidebar visibility for new conversations, robust SSE event boundary handling, streaming markdown parser state preservation, an updated LLM model configuration with extended thinking, refined stream resume boundary semantics, a streamlined new-chat UX, stream resume that survives any number of mid-stream refreshes, a themed confirmation modal that replaces the browser-native dialog, batch delete for conversations, a fix for the streaming-conversation resurrection bug, smart auto-scroll that respects manual scrolling during streaming, and a guard that blocks sending messages while in batch-deletion selection mode.
 
 ---
 
@@ -138,6 +138,71 @@ A modular chatbot application that provides streaming AI responses with conversa
 | FR-13.1 | The streaming badge is shown on a sidebar conversation item whenever that conversation is actively streaming |
 | FR-13.2 | The streaming badge is derived from localStorage state on every sidebar render (not just once when the message is sent), so brand-new conversations display the badge correctly on their first appearance in the sidebar |
 | FR-13.3 | The streaming badge is removed from a sidebar item once streaming completes for that conversation |
+
+### FR-14: Stream Resume Survives Repeated Refresh
+
+| ID | Requirement |
+|----|-------------|
+| FR-14.1 | On any number of refreshes during the streaming phase of a conversation, the partial assistant message (every token and thinking chunk stored in the chunk cache) is rendered before live streaming resumes |
+| FR-14.2 | Live streaming continues to the same assistant message DOM node after the partial message is rendered |
+| FR-14.3 | The streaming badge appears on the sidebar item for the active conversation on every refresh during streaming |
+| FR-14.4 | The fix does not regress first-refresh-during-streaming, post-completion refresh, or new-message flows |
+
+### FR-15: Custom Confirmation Modal
+
+| ID | Requirement |
+|----|-------------|
+| FR-15.1 | A reusable confirmation modal component is provided (function `showConfirmModal({title, message, confirmText, cancelText, danger})` returns a Promise resolving to `true`/`false`) |
+| FR-15.2 | The modal is rendered with a semi-transparent backdrop covering the whole viewport and is centered horizontally and vertically |
+| FR-15.3 | The modal uses page-theme colors: `var(--bg-secondary)` background, `var(--border-color)` border, `var(--text-primary)` text, `var(--text-secondary)` muted text |
+| FR-15.4 | The modal has a title, a message, a Cancel button (secondary), and a Confirm button (primary, red/danger when `danger: true`) |
+| FR-15.5 | Clicking the backdrop, pressing Escape, or clicking Cancel closes the modal and resolves the Promise with `false` |
+| FR-15.6 | Clicking Confirm closes the modal and resolves the Promise with `true` |
+| FR-15.7 | All delete confirmations (single, batch) use this modal instead of `confirm()` — no browser-native `confirm()` calls remain in the codebase |
+
+### FR-16: Batch Delete
+
+| ID | Requirement |
+|----|-------------|
+| FR-16.1 | The sidebar-header `≡` button is replaced with a "Batch Delete" button (icon: trash) |
+| FR-16.2 | Clicking "Batch Delete" enters selection mode |
+| FR-16.3 | In selection mode, each conversation item shows a leading checkbox; the per-item `×` delete button is hidden |
+| FR-16.4 | Clicking a conversation's checkbox toggles its selection state |
+| FR-16.5 | The sidebar header in selection mode shows: a count, a Delete button, and a Cancel button — replacing the normal header content |
+| FR-16.6 | The Delete button is disabled when zero items are selected; enabled and shows the count when one or more are selected |
+| FR-16.7 | Clicking Cancel exits selection mode without deleting anything |
+| FR-16.8 | Clicking Delete opens the themed confirmation modal with the count and item titles |
+| FR-16.9 | On confirmation, all selected conversations are deleted: frontend caches cleared, backend DELETE called per item |
+| FR-16.10 | After batch deletion completes, selection mode exits and the sidebar list refreshes |
+| FR-16.11 | If the currently-active conversation was among the deleted ones, the user is switched to a new empty chat |
+| FR-16.12 | The chat-header `≡` button remains and still collapses/expands the sidebar |
+
+### FR-17: Streaming-Conversation Resurrection Fix
+
+| ID | Requirement |
+|----|-------------|
+| FR-17.1 | When the user deletes a conversation while the LLM is still generating, the conversation must NOT reappear in `GET /api/chat/conversations` after the LLM finishes |
+| FR-17.2 | The fix does not affect the normal stream-completion path (no delete): the assistant message is still appended to storage on `data.end` |
+| FR-17.3 | The fix does not affect conversations that have no in-flight background task at delete time |
+| FR-17.4 | The fix is contained to the backend (no frontend changes required) |
+
+### FR-18: Smart Auto-Scroll During Streaming
+
+| ID | Requirement |
+|----|-------------|
+| FR-18.1 | During streaming, the messages container auto-scrolls to the bottom on each chunk **only if** the user was already at (or within 50px of) the bottom before the chunk was applied |
+| FR-18.2 | The "pinned" state is captured BEFORE the DOM update for the chunk, since the per-chunk content height can exceed 50px and would cause a post-update check to incorrectly report "not pinned" |
+| FR-18.3 | Scrolling back to the bottom during streaming re-pins the scroll on the next chunk |
+| FR-18.4 | Other scroll sites (cached-chunks replay on resume, sendMessage placeholder, addMessage) are unchanged — they happen once per action and aren't per-chunk auto-scrolls |
+
+### FR-19: Block Sending Messages in Selection Mode
+
+| ID | Requirement |
+|----|-------------|
+| FR-19.1 | When `sendMessage()` is invoked while `selectionMode === true`, the function returns immediately without mutating any state (selection, active conversation, messages, input value) |
+| FR-19.2 | The Send button click handler routes through `sendMessage()` and is therefore blocked by FR-19.1 |
+| FR-19.3 | The `messageInput` `keydown` handler (Enter key, when Shift is not held) routes through `sendMessage()` and is therefore blocked by FR-19.1 |
+| FR-19.4 | After exiting selection mode (Cancel button), Send and Enter both work normally — no regression |
 
 ---
 

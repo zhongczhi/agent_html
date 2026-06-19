@@ -34,6 +34,12 @@ class ChatService:
 
         try:
             async for chunk in self.chain.astream(messages):
+                # If the user deleted the conversation mid-stream, stop early and
+                # do NOT call mark_completed or save_conversation — that would
+                # resurrect the deleted conversation in storage.
+                if job.cancelled:
+                    return
+
                 content = None
                 if hasattr(chunk, "content"):
                     content = chunk.content
@@ -58,6 +64,10 @@ class ChatService:
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             job.mark_failed(str(e))
+            return
+
+        # Defensive: if cancellation happened right as the LLM finished, do not save.
+        if job.cancelled:
             return
 
         job.mark_completed()

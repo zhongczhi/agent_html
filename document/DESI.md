@@ -20,7 +20,7 @@
 - LCEL enables clean streaming chain composition
 - Built-in support for Anthropic models via MiniMax endpoint
 - Easy to swap models without changing application logic
-- Environment variables: `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`
+- User-facing environment variables: `ANTHROPIC_BASE_URL` (consumed by `pydantic-settings`) and `ANTHROPIC_API_KEY`. Internally `chain.py` also sets the legacy `ANTHROPIC_API_BASE` env var because `langchain-anthropic` reads that name.
 
 ### 1.3 Storage: JSON Files
 
@@ -99,13 +99,55 @@
 
 **Rationale:** The library is stateful — `parser_write` accumulates tokens so multi-line constructs (tables, fenced code blocks, math blocks, lists, blockquotes) render correctly when their tokens arrive in multiple chunks. Hoisting prevents the parser from being recreated on every chunk batch. `parser_end` is called exactly once on stream completion (in the `data.end` handler). On resume, the parser created during `renderCachedChunks` is reused by `processStreamResponse` so multi-line constructs spanning the cache-replay → live-stream boundary render correctly.
 
-### 1.14 Backend Stream Resume Boundary Case
+### 1.14 Stream Resume Error Handling
+
+**Choice:** In `resumeStreamFromPosition`'s catch block, drop any error-type branching. Log the error and return false; do not touch the streaming flag or badge.
+
+**Rationale:** The streaming flag has exactly two responsibilities — `init` / `checkStreamStatus` decides whether to attempt a resume on page load, and `loadConversationList` derives the sidebar "Streaming" badge. For (1), a transient fetch failure must leave the flag set so the next refresh can retry. The flag should only be cleared on `data.end` or on explicit user action. A fetch killed by browser navigation (refresh, close tab, back button) is rejected with `TypeError: network error` rather than `AbortError`; the two cannot be reliably distinguished, so both are treated as transient.
+
+### 1.15 init Fallback Gate
+
+**Choice:** In `init`, only fall through to `loadConversation` when the streaming flag was unset at the start of the decision.
+
+**Rationale:** `checkStreamStatus` calls `resumeStreamFromPosition`, which always renders cached chunks into the DOM before issuing the network fetch. Whatever happens afterwards, the partial content stays in the DOM. Calling `loadConversation` after a resume attempt would `messagesContainer.innerHTML = ''` and re-render only what is in the history cache (missing the in-progress assistant message), wiping the partial content.
+
+### 1.16 Custom Confirmation Modal
+
+**Choice:** A single reusable modal element appended to `<body>` with a single `showConfirmModal({title, message, confirmText, cancelText, danger})` helper that returns a Promise resolving to `true`/`false`.
+
+**Rationale:** Browser-native `confirm()` has a generic OS look that does not match the page's dark-theme + cyan/purple-accent styling. The helper uses the same theme tokens as the rest of the page (`var(--bg-secondary)`, `var(--border-color)`, etc.) and is invoked by both single-item and batch deletion.
+
+### 1.17 Batch Delete Selection Mode
+
+**Choice:** Module-level state (`selectionMode: boolean`, `selectedConvIds: Set`) toggled via `enterSelectionMode()` / `exitSelectionMode()`. The sidebar header has two layouts (normal vs selection), switched in a single `renderSidebarHeader()` function that reads `selectionMode`. `+ New Chat` is hidden in selection mode; the per-item `×` is also hidden so the user uses the batch Delete button exclusively.
+
+**Rationale:** A `Set` makes add/remove/lookup O(1) and avoids duplicate selections. Two layout branches in one renderer keeps the DOM state in sync without separate header functions. Hiding `+ New Chat` and per-item `×` in selection mode prevents the user from inadvertently starting a new chat or single-deleting an item while in "I'm about to delete these" mode.
+
+### 1.18 StreamJob Cancellation Flag
+
+**Choice:** `StreamJob` carries a `cancelled: bool` flag. `clear_job` sets the flag before removing the job from `STREAM_REGISTRY`. `generate_background` checks the flag mid-loop and immediately before `save_conversation`, bailing out without `mark_completed` or save if set.
+
+**Rationale:** `generate_background` is a fire-and-forget `asyncio.create_task`. Deleting the conversation only removes the `StreamJob` and the entry from `conversations.json` — it does not stop the background task. When the task finishes, `file_storage.save_conversation` is create-or-update and silently re-creates the deleted entry (the "resurrection" bug). A `cancelled` flag stops the background task at its next natural checkpoint without taking the heavier step of cancelling the asyncio task itself (which would abort the LLM read but waste server-side LLM work).
+
+### 1.19 Smart Auto-Scroll Pin State
+
+**Choice:** During streaming, capture the user's pinned-to-bottom state BEFORE each chunk's DOM update, and only force `scrollTop = scrollHeight` when the captured state is true.
+
+**Rationale:** A naive post-update check breaks because a single chunk can add more than 50px of height, causing the post-update check to incorrectly report "not pinned" even though the user never scrolled. Capturing pre-update reflects the user's true intent at the moment the chunk arrived.
+
+### 1.20 Selection-Mode Send Guard
+
+**Choice:** An early-return guard at the top of `sendMessage()` checks `selectionMode` and returns immediately if true. No UI changes — the textarea and send button remain enabled-looking; the user is expected to exit selection mode via Cancel if they want to send.
+
+**Rationale:** Both the Send button click handler and the `messageInput` keydown (Enter) handler route through `sendMessage()`. Guarding `sendMessage()` blocks both paths with one line. Visual disablement is a separate UX choice and is intentionally omitted to keep the change minimal.
+
+### 1.21 Backend Stream Resume Boundary Case
 
 **Choice:** The `stream_from_job` `from_pointer` guard treats `from_pointer == len(chunks)` as a valid boundary (all current chunks already sent), not as an out-of-range error. Only negative or strictly-greater-than pointers are rejected.
 
 **Rationale:** The frontend's pointer always lands at exactly `len(job.chunks)` during active streaming (because the user-entered message is only in `chunksCache`, not yet committed to history). Treating this as an error would cause the resume to return immediately and drop the live stream.
 
-### 1.15 LLM Model Configuration
+### 1.22 LLM Model Configuration
 
 **Choice:** The backend LLM is configured as `minimax-3` with `max_tokens=16000` and `thinking={"type": "enabled", "budget_tokens": 10000}`.
 
@@ -234,7 +276,8 @@ Note: `thinking` field is optional. History API returns thinking field for assis
 | `get_conversation(id)` | Retrieve conversation or `None` |
 | `save_conversation(id, messages)` | Persist entire messages array |
 | `append_message(id, role, content)` | Append single message |
-| `list_conversations()` | Return sorted list (updated_at desc) |
+| `create_conversation(id)` | Create empty conversation entry; called by `get_or_create_job` so a brand-new conversation appears in the list before the first message arrives |
+| `get_conversation_list()` | Return sorted list (updated_at desc) |
 | `delete_conversation(id)` | Remove conversation, clear stream |
 
 **Error Handling:** Invalid JSON returns empty dict with warning log.
@@ -284,11 +327,11 @@ The frontend maintains two separate caches per conversation: a **chunks cache** 
 
 ### UI Styling
 
-- Centered chat container (max 800px)
+- Centered chat container (max 1100px)
 - User messages: right-aligned, blue bubble
 - Assistant messages: left-aligned, gray bubble
 - Thinking section: displayed above response, collapsible
-- Loading indicator: "Thinking..." with animated dots
+- Loading indicator: "Thinking" with animated dots
 
 ### Frontend Structure
 
@@ -304,7 +347,7 @@ The frontend maintains two separate caches per conversation: a **chunks cache** 
       <div class="thinking-content">...</div>
       <button class="thinking-toggle">Show more</button>
     </div>
-    <div class="message-content markdown-body"></div>
+    <div class="message-content"></div>
   </div>
 </div>
 ```
@@ -319,7 +362,7 @@ The frontend maintains two separate caches per conversation: a **chunks cache** 
 | `.thinking-collapsed` | Applied when thinking is collapsed |
 | `.scrollbar-visible` | Override scrollbar hiding |
 | `.empty` | On messages container when no messages |
-| `.markdown-body` | Rendered markdown content |
+| `.message-content` | Rendered markdown content (assistant body) |
 
 ### JavaScript Functions
 
@@ -516,6 +559,59 @@ The streaming markdown parser is hoisted to function scope so it persists across
 - **`from_pointer > len(chunks)`**: Reject (returns nothing).
 - **`from_pointer < 0`**: Reject (defensive — frontends should never send negative).
 
+### 8.14 Repeated Refresh During Streaming
+
+- **First refresh during streaming**: Streaming flag is `'true'` → `checkStreamStatus` → `resumeStreamFromPosition` renders cached chunks + processes live stream. DOM intact.
+- **Second (or Nth) refresh during streaming**: Same as first. Streaming flag survives (Part 14 / 1.14). `init` doesn't fall back (Part 15 / 1.15). DOM shows cached chunks + live tail.
+- **Stream completes naturally between refreshes**: `data.end` handler clears flag and chunks cache. Next refresh sees flag `'false'` → falls back to `loadConversation` → renders full history.
+- **Refresh after stream completes**: Flag `'false'` → `loadConversation` → history cache.
+- **New conversation in a fresh tab**: Flag `'true'` immediately after send → resume path. If stream is fast and already done, the resume gets the end marker on first read; flag cleared; UI correct.
+- **User switches conversation mid-stream**: `switchConversation` aborts `currentAbortController` → fetch throws `AbortError` → catch block logs and returns false → next refresh of the original conversation can resume from chunk cache. Streaming flag preserved.
+- **User clicks "New Chat" mid-stream**: `startNewChat` aborts controller + clears `currentConversationId`. No resume possible for the previous conversation from this tab.
+- **Genuine stream failure (backend 404, etc.)**: Fetch rejects with non-Abort error. Streaming flag preserved → next refresh retries.
+
+### 8.15 Confirmation Modal
+
+- **User presses Enter while modal is open**: Confirm button gets a click. For `danger: true`, focus is on cancel so Enter cancels instead.
+- **User double-clicks confirm**: First click resolves the Promise; modal hides immediately. Second click is a no-op.
+- **Page refresh while modal is open**: Modal element is gone with the page. No Promise resolution (caller never sees the result).
+- **Multiple concurrent confirmations**: Not supported. Caller awaits the Promise before issuing another.
+
+### 8.16 Batch Delete Selection Mode
+
+- **Enter selection mode with 0 conversations**: Selection mode renders, but list is empty; Delete button disabled.
+- **Enter selection mode with 1 conversation**: User can select and batch-delete that one item (effectively a single delete).
+- **Delete the active conversation**: After deletion, `startNewChat()` clears current conversation and resets input.
+- **Delete all conversations**: Sidebar becomes empty; selection mode exits.
+- **Switch conversation while in selection mode**: The row-click handler routes to selection toggle (not switch) — switching is disabled in selection mode.
+- **Refresh page while in selection mode**: `selectionMode` is module-level, not persisted. On reload, normal state is restored.
+- **Backend DELETE fails for one item**: Other deletions proceed; failed item is logged but UI does not block.
+
+### 8.17 Streaming-Conversation Resurrection
+
+- **User deletes right as LLM finishes**: The pre-save `if job.cancelled: return` catches it.
+- **User deletes before any chunks are received**: The mid-loop check triggers on the very first chunk iteration.
+- **`clear_job` is called multiple times**: Idempotent — flag is set once; subsequent calls are no-ops on the registry.
+- **Normal stream completion (no delete)**: `cancelled` stays `False`; the existing `mark_completed` + `save_conversation` path runs unchanged.
+- **LLM errors mid-stream (`generate_background` except branch)**: `mark_failed` runs as before; `save_conversation` is not called by this code path so cancellation is irrelevant.
+
+### 8.18 Smart Auto-Scroll Pin State
+
+- **User at bottom, chunk arrives with content > 50px**: `wasPinnedToBottom = true` (captured before), scroll restored to new bottom.
+- **User scrolled up to read earlier content, chunk arrives**: `wasPinnedToBottom = false` (captured before), scroll position preserved.
+- **User scrolls back to bottom manually, next chunk arrives**: `wasPinnedToBottom = true` again, scroll pinned.
+- **Page is shorter than clientHeight (no scroll possible)**: `scrollHeight - clientHeight <= 0`, always pinned; scroll is a no-op but harmless.
+- **Resize of the messages container (window resize) mid-stream**: The helper re-evaluates on every chunk, so the next chunk corrects any drift.
+- **Multiple rapid chunks**: Each captures its own pinned state; works correctly even at high token rates.
+
+### 8.19 Selection-Mode Send Guard
+
+- **User in selection mode, clicks Send button**: `sendMessage()` returns immediately — no message, no state change.
+- **User in selection mode, presses Enter in textarea**: Same — `sendMessage()` returns.
+- **User in selection mode, types text and tries to send**: Text stays in the input; no send.
+- **User exits selection mode (Cancel), then sends**: Guard is a no-op; normal flow.
+- **`sendMessage()` called programmatically while in selection mode**: Returns immediately — future-proofs against any other call path.
+
 ---
 
 ## 9. Error Handling
@@ -533,7 +629,6 @@ The streaming markdown parser is hoisted to function scope so it persists across
 | Scenario | Handling |
 |----------|----------|
 | Stream fetch fails | Show error message, retry button |
-| localStorage full | Fall back to memory-only caching |
 | Parse error | Ignore malformed SSE lines |
 
 ---
@@ -568,7 +663,7 @@ Frontend clears `pointer_*` localStorage on `end: true`. Backend keeps StreamJob
 
 | File | What is Tested |
 |------|----------------|
-| `test_chat_service.py` | `ChatService.generate()` with mocked LLM |
+| `test_chat_service.py` | `ChatService.generate_background()` with mocked LLM |
 | `test_storage.py` | JSON read/write roundtrip |
 | `test_chat_routes.py` | HTTP endpoint responses |
 | `test_stream_manager.py` | StreamJob state transitions |
@@ -618,6 +713,60 @@ httpx>=0.25.0
 - [x] Pointer cleared on stream complete
 - [x] Resume renders cached chunks first, then continues streaming
 
+#### Repeated Refresh During Streaming
+
+**Frontend:**
+- [x] Streaming flag survives transient fetch errors (no longer cleared on `error.name !== 'AbortError'`)
+- [x] `init` does not fall back to `loadConversation` when the streaming flag is set
+- [x] 2nd, 3rd, 5th refresh during streaming all show the partial assistant message
+
+#### Confirmation Modal
+
+**Frontend:**
+- [x] `confirm()` is gone — replaced by `showConfirmModal`
+- [x] Modal is centered both horizontally and vertically
+- [x] Backdrop click and Escape close (cancel)
+- [x] Cancel and Confirm buttons work
+- [x] `danger: true` produces a red confirm button
+- [x] Focus moves to cancel when `danger: true` (Enter doesn't accidentally delete)
+
+#### Batch Delete
+
+**Frontend:**
+- [x] Sidebar-header shows "Batch Delete" instead of `≡`
+- [x] Selection mode shows checkboxes; clicking row toggles
+- [x] Header count updates as items are toggled
+- [x] Delete button disabled when count is 0
+- [x] Cancel exits selection mode
+- [x] Delete opens modal; confirm deletes all; cancel keeps all
+- [x] Active conversation deletion → auto new chat
+- [x] Single-item `×` delete still works and uses the new modal
+- [x] Sidebar collapse via chat-header `≡` still works
+
+#### Streaming-Conversation Resurrection Fix
+
+**Backend:**
+- [x] `test_generate_background_aborts_on_cancellation` passes — proves the resurrection bug is fixed
+- [x] Normal stream completion still saves the assistant message to history
+- [x] Deleting a conversation that has no in-flight LLM task still works
+
+#### Smart Auto-Scroll During Streaming
+
+**Frontend:**
+- [x] Streaming with no user interaction: scroll stays pinned to the bottom throughout
+- [x] User scrolls up during streaming: scroll position stays where the user put it
+- [x] User scrolls back to the bottom: next chunk re-pins the scroll
+- [x] Refresh-during-streaming (regression check): cached-chunks replay still scrolls to the bottom
+
+#### Selection-Mode Send Guard
+
+**Frontend:**
+- [x] Click Send in selection mode → no message sent, input value preserved, selection intact
+- [x] Press Enter in selection mode → no message sent, input value preserved, selection intact
+- [x] Exit selection mode (Cancel) → Send and Enter both work normally
+- [x] Deleting the active conversation via single `×` still ends in a fresh empty chat (no regression)
+- [x] Deleting the active conversation via batch-delete (selected) still ends in a fresh empty chat (no regression)
+
 ---
 
 ## 12. Future Extension Points
@@ -656,10 +805,12 @@ httpx>=0.25.0
 | `backend/chat/stream_manager.py` | StreamJob + STREAM_REGISTRY |
 | `backend/storage/file_storage.py` | JSON file operations |
 | `frontend/index.html` | Chat UI with SSE streaming, thinking display, localStorage cache |
-| `tests/conftest.py` | Pytest fixtures (mock LLM, temp storage) |
-| `tests/test_chat_*.py` | Chat domain tests |
-| `tests/test_storage.py` | Storage layer tests |
-| `tests/test_stream_manager.py` | Stream registry tests |
+| `backend/tests/conftest.py` | Pytest fixtures (`temp_storage_dir`, `mock_chain`) |
+| `backend/tests/test_chat_routes.py` | `/api/chat/stream`, `/api/chat/stream/{id}`, `/api/chat/stream/status/{id}` HTTP tests (including from_pointer boundary regression tests) |
+| `backend/tests/test_thinking_routes.py` | HTTP tests for thinking-aware endpoints (status partial_content, resume 404, post starts background task, delete clears job) |
+| `backend/tests/test_chat_service.py` | `ChatService.generate_background()` with mocked LLM (thinking + token extraction, string content, append_chunk, cancellation, failure handling) |
+| `backend/tests/test_storage.py` | Storage layer tests (JSON read/write, list sorting, title truncation, delete, invalid JSON) |
+| `backend/tests/test_stream_manager.py` | StreamJob state transitions, unified chunks list + chunk_queue |
 
 ### Modified Files (Recent Features)
 
@@ -671,7 +822,10 @@ httpx>=0.25.0
 | `backend/chat/chain.py` | LLM configured as `minimax-3` with `max_tokens=16000` and extended thinking (`budget_tokens=10000`) |
 | `backend/chat/stream_manager.py` | `get_or_create_job` calls `file_storage.create_conversation(conversation_id)` to ensure an empty entry exists in the conversations list |
 | `backend/tests/test_chat_routes.py` | Added regression tests for `stream_from_job` boundary behavior (boundary yields end marker, boundary streams new chunks, out-of-range returns empty) |
-| `frontend/index.html` | Unified chunk handling, cached chunks rendering, streaming state per conversation; history cache (`history_{convId}`) with helpers; cache-first `loadConversation`; SSE event buffering; streaming markdown parser state preservation across chunks and across the cache-replay → live-stream resume boundary; streaming badge derived per-render; `startNewChat` aborts in-flight stream and resets UI state |
+| `frontend/index.html` | Unified chunk handling, cached chunks rendering, streaming state per conversation; history cache (`history_{convId}`) with helpers; cache-first `loadConversation`; SSE event buffering; streaming markdown parser state preservation across chunks and across the cache-replay → live-stream resume boundary; streaming badge derived per-render; `startNewChat` aborts in-flight stream and resets UI state; stream-resume catch block drops AbortError branching so the streaming flag survives transient fetch errors; `init` gates the `loadConversation` fallback on the streaming flag; themed `showConfirmModal` component (replaces `confirm()`); batch-delete selection mode (sidebar header has two layouts, per-item `×` hidden in selection mode, batch delete via the new modal); smart auto-scroll that captures pinned-to-bottom state before the DOM update; `sendMessage()` early-return guard when `selectionMode === true` |
+| `backend/chat/stream_manager.py` | `StreamJob.cancelled` flag; `clear_job` sets the flag before removing from registry |
+| `backend/chat/service.py` | `generate_background` checks `job.cancelled` in the chunk loop and before `save_conversation`; bails out (no `mark_completed`, no save) if set |
+| `backend/tests/test_chat_service.py` | Regression test `test_generate_background_aborts_on_cancellation` — proves the resurrection bug is fixed |
 
 ---
 

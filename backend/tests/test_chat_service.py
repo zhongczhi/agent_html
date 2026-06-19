@@ -182,3 +182,86 @@ async def test_generate_background_uses_append_chunk():
     assert len(token_chunks) >= 1, f"Expected at least 1 token chunk, got {len(token_chunks)}"
 
     clear_job("test-append-chunk")
+
+
+@pytest.mark.asyncio
+async def test_generate_background_aborts_on_cancellation():
+    """If clear_job is called mid-stream, generate_background must NOT call
+    file_storage.save_conversation (which would resurrect the deleted
+    conversation)."""
+    from backend.chat.service import ChatService
+    from backend.chat.stream_manager import get_or_create_job, clear_job, get_job
+    from backend.storage import file_storage
+
+    conv_id = "test-cancel-mid-stream"
+    clear_job(conv_id)
+
+    # Pre-create the conversation so save_conversation would update-in-place
+    # (this mirrors the "new conversation" path in stream_chat).
+    file_storage.create_conversation(conv_id)
+    file_storage.append_message(conv_id, "user", "Hi")
+
+    mock_chain = MagicMock()
+
+    class AsyncIterator:
+        """Yields one chunk, then sleeps until cancelled, then would yield more."""
+        def __init__(self):
+            self.index = 0
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            if self.index == 0:
+                self.index += 1
+                chunk = MagicMock()
+                chunk.content = [{"type": "text", "text": "Hello "}]
+                return chunk
+            # Sleep until cancelled
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
+            # Would never reach here in normal flow; provide another chunk just in case.
+            self.index += 1
+            chunk = MagicMock()
+            chunk.content = [{"type": "text", "text": "world"}]
+            return chunk
+
+    mock_chain.astream.return_value = AsyncIterator()
+
+    service = ChatService(mock_chain)
+
+    job = get_or_create_job(conv_id, [])
+
+    task = asyncio.create_task(service.generate_background("Hi", conv_id))
+    # Let the first chunk be processed
+    await asyncio.sleep(0.1)
+    # Simulate user deleting the conversation mid-stream
+    clear_job(conv_id)
+    # Cancel the LLM task too (the abort that's normally done by the frontend)
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    # Wait long enough that any "I'm going to call save_conversation now" path
+    # would have run.
+    await asyncio.sleep(0.5)
+
+    # Job was cleared by clear_job; verify it is no longer in the registry.
+    assert get_job(conv_id) is None
+
+    # CRITICAL: the conversation must NOT have been resurrected by save_conversation.
+    # It should still be present in storage (we never asked delete_conversation
+    # to remove it), but its messages list must NOT contain the assistant message
+    # produced by the background task.
+    conv = file_storage.get_conversation(conv_id)
+    assert conv is not None
+    roles = [m["role"] for m in conv["messages"]]
+    assert "assistant" not in roles, (
+        f"Resurrection bug: background task saved assistant message after cancellation. "
+        f"Roles: {roles}"
+    )
+
+    # Cleanup
+    file_storage.delete_conversation(conv_id)
