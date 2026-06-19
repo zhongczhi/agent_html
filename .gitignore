@@ -27,3 +27,6 @@ storage/conversations.json
 
 # Todo
 todo.md
+
+# Claude Code local settings
+.claude/settings.json
