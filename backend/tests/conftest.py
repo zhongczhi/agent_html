@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 @pytest.fixture
 def temp_storage_dir():
     temp_dir = tempfile.mkdtemp()
-    original_storage_path = Path(__file__).parent.parent / "backend" / "storage" / "file_storage.py"
+    original_storage_path = Path(__file__).parent.parent / "storage" / "file_storage.py"
     import sys
     import importlib.util
 

@@ -8,19 +8,19 @@ A modular chatbot application using FastAPI backend + plain HTML/JS frontend wit
 
 ## Commands
 
+All commands run from the project root so the `backend` package is importable and the `.env` / `requirements.txt` files are picked up from their actual locations.
+
 ### Run the server
 ```bash
-cd backend
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8080
+uvicorn backend.main:app --reload --port 8080
 ```
 Frontend served at `/`, API at `/api/chat/stream`
 
 ### Run tests
 ```bash
-cd backend
 pip install pytest pytest-asyncio httpx
-pytest tests/ -v
+pytest backend/tests/ -v
 ```
 
 ## Architecture
