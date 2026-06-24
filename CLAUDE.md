@@ -73,6 +73,7 @@ idea → SPEC.md → DESI.md → implementation → testing → assessment → m
 | `SPEC_focus.md` | Current iteration's spec (active working document) |
 | `DESI.md` | Full project detailed design (all decisions, explains how the system implements it, nothing more) |
 | `DESI_focus.md` | Current iteration's design (active working document) |
+| `docs/superpowers/` | Spec / plan artifacts from the superpowers brainstorming workflow — different lifecycle, leave alone |
 
 ### Iteration Process
 

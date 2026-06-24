@@ -20,7 +20,7 @@
 - LCEL enables clean streaming chain composition
 - Built-in support for Anthropic models via MiniMax endpoint
 - Easy to swap models without changing application logic
-- User-facing environment variables: `ANTHROPIC_BASE_URL` (consumed by `pydantic-settings`) and `ANTHROPIC_API_KEY`. Internally `chain.py` also sets the legacy `ANTHROPIC_API_BASE` env var because `langchain-anthropic` reads that name.
+- `ChatAnthropic` receives `base_url=settings.anthropic_base_url` directly via its constructor argument. No `os.environ` mutation is needed.
 
 ### 1.3 Storage: JSON Files
 
@@ -65,9 +65,9 @@
 
 ### 1.8 Markdown Library
 
-**Choice:** marked.js via CDN.
+**Choice:** `streaming-markdown` via CDN. `marked.js` is no longer loaded.
 
-**Rationale:** Lightweight (39KB), no build step required, widely used and maintained. Plain HTML/JS architecture makes CDN inclusion simple.
+**Rationale:** The streaming parser (`smd`) handles both incremental token rendering during streaming and full-message rendering for cached/replayed history. It is stateful (a `parser_write` accumulates tokens across chunks), so multi-line constructs (tables, fenced code blocks, math blocks, lists) render correctly when their tokens arrive in multiple chunks or span the cache-replay → live-stream resume boundary. The earlier `marked.js` (used for final-message rendering) is now redundant.
 
 ### 1.9 Stream Resume Architecture
 
@@ -77,15 +77,15 @@
 
 ### 1.10 Two-Cache Frontend Architecture
 
-**Choice:** Maintain two separate localStorage caches — `history_{convId}` for full message lists and `chunks_{convId}` for in-flight streaming chunks.
+**Choice:** Maintain two separate localStorage caches — `history_{convId}` for full message lists and `chunks_{convId}` for in-flight streaming chunks. All `localStorage` access is encapsulated in [`frontend/static/cache.js`](../frontend/static/cache.js) (see 1.26).
 
 **Rationale:** History cache stores the "done" state (complete messages, updated on stream end via append); chunks cache stores the "in-flight" state (individual tokens, updated per chunk). Different update patterns and different consumers (`loadConversation` vs. `processStreamResponse`). Separation makes invalidation explicit and avoids mixing concerns. The history cache is loaded cache-first by `loadConversation`, with a backend fetch on miss and a stale-chunks-cache clear on success.
 
 ### 1.11 New Conversation Sidebar Visibility
 
-**Choice:** When a brand-new conversation is created, the backend appends the user message to storage synchronously in `stream_chat` (before the background LLM task starts).
+**Choice:** When a brand-new conversation is created, `stream_chat` (the POST `/api/chat/stream` route) calls `file_storage.create_conversation(conversation_id)` and `file_storage.append_message(conversation_id, "user", request.message)` itself, before starting the background LLM task. `get_or_create_job` no longer has any storage side effect.
 
-**Rationale:** Without this, the new conversation only appears in the sidebar after the LLM finishes streaming (5-30+ seconds later) and lacks a user-message-derived title. The synchronous append also relies on `get_or_create_job` calling `file_storage.create_conversation(conversation_id)` to ensure an empty entry exists. The background task has an idempotency check to avoid duplicating the user message.
+**Rationale:** Without this, the new conversation only appears in the sidebar after the LLM finishes streaming (5-30+ seconds later) and lacks a user-message-derived title. Pulling the create+append into the route keeps the storage side effect co-located with the user-visible "new conversation" action and makes `get_or_create_job` a pure in-memory operation. The background task trusts the storage contents as the single source of truth (no idempotency dedupe is needed).
 
 ### 1.12 SSE Event Boundary Handling
 
@@ -152,6 +152,65 @@
 **Choice:** The backend LLM is configured as `minimax-3` with `max_tokens=16000` and `thinking={"type": "enabled", "budget_tokens": 10000}`.
 
 **Rationale:** The larger output budget (4× the previous 4096) supports long code blocks and multi-paragraph answers. Explicit extended thinking with a 10k budget reserves reasoning capacity; visible answer has ~6k tokens. Frontend already supports `thinking` blocks via the unified chunk format.
+
+### 1.23 Multi-Turn Thinking Continuity
+
+**Choice:** `convert_messages` (module-level in `chat/chain.py`) constructs an `AIMessage` whose `content` is a list of content blocks when a prior assistant turn has a `thinking` field. The list is `[{"type": "thinking", "thinking": ...}, {"type": "text", "text": ...}]`. When the prior turn has no `thinking` field, the `AIMessage` is a plain `AIMessage(content=...)`.
+
+**Rationale:** The LLM emits `thinking` content blocks on every turn when given the previous turn's `thinking` as part of the input. It does not emit them when the previous turn's `thinking` is stripped before being fed back. The pre-change code dropped the prior `thinking` (returning only the visible `content`), which produced empty thinking sections for turns 2+. Feeding the prior `thinking` back as a content block alongside the visible text restores continuous reasoning. Prior messages without `thinking` (e.g., loaded from older storage) become a plain `AIMessage` so the LLM still sees a coherent conversation history.
+
+### 1.24 Stream Registry Memory Cleanup
+
+**Choice:** A thin async generator wrapper `consume_with_cleanup(gen, conversation_id)` in `chat/stream_manager.py` is applied only to the resume route's `StreamingResponse`. Two flags inside the wrapper:
+- `completed` — set to `True` only after the `async for` loop exits normally.
+- `any_event` — set to `True` after the first event is yielded.
+
+The wrapper's `finally` block calls `STREAM_REGISTRY.pop(conversation_id, None)` if and only if both flags are `True`. The initial stream (`POST /api/chat/stream`) does NOT use the wrapper, so the entry is still available for a possible later resume.
+
+**Rationale:** The `StreamJob` exists in the registry to support resume. Once a resume has delivered the full cached chunk history (including `end`), there is nothing left to resume. The two-flag pattern ensures that:
+- An interrupted resume (`aclose()`, exception, or out-of-range `from_pointer` returning no events) leaves the entry in place.
+- A normal completion removes the entry.
+- Two concurrent resumes where the first finishes are safe: the second wrapper's `pop` is a no-op (idempotent).
+- The initial stream is not affected — its job stays in the registry for a potential future resume.
+
+### 1.25 File Storage Concurrency Safety
+
+**Choice:** `chat/storage/file_storage.py` uses two complementary safety mechanisms:
+- A module-level `_write_lock = threading.Lock()` serializes the four write functions (`create_conversation`, `save_conversation`, `append_message`, `delete_conversation`). The lock holds for the full read-modify-write cycle.
+- An `_atomic_write_json(path, data)` helper writes JSON to `<path>.tmp` in the same directory, then `os.replace()` swaps it into place. On any failure, the `.tmp` file is cleaned up.
+
+**Rationale:** Two distinct hazards:
+- **Lost updates** (per-process). Two concurrent `append_message` calls would each read the same baseline, append their own change, and write back; the second overwrites the first. The lock prevents this.
+- **Crash corruption.** A `SIGKILL`/`OOM`/power-loss mid-write would leave a partial JSON on disk. `os.replace` is atomic on POSIX and on Windows when source and destination are on the same volume (the `.tmp` is in `STORAGE_DIR`, so this holds). A crash before the `replace` leaves the original file fully intact; after the `replace`, the new file is in place.
+
+Reads (`get_conversation`, `get_conversation_list`) are not under the lock. Combined with the atomic write, a concurrent reader sees either the fully-old or fully-new file — never partial. The lock is per-process; a multi-worker deployment (`uvicorn --workers N`) would need a file-level lock (out of scope).
+
+### 1.26 Frontend Cache Module
+
+**Choice:** All `localStorage` access in the frontend is encapsulated in a single ES module, [`frontend/static/cache.js`](../frontend/static/cache.js). The module owns:
+- The five localStorage key names (`chunks_`, `consumed_`, `streaming_`, `history_`, `currentConversationId`).
+- All `localStorage.getItem` / `setItem` / `removeItem` calls.
+- All `JSON.parse` / `JSON.stringify` calls (for the JSON-encoded caches: `chunks`, `history`).
+
+The module exposes typed accessors: `getHistory` / `setHistory` / `appendToHistory` / `clearHistory`, `getChunks` / `setChunks` / `appendToChunks` / `clearChunks`, `getConsumed` / `setConsumed` / `clearConsumed`, `isStreaming` / `getStreaming` / `setStreaming` / `clearStreaming`, `getCurrentConversationId` / `setCurrentConversationId`. `app.js` imports the module and calls these accessors; no `localStorage` reference, no `STORAGE_KEYS`, no `JSON.parse` / `JSON.stringify` for cached state, and no helper functions remain in `app.js`.
+
+**Rationale:** The pre-refactor `app.js` had ~15 raw `localStorage` calls and ~8 `JSON.parse` / `JSON.stringify` calls scattered across 6+ call sites, plus 7 helper functions and a `STORAGE_KEYS` constant. This made the file harder to read, easy to get wrong (forgetting `JSON.parse` on a read, or `JSON.stringify` on a write), and gave no single place to migrate to a different backing store (e.g., IndexedDB) later. The cache module also makes the storage format discoverable from one file. The two remaining `JSON.*` calls in `app.js` are for the `fetch` request body and SSE event parsing, which are external-data protocol concerns, not state-storage concerns.
+
+### 1.27 Frontend Asset Path
+
+**Choice:** Frontend assets live in `frontend/static/`:
+```
+frontend/
+├── index.html
+└── static/
+    ├── app.js
+    ├── cache.js
+    └── styles.css
+```
+
+FastAPI's `StaticFiles` mount is at `/static` and points at `frontend_path / "static"`. The explicit `@app.get("/")` route serves `frontend/index.html`. There is no separate `/index.html` route.
+
+**Rationale:** The pre-change code mounted `/static` on `frontend/` (with no actual `static/` subdirectory). The URL path `/static/...` was misleading because there was no matching folder. Moving the assets into `frontend/static/` makes the URL and the directory match. `index.html` stays at `frontend/index.html` because it is the application entry point, not a static asset.
 
 ---
 
@@ -222,28 +281,30 @@ data: {"end": true}\n\n
 
 ### Request/Response Flow
 
-**New Stream:**
-1. Parse request body (`message`, `conversation_id`)
-2. Generate UUID for new conversation if `conversation_id` is None
-3. Call `get_or_create_job(conversation_id, [])` — creates a `StreamJob` and ensures an empty conversation entry exists via `file_storage.create_conversation(conversation_id)`
-4. If the conversation is new (`existing_conv is None`), append the user message to storage synchronously in `stream_chat` before the background task starts (so the conversation appears in the sidebar with the correct title while the LLM is still generating)
-5. Start background task for LLM streaming
-6. Stream thinking chunks first, then token chunks via SSE
-7. Save assistant response (with thinking) on completion (with idempotency check to skip duplicate user message append)
+**New Stream (POST /api/chat/stream):**
+1. `routes.stream_chat` validates the `ChatRequest` (message 1-10000 chars)
+2. `file_storage.create_conversation(conversation_id)` ensures an empty entry exists
+3. `file_storage.append_message(conversation_id, "user", request.message)` stores the user message synchronously (so the conversation appears in the sidebar with the correct title while the LLM is still generating)
+4. `get_or_create_job(conversation_id, [])` returns the existing `StreamJob` or creates a new one (pure in-memory; no storage side effect)
+5. If the job is not already `active`, `job.reset()` clears `chunks` and sets `status = "active"`
+6. `asyncio.create_task(chat_service.generate_background(...))` starts the background LLM task
+7. The route returns a `StreamingResponse` wrapping `stream_from_active_job(job)` — the initial stream. **No cleanup wrapper** is applied; the job stays in `STREAM_REGISTRY` for a possible future resume.
 
-**Resume Stream:**
-1. Check `STREAM_REGISTRY` for active job
-2. Send accumulated chunks from `from_pointer` position
-3. Continue streaming from current queue position
+**Resume Stream (GET /api/chat/stream/{conversation_id}):**
+1. `get_job(conversation_id)` returns the existing job; 404 if none
+2. If `job.status == "active"`, use `stream_from_active_job(job, from_pointer)`; otherwise `stream_from_inactive_job(job, from_pointer)`
+3. The route returns a `StreamingResponse` wrapping `consume_with_cleanup(gen, conversation_id)` — the entry is removed from `STREAM_REGISTRY` after the resume delivers the full cached chunk history (including `end`)
 
 ### Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/chat/stream` | Start new chat stream |
-| GET | `/api/chat/stream/{conversation_id}?from_pointer=N` | Resume stream from position N |
-| GET | `/api/chat/stream/status/{conversation_id}` | Get stream status |
-| DELETE | `/api/chat/conversation/{conversation_id}` | Delete conversation + cleanup |
+| GET | `/api/chat/stream/{conversation_id}?from_pointer=N` | Resume stream from position N; removes the `StreamJob` from `STREAM_REGISTRY` on full completion |
+| GET | `/api/chat/stream/status/{conversation_id}` | Get stream status (single `status` string) |
+| GET | `/api/chat/history/{conversation_id}` | Get conversation history |
+| GET | `/api/chat/conversations` | List all conversations |
+| DELETE | `/api/chat/conversation/{conversation_id}` | Delete conversation + clear stream job |
 
 ---
 
@@ -273,14 +334,14 @@ Note: `thinking` field is optional. History API returns thinking field for assis
 
 | Function | Behavior |
 |----------|----------|
-| `get_conversation(id)` | Retrieve conversation or `None` |
-| `save_conversation(id, messages)` | Persist entire messages array |
-| `append_message(id, role, content)` | Append single message |
-| `create_conversation(id)` | Create empty conversation entry; called by `get_or_create_job` so a brand-new conversation appears in the list before the first message arrives |
-| `get_conversation_list()` | Return sorted list (updated_at desc) |
-| `delete_conversation(id)` | Remove conversation, clear stream |
+| `get_conversation(id)` | Retrieve conversation or `None` (no lock) |
+| `save_conversation(id, messages)` | Acquire `_write_lock`; load → replace messages → atomic write |
+| `append_message(id, role, content)` | Acquire `_write_lock`; load → append → atomic write; return the messages list |
+| `create_conversation(id)` | Acquire `_write_lock`; load → ensure entry exists → atomic write (no-op if already present) |
+| `get_conversation_list()` | Return sorted list (updated_at desc; no lock) |
+| `delete_conversation(id)` | Acquire `_write_lock`; load → remove entry → atomic write |
 
-**Error Handling:** Invalid JSON returns empty dict with warning log.
+The four write functions (`create_conversation`, `save_conversation`, `append_message`, `delete_conversation`) all run inside a per-process `threading.Lock` and write through `_atomic_write_json`, which writes to `<path>.tmp` and `os.replace`s into place. Reads are lock-free; combined with the atomic write, a reader sees either the fully-old or fully-new file. **Error Handling:** Invalid JSON is moved aside as `conversations.json.corrupt` and the application starts fresh with a warning log (the previous behavior of silently overwriting the file is gone).
 
 ---
 
@@ -305,14 +366,15 @@ Note: `thinking` field is optional. History API returns thinking field for assis
 
 ### localStorage Keys
 
-The frontend maintains two separate caches per conversation: a **chunks cache** for in-flight streaming state and a **history cache** for the full message list (see Section 1.10).
+The frontend maintains two separate caches per conversation: a **chunks cache** for in-flight streaming state and a **history cache** for the full message list (see Section 1.10). All `localStorage` access is via the `cache` module — see Section 1.26.
 
 | Key | Purpose |
 |-----|---------|
 | `chunks_{conv_id}` | Cached chunks for resume |
-| `pointer_{conv_id}` | Current position in stream |
-| `streaming_{conv_id}` | Active streaming state per conversation |
+| `consumed_{conv_id}` | Current position in stream (renamed from `pointer_{conv_id}`) |
+| `streaming_{conv_id}` | Active streaming state per conversation (`"true"` / `"false"`) |
 | `history_{conv_id}` | Full message list for fast load on conversation switch/refresh |
+| `currentConversationId` | UUID of the currently open conversation (global, not per-conversation) |
 
 ### Conversation Switch Flow
 
@@ -371,18 +433,20 @@ The frontend maintains two separate caches per conversation: a **chunks cache** 
 | `processStreamResponse()` | Parse SSE via `sseBuffer` accumulator; handle thinking + token events; reuse parser/renderer across chunks; accept `existingRenderer` / `existingParser` and return `{renderer, parser}` for parser handoff on resume |
 | `renderContent()` | Lazy-create parser/renderer; write streaming-markdown tokens; apply LaTeX |
 | `addMessage()` | Create message element with proper structure |
+| `addAssistantPlaceholder()` | Thin wrapper: calls `addMessage('assistant', '')` and sets the content div's class to `loading` with the loading-dots markup |
 | `updateThinkingDisplay()` | Handle thinking content and fold/unfold |
 | `setupScrollbarAutoHide()` | Attach wheel listener to message blocks |
 | `autoResizeInput()` | Expand textarea with content |
-| `resumeStreamFromPosition()` | Resume stream from localStorage cache; thread parser/renderer to `processStreamResponse` for handoff |
+| `resumeStreamFromPosition()` | Resume stream from cache; thread parser/renderer to `processStreamResponse` for handoff |
 | `loadConversation()` | Cache-first load: read `history_{convId}`; fetch from backend on miss and store; clear stale `chunks_{convId}` on success |
 | `sendMessage()` | Append user message to UI, then to history cache; trigger stream and `loadConversationList()` |
-| `deleteConversation()` | Remove conversation + all related caches (history + chunks + pointer + streaming) |
-| `loadConversationList()` | Derive streaming badge from `isStreamingForConv()` on every render (not just once at send time) |
+| `deleteConversation()` | Remove conversation + all related caches (history + chunks + consumed + streaming) |
+| `loadConversationList()` | Derive streaming badge from `cache.isStreaming(convId)` on every render (not just once at send time) |
 | `startNewChat()` | Abort in-flight stream via `currentAbortController`; clear current conversation; reset input + send button; refocus input |
-| `getHistoryCache()` / `setHistoryCache()` / `appendToHistoryCache()` / `clearHistoryCache()` / `clearChunkCache()` | History cache helpers |
 | `renderMessagesFromCache()` | Re-render message list from cached or fetched messages array |
-| `isStreamingForConv()` | Check whether the streaming flag is set in localStorage for a given conversation |
+| `showStreamingBadge()` | Show/hide the streaming badge on the active sidebar item |
+
+All `localStorage` reads/writes are delegated to the `cache` module imported from `frontend/static/cache.js`. The seven old localStorage helper functions (`getHistoryCache`, `setHistoryCache`, `appendToHistoryCache`, `clearHistoryCache`, `clearChunkCache`, `isStreamingForConv`, `getStreamingForConv`, `setStreamingForConv`) and the `STORAGE_KEYS` constant are gone from `app.js`.
 
 ---
 
@@ -392,56 +456,88 @@ The frontend maintains two separate caches per conversation: a **chunks cache** 
 
 ```python
 class StreamJob:
-    def __init__(
-        self,
-        conversation_id: str,
-        messages: Optional[List[dict]] = None
-    ):
+    def __init__(self, conversation_id, messages=None):
         self.conversation_id = conversation_id
         self.status: Literal["pending", "active", "completed", "failed"] = "pending"
-        self.chunks: List[dict] = []  # [{"chunk": "text", "type": "thinking|token", "message_id": str}] — message_id is for debug tracing; frontend does not depend on it
+        self.chunks: List[dict] = []  # [{"chunk": text, "type": "thinking|token", "message_id": str}]
         self.chunk_queue: asyncio.Queue = asyncio.Queue()
         self.messages: List[dict] = messages or []
-        self.error: Optional[str] = None
+        self.error: str | None = None
+        self.cancelled: bool = False  # Set by clear_job when the user deletes the conversation
         self.created_at = datetime.now(timezone.utc)
         self.updated_at = datetime.now(timezone.utc)
 
-    def append_chunk(self, chunk_type: str, text: str) -> None:
-        """Add a chunk to both the chunks list and chunk_queue."""
-        chunk = {"chunk": text, "type": chunk_type}
+    def append_chunk(self, chunk_type, text):
+        message_id = str(time.time_ns())
+        chunk = {"chunk": text, "type": chunk_type, "message_id": message_id}
         self.chunks.append(chunk)
         self.chunk_queue.put_nowait(chunk)
         self.updated_at = datetime.now(timezone.utc)
 
-    def mark_completed(self) -> None:
+    def reset(self):
+        """Reset job state to start a new message in the same conversation."""
+        self.status = "active"
+        self.chunks = []
+        self.updated_at = datetime.now(timezone.utc)
+
+    def mark_completed(self):
         self.status = "completed"
         self.chunk_queue.put_nowait(None)  # End marker
         self.updated_at = datetime.now(timezone.utc)
 
-    def mark_failed(self, error: str) -> None:
+    def mark_failed(self, error):
         self.status = "failed"
         self.error = error
         self.chunk_queue.put_nowait(None)
         self.updated_at = datetime.now(timezone.utc)
 ```
 
+### Module-Level Functions
+
+- `get_or_create_job(conversation_id, messages) -> StreamJob`: returns the existing job or creates a new one (pure in-memory; no storage side effect).
+- `get_job(conversation_id) -> StreamJob | None`: returns the existing job or `None`.
+- `clear_job(conversation_id) -> None`: sets `cancelled = True` on the live job, then removes it from `STREAM_REGISTRY`. The background task holds a local reference to the job and checks `cancelled` between iterations; setting the flag on the live object first ensures the check sees it (see 1.18 for the resurrection-bug rationale).
+- `consume_with_cleanup(gen, conversation_id)`: see Section 1.24. Wraps a stream generator and removes the entry from `STREAM_REGISTRY` after a successful resume.
+
 ### Background Task Flow
 
 ```
 POST /api/chat/stream
     ↓
-get_or_create_job(conversation_id)
+file_storage.create_conversation(conversation_id)
+file_storage.append_message(conversation_id, "user", request.message)
     ↓
-if new job:
-    asyncio.create_task(chat_service.generate_background(...))
+get_or_create_job(conversation_id, [])
     ↓
-return StreamingResponse(stream_from_job(job))
+if job.status != "active":
+    job.reset()
     ↓
-stream_from_job(job):
+asyncio.create_task(chat_service.generate_background(...))
+    ↓
+return StreamingResponse(stream_from_active_job(job))
+    ↓
+stream_from_active_job(job):
+    async for chunk in _replay_cached_chunks(job, 0): yield
     while True:
         chunk = await job.chunk_queue.get()
-        if chunk is None: break
+        if chunk is None: yield end; return
         yield SSE_event(chunk)
+```
+
+```
+GET /api/chat/stream/{conversation_id}?from_pointer=N
+    ↓
+job = get_job(conversation_id); 404 if None
+    ↓
+if job.status == "active":
+    gen = stream_from_active_job(job, from_pointer)
+else:
+    gen = stream_from_inactive_job(job, from_pointer)
+    ↓
+return StreamingResponse(consume_with_cleanup(gen, conversation_id))
+    ↓
+consume_with_cleanup removes the entry from STREAM_REGISTRY
+after the resume has fully delivered the cached chunk history.
 ```
 
 ---
@@ -489,37 +585,46 @@ Thinking content is NOT rendered as markdown. It's displayed as plain text to av
 
 ### 8.7 Partial Resume After Complete
 
-If a conversation was fully completed (streaming=false, is_complete=true) but user sends another message:
-- Backend starts new stream, no resume needed
-- History already contains full thinking + content
+If a conversation was fully completed (`status == "completed"`) but the user sends another message:
+- Backend starts a new stream (the old `StreamJob` is reset via `job.reset()`)
+- The completion path used the cleanup wrapper on a resume, so the entry may already be gone from `STREAM_REGISTRY`; the route calls `get_or_create_job` which creates a fresh one
+- History already contains full thinking + content from the previous turn
 
 ### 8.8 Refresh While Streaming
 
 ```
 init()
     ↓
+Read currentConversationId from localStorage (cache module)
+    ↓
 checkStreamStatus() → GET /api/chat/stream/status/{id}
     ↓
-status.streaming = true
+status.status === 'active' (or cache.isStreaming(currentConversationId) === true)
     ↓
-Read from localStorage[chunks_{conv_id}] → render cached
-Read pointer from localStorage[pointer_{conv_id}]
+Read cache.getConsumed(currentConversationId) → N
     ↓
-resumeStream() → GET /api/chat/stream/{id}?from_pointer=N
+resumeStreamFromPosition(N)
+    ↓
+Read cache.getHistory(convId) → renderMessagesFromCache
+Read cache.getChunks(convId) → renderCachedChunks (into a fresh assistant message)
+    ↓
+fetch GET /api/chat/stream/{id}?from_pointer=N  (wrapped in consume_with_cleanup)
     ↓
 Receive remaining chunks via SSE
-Append to displayed content
+    ↓
+On end: cache.appendToHistory, cache.clearChunks, cache.clearConsumed, cache.setStreaming(false)
+        (consume_with_cleanup removes the StreamJob from STREAM_REGISTRY)
 ```
 
 ### 8.9 Two-Cache Architecture
 
-The frontend maintains separate history and chunks caches with different update patterns and consumers. Edge cases:
+The frontend maintains separate history and chunks caches with different update patterns and consumers. All access goes through the `cache` module (see 1.26). Edge cases:
 
-- **Empty cache on first load**: `getHistoryCache()` returns null; `loadConversation` falls through to backend and populates the cache.
+- **Empty cache on first load**: `cache.getHistory(convId)` returns `null`; `loadConversation` falls through to backend and populates the cache.
 - **Cache exists but conversation was deleted on another tab**: Local cache remains; backend returns empty array on next load. Cross-tab invalidation is out of scope.
-- **Resume streaming after refresh**: `checkStreamStatus` → `resumeStreamFromPosition` continues to use `chunks_{convId}` and `pointer_{convId}`. After resume, the new assistant message is appended to `history_{convId}`.
-- **Switching conversations mid-stream**: Only the streaming conversation's chunks/pointer are updated. Other conversations' history cache is untouched. On switch back, `loadConversation` reads from cache.
-- **Stale chunks cleared on history load**: `loadConversation` calls `clearChunkCache(convId)` after a successful backend fetch so a stale in-flight chunk cache cannot replay on top of fresh history.
+- **Resume streaming after refresh**: `checkStreamStatus` → `resumeStreamFromPosition` continues to use the `chunks_` and `consumed_` keys. After resume, the new assistant message is appended to the `history_` key.
+- **Switching conversations mid-stream**: Only the streaming conversation's chunks/consumed are updated. Other conversations' history cache is untouched. On switch back, `loadConversation` reads from cache.
+- **Stale chunks cleared on history load**: `loadConversation` calls `cache.clearChunks(convId)` after a successful backend fetch so a stale in-flight chunk cache cannot replay on top of fresh history.
 
 ### 8.10 SSE Event Boundary Handling
 
@@ -612,6 +717,33 @@ The streaming markdown parser is hoisted to function scope so it persists across
 - **User exits selection mode (Cancel), then sends**: Guard is a no-op; normal flow.
 - **`sendMessage()` called programmatically while in selection mode**: Returns immediately — future-proofs against any other call path.
 
+### 8.20 Multi-Turn Thinking Continuity
+
+- **First turn of a new conversation**: No prior assistant; no `thinking` to feed back. `convert_messages` returns only `HumanMessage`s. LLM emits `thinking` + tokens normally.
+- **Second turn**: `convert_messages` reads the saved first assistant message (with `thinking`), constructs `AIMessage(content=[{type:thinking,...}, {type:text,...}])`, and prepends it before the new `HumanMessage`. LLM sees its own prior reasoning and continues to emit `thinking` on the second turn.
+- **Prior assistant without `thinking`** (e.g., older storage): `convert_messages` returns a plain `AIMessage(content=str)` so the LLM still sees a coherent conversation history; no list, no content blocks.
+- **Unknown roles** (e.g., `system`): silently dropped by `convert_messages`. The LLM never sees them.
+
+### 8.21 Stream Registry Memory Cleanup
+
+- **Resume drains all cached chunks and yields `end`**: `consume_with_cleanup` removes the entry from `STREAM_REGISTRY`.
+- **Resume client disconnects before `end` is yielded** (e.g., `wrapper.aclose()` from a closed SSE connection): the wrapper's `GeneratorExit` propagates, `completed` stays `False`, the entry is kept.
+- **Resume is for an out-of-range `from_pointer`**: the inner generator returns without yielding; `any_event` stays `False`, the entry is kept.
+- **Resume's inner generator raises** (e.g., LLM error): exception propagates through the wrapper, `completed` stays `False`, the entry is kept.
+- **Two concurrent resumes where the first finishes**: the first `pop` removes the entry; the second `pop` is a no-op (`STREAM_REGISTRY.pop(..., None)` returns `None`).
+- **Initial stream (POST) is interrupted**: no `consume_with_cleanup` is applied; the entry stays so a later resume is possible.
+- **Initial stream (POST) completes normally**: no `consume_with_cleanup` is applied; the entry stays. (A `StreamJob` for which the user never resumes leaks for the lifetime of the process — a known limitation, addressed by a separate TTL-based sweep item.)
+
+### 8.22 File Storage Concurrency Safety
+
+- **Two concurrent `append_message` calls on the same conversation**: the first acquires `_write_lock` and runs to completion; the second waits on the lock, then loads the first's committed state and appends. **No lost updates.**
+- **Two concurrent `save_conversation` calls**: serialized by the lock. The last writer wins for the messages field (this is the documented contract of `save_conversation` — it replaces, not merges). The on-disk file is always fully valid JSON.
+- **A process crash (SIGKILL, OOM, power loss) during a write**: the `.tmp` file is in the same directory and the `os.replace` is atomic; a crash before the replace leaves the original file fully intact; a crash after the replace means the new file is in place. No partial state.
+- **A failure during the write** (e.g., `json.dump` raises): the `except` in `_atomic_write_json` removes the `.tmp` file and re-raises. The original `conversations.json` is untouched.
+- **A failure during the replace** (e.g., `os.replace` raises): same — `.tmp` is removed, original untouched, exception re-raised.
+- **Corrupt JSON at load time** (e.g., from a file that was corrupted before this fix was applied): renamed to `conversations.json.corrupt`; the application starts fresh with a warning log.
+- **Multi-worker deployment (`uvicorn --workers N`)**: out of scope. The per-process lock would not serialize across processes. A file-level lock (`fcntl.flock` / `msvcrt.locking`) would be needed.
+
 ---
 
 ## 9. Error Handling
@@ -640,14 +772,22 @@ The streaming markdown parser is hoisted to function scope so it persists across
 ```python
 @router.delete("/conversation/{conversation_id}")
 async def delete_conversation(conversation_id: str):
-    clear_job(conversation_id)  # Remove from STREAM_REGISTRY
+    clear_job(conversation_id)  # Set cancelled=True, then remove from STREAM_REGISTRY
     deleted = file_storage.delete_conversation(conversation_id)
     return {"deleted": deleted}
 ```
 
-### After stream completes
+### After a successful resume
 
-Frontend clears `pointer_*` localStorage on `end: true`. Backend keeps StreamJob in registry for status queries until conversation is deleted.
+`consume_with_cleanup` (applied only to the resume route) removes the entry from `STREAM_REGISTRY` once the resume has delivered the full cached chunk history (including `end`).
+
+### After a successful initial stream
+
+The initial stream (`POST /api/chat/stream`) does not have `consume_with_cleanup` applied. The `StreamJob` stays in `STREAM_REGISTRY` until either (a) the user calls resume and the cleanup fires, or (b) the user deletes the conversation and `clear_job` removes it. A `StreamJob` for which neither ever happens leaks for the lifetime of the process — a known limitation, not addressed in this iteration.
+
+### Frontend cleanup on `data.end`
+
+On `data.end`, `processStreamResponse` calls `cache.appendToHistory(...)` (to add the assistant message to the history cache), `cache.clearChunks(convId)`, and `cache.setStreaming(convId, false)`. The `consumed_` key was already cleared earlier in the stream (in the per-chunk path, `cache.setConsumed(convId, consumedCount)` updates it; on `data.end`, no further consumed cleanup is needed since the next page load will use the history cache).
 
 ---
 
@@ -663,10 +803,12 @@ Frontend clears `pointer_*` localStorage on `end: true`. Backend keeps StreamJob
 
 | File | What is Tested |
 |------|----------------|
-| `test_chat_service.py` | `ChatService.generate_background()` with mocked LLM |
-| `test_storage.py` | JSON read/write roundtrip |
-| `test_chat_routes.py` | HTTP endpoint responses |
-| `test_stream_manager.py` | StreamJob state transitions |
+| `test_chat_service.py` | `ChatService.generate_background()` with mocked LLM (thinking + token extraction, string content, append_chunk, cancellation, failure handling) |
+| `test_storage.py` | JSON read/write roundtrip; list sorting; title truncation; delete; invalid-JSON recovery; `TestAtomicWrite` (replace-fails-original-intact, dump-fails-tmp-cleaned, success-no-tmp-left); `TestWriteLock` (50 concurrent appends, 20 concurrent saves serialized) |
+| `test_chat_routes.py` | `stream_from_inactive_job` / `stream_from_active_job`; pointer / boundary / out-of-range; `job.reset()` |
+| `test_stream_manager.py` | `StreamJob` state transitions; unified chunks list + chunk_queue; 5 `consume_with_cleanup` tests (full consumption, no events, cancellation, exception, idempotent pop) |
+| `test_thinking_routes.py` | HTTP tests for thinking-aware endpoints (status partial_content, resume 404, post starts background task, delete clears job); 2 integration tests for `consume_with_cleanup` (resume route cleans up, initial stream does not) |
+| `test_chain.py` | `convert_messages` shape: user → `HumanMessage`; assistant without `thinking` → plain `AIMessage`; assistant with `thinking` → `AIMessage(content=[thinking, text])`; multi-turn scenario; unknown roles dropped |
 
 ### Test Dependencies
 
@@ -767,6 +909,42 @@ httpx>=0.25.0
 - [x] Deleting the active conversation via single `×` still ends in a fresh empty chat (no regression)
 - [x] Deleting the active conversation via batch-delete (selected) still ends in a fresh empty chat (no regression)
 
+#### Multi-Turn Thinking Continuity
+
+**Backend (`convert_messages`):**
+- [x] User message → `HumanMessage(content=...)`
+- [x] Assistant without `thinking` → `AIMessage(content=str)`
+- [x] Assistant with `thinking` → `AIMessage(content=[{type:thinking,...}, {type:text,...}])`
+- [x] Multi-turn: prior assistant with `thinking` becomes a content-block `AIMessage`; the chain stays coherent
+- [x] Unknown roles (e.g., `system`) are dropped
+
+**Live (real LLM):**
+- [x] 2-turn conversation: turn 2 stores a non-empty `thinking` field
+- [x] 3-turn conversation: turn 3 stores a non-empty `thinking` field
+
+#### Stream Registry Memory Cleanup
+
+- [x] Resume via `GET /api/chat/stream/{id}` drains to completion → entry removed from `STREAM_REGISTRY`
+- [x] `POST /api/chat/stream` (initial stream) drains to completion → entry **stays** in `STREAM_REGISTRY`
+- [x] Resume whose `wrapper.aclose()` is called (client disconnect simulation) → entry stays
+- [x] Resume with an out-of-range `from_pointer` (no events) → entry stays
+- [x] Resume whose inner generator raises → entry stays
+- [x] Two concurrent resumes where the first finishes → no error on the second's `pop`
+
+#### File Storage Concurrency Safety
+
+- [x] 50 concurrent `append_message` threads → all 50 messages present in the final file
+- [x] 20 concurrent `save_conversation` threads → all complete; file is always valid JSON; no `.tmp` left
+- [x] `os.replace` fails mid-swap → original file fully intact; no `.tmp` left
+- [x] `json.dump` fails mid-write → original file fully intact; no `.tmp` left
+
+#### Frontend Cache Consolidation
+
+- [x] `app.js` contains no `localStorage`, no `STORAGE_KEYS`, no `JSON.parse` / `JSON.stringify` for cached state
+- [x] The only two remaining `JSON.*` calls in `app.js` are the `fetch` request body and SSE event parsing (both legitimate)
+- [x] `cache.js` is served correctly at `/static/cache.js` (200)
+- [x] All 47 backend tests still pass
+
 ---
 
 ## 12. Future Extension Points
@@ -797,35 +975,25 @@ httpx>=0.25.0
 
 | File | Purpose |
 |------|---------|
-| `backend/main.py` | FastAPI app entry, serves frontend + mounts routers |
+| `backend/main.py` | FastAPI app entry, serves frontend, mounts `/static` from `frontend/static/`, includes chat router |
 | `backend/config.py` | Pydantic Settings from environment variables |
-| `backend/chat/routes.py` | `/api/chat/*` endpoints, stream resume logic |
-| `backend/chat/chain.py` | LangChain LCEL chain definition |
-| `backend/chat/service.py` | ChatService (background generation, thinking extraction) |
-| `backend/chat/stream_manager.py` | StreamJob + STREAM_REGISTRY |
-| `backend/storage/file_storage.py` | JSON file operations |
-| `frontend/index.html` | Chat UI with SSE streaming, thinking display, localStorage cache |
-| `backend/tests/conftest.py` | Pytest fixtures (`temp_storage_dir`, `mock_chain`) |
-| `backend/tests/test_chat_routes.py` | `/api/chat/stream`, `/api/chat/stream/{id}`, `/api/chat/stream/status/{id}` HTTP tests (including from_pointer boundary regression tests) |
-| `backend/tests/test_thinking_routes.py` | HTTP tests for thinking-aware endpoints (status partial_content, resume 404, post starts background task, delete clears job) |
-| `backend/tests/test_chat_service.py` | `ChatService.generate_background()` with mocked LLM (thinking + token extraction, string content, append_chunk, cancellation, failure handling) |
-| `backend/tests/test_storage.py` | Storage layer tests (JSON read/write, list sorting, title truncation, delete, invalid JSON) |
-| `backend/tests/test_stream_manager.py` | StreamJob state transitions, unified chunks list + chunk_queue |
-
-### Modified Files (Recent Features)
-
-| File | Changes |
-|------|---------|
-| `backend/chat/stream_manager.py` | Unified chunks list + chunk_queue (vs separate token/thinking) |
-| `backend/chat/service.py` | Uses `append_chunk(chunk_type, text)` for both thinking and tokens |
-| `backend/chat/routes.py` | Single `from_pointer` param, unified chunk events, `end: true` sentinel; `stream_chat` synchronously appends user message for new conversations; `stream_from_job` `from_pointer` guard relaxed so boundary case is valid |
-| `backend/chat/chain.py` | LLM configured as `minimax-3` with `max_tokens=16000` and extended thinking (`budget_tokens=10000`) |
-| `backend/chat/stream_manager.py` | `get_or_create_job` calls `file_storage.create_conversation(conversation_id)` to ensure an empty entry exists in the conversations list |
-| `backend/tests/test_chat_routes.py` | Added regression tests for `stream_from_job` boundary behavior (boundary yields end marker, boundary streams new chunks, out-of-range returns empty) |
-| `frontend/index.html` | Unified chunk handling, cached chunks rendering, streaming state per conversation; history cache (`history_{convId}`) with helpers; cache-first `loadConversation`; SSE event buffering; streaming markdown parser state preservation across chunks and across the cache-replay → live-stream resume boundary; streaming badge derived per-render; `startNewChat` aborts in-flight stream and resets UI state; stream-resume catch block drops AbortError branching so the streaming flag survives transient fetch errors; `init` gates the `loadConversation` fallback on the streaming flag; themed `showConfirmModal` component (replaces `confirm()`); batch-delete selection mode (sidebar header has two layouts, per-item `×` hidden in selection mode, batch delete via the new modal); smart auto-scroll that captures pinned-to-bottom state before the DOM update; `sendMessage()` early-return guard when `selectionMode === true` |
-| `backend/chat/stream_manager.py` | `StreamJob.cancelled` flag; `clear_job` sets the flag before removing from registry |
-| `backend/chat/service.py` | `generate_background` checks `job.cancelled` in the chunk loop and before `save_conversation`; bails out (no `mark_completed`, no save) if set |
-| `backend/tests/test_chat_service.py` | Regression test `test_generate_background_aborts_on_cancellation` — proves the resurrection bug is fixed |
+| `backend/chat/routes.py` | `/api/chat/*` endpoints; `stream_from_active_job` / `stream_from_inactive_job`; `_sse` and `_serialize_chunk` helpers; `consume_with_cleanup` is applied to the resume route's `StreamingResponse`; `stream_chat` calls `file_storage.create_conversation` + `file_storage.append_message` synchronously |
+| `backend/chat/chain.py` | `convert_messages` is module-level: `HumanMessage` for user turns; `AIMessage` for assistant turns (plain string when no `thinking`, content-block list when there is). `create_chain` wires it to `ChatAnthropic` via `RunnableLambda \| llm`. Passes `base_url=settings.anthropic_base_url` directly. |
+| `backend/chat/service.py` | `ChatService.generate_background` reads history from `file_storage` as the single source of truth; trusts it, no dedupe. Checks `job.cancelled` in the loop and before `save_conversation`. |
+| `backend/chat/stream_manager.py` | `StreamJob` (with `cancelled` flag and `reset()` method); `STREAM_REGISTRY`; `get_or_create_job` / `get_job` / `clear_job`; `consume_with_cleanup` |
+| `backend/storage/file_storage.py` | Per-process `_write_lock` (threading); `_atomic_write_json` helper (tmp + `os.replace`); corrupt-JSON-aside recovery; the four write functions are wrapped in the lock and use the atomic helper |
+| `frontend/index.html` | Chat UI structure (49 lines): links to `styles.css`, `app.js`; CDN scripts (katex, dompurify, streaming-markdown); modal markup; chat layout |
+| `frontend/static/styles.css` | All UI styling (theme tokens, layout, animations, responsive, modal) |
+| `frontend/static/app.js` | Frontend chat UI logic: SSE stream processing, resume, conversation list, message rendering, history cache-first load, modal flow. Imports `cache` from `./cache.js` for all `localStorage` access. No raw `localStorage` or `JSON.parse` / `JSON.stringify` of cached state. |
+| `frontend/static/cache.js` | The single owner of `localStorage` access: typed accessors for `chunks`, `history`, `consumed`, `streaming`, `currentConversationId`. Encapsulates the five key names and the JSON encoding. |
+| `pyproject.toml` | Pytest config: `asyncio_mode = "auto"`, `testpaths = ["backend/tests"]` |
+| `backend/tests/conftest.py` | Pytest fixtures: `temp_storage_dir` (uses `monkeypatch` + `tmp_path` to redirect `STORAGE_DIR` / `CONVERSATIONS_FILE`); `mock_chain` |
+| `backend/tests/test_chat_routes.py` | `stream_from_inactive_job` / `stream_from_active_job`; pointer / boundary / out-of-range; `job.reset()` |
+| `backend/tests/test_chat_service.py` | `ChatService.generate_background()` with mocked LLM (thinking + tokens, string content, append_chunk, cancellation) |
+| `backend/tests/test_storage.py` | `TestStorage`, `TestConversationList`, `TestDeleteConversation`, `TestAtomicWrite` (3 tests), `TestWriteLock` (2 tests) |
+| `backend/tests/test_stream_manager.py` | `StreamJob` state transitions; unified chunks list + chunk_queue; 5 `consume_with_cleanup` tests |
+| `backend/tests/test_thinking_routes.py` | HTTP tests for status, resume 404, post starts background task, delete clears job; 2 integration tests for `consume_with_cleanup` (resume route cleans up, initial stream does not) |
+| `backend/tests/test_chain.py` | `convert_messages` shape: user → `HumanMessage`; assistant without `thinking` → plain `AIMessage`; assistant with `thinking` → content-block `AIMessage`; multi-turn scenario; unknown roles dropped |
 
 ---
 

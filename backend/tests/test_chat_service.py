@@ -81,29 +81,6 @@ def test_generate_background_stores_tokens_in_job():
     clear_job("test-conv-456")
 
 
-def test_get_stream_status_returns_chunks_count():
-    """Test get_stream_status returns chunks_count and status."""
-    mock_chain = MagicMock()
-    service = ChatService(mock_chain)
-
-    clear_job("test-status")
-
-    # Create a job with some chunks using the new API
-    from backend.chat.stream_manager import get_or_create_job
-    job = get_or_create_job("test-status", [])
-    job.append_chunk("thinking", "thinking 1")
-    job.append_chunk("thinking", "thinking 2")
-    job.append_chunk("token", "token 1")
-
-    status = service.get_stream_status("test-status")
-    assert status["chunks_count"] == 3
-    assert status["status"] == "pending"
-    assert status["streaming"] == False
-    assert status["is_complete"] == False
-
-    clear_job("test-status")
-
-
 def test_generate_background_handles_string_content():
     """Test that generate_background handles string content from chunk."""
     mock_chain = MagicMock()

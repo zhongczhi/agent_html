@@ -3,22 +3,32 @@ import json
 import uuid
 from typing import AsyncGenerator
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
 from backend.chat.chain import create_chain
 from backend.chat.service import ChatService
-from backend.chat.stream_manager import get_job, clear_job, get_or_create_job
+from backend.chat.stream_manager import clear_job, consume_with_cleanup, get_job, get_or_create_job
 from backend.storage import file_storage
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
-chain = create_chain()
-chat_service = ChatService(chain)
+
+
+_chat_service: ChatService | None = None
+
+
+def get_chat_service() -> ChatService:
+    """Lazy-init singleton. Using Depends() keeps this testable and avoids
+    constructing the LLM client at module-import time."""
+    global _chat_service
+    if _chat_service is None:
+        _chat_service = ChatService(create_chain())
+    return _chat_service
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=10000)
     conversation_id: str | None = None
 
 
@@ -43,91 +53,93 @@ class DeleteResponse(BaseModel):
 
 
 class StreamStatusResponse(BaseModel):
-    streaming: bool
-    status: str
+    status: str  # "none" | "pending" | "active" | "completed" | "failed"
     chunks_count: int
-    is_complete: bool
     partial_content: str | None = None
 
 
-async def stream_from_job(
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _serialize_chunk(chunk: dict) -> dict:
+    return {"chunk": chunk["chunk"], "type": chunk["type"], "message_id": chunk["message_id"]}
+
+
+async def _replay_cached_chunks(job, from_pointer: int) -> AsyncGenerator[str, None]:
+    """Yield cached chunks [from_pointer:]. Caller handles the end marker / queue drain."""
+    for chunk in job.chunks[from_pointer:]:
+        yield _sse(_serialize_chunk(chunk))
+
+
+async def stream_from_inactive_job(
     job,
     from_pointer: int = 0
 ) -> AsyncGenerator[str, None]:
-    """Read chunks from StreamJob and yield SSE events.
-    from_pointer is provided by frontend to resume from a specific position.
-    Backend does NOT track sent_pointer.
+    """Replay the full cached chunk history for a completed/failed/pending job and stop."""
+    if from_pointer < 0 or from_pointer > len(job.chunks):
+        return
+    async for event in _replay_cached_chunks(job, from_pointer):
+        yield event
+    yield _sse({"end": True})
+
+
+async def stream_from_active_job(
+    job,
+    from_pointer: int = 0
+) -> AsyncGenerator[str, None]:
+    """Replay cached chunks [from_pointer:], then drain queued chunks until the end marker.
+
+    `from_pointer == len(job.chunks)` is a valid boundary — the slice is empty but
+    we still need to wait for queued chunks and the end marker.
     """
-    # Error handling: from_pointer must be within valid range.
-    # from_pointer == len(job.chunks) is a VALID boundary (all current chunks
-    # already sent); we still need to wait for queued chunks and the end marker.
     if from_pointer < 0 or from_pointer > len(job.chunks):
         return
 
-    # load strictly from chunks if inactive
-    if job.status != "active":
-        for chunk in job.chunks[from_pointer:]:
-            yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
-        yield f"data: {json.dumps({'end': True})}\n\n"
-        return
+    async for event in _replay_cached_chunks(job, from_pointer):
+        yield event
 
-    # first load from chunks when fetch from the queue
-    for chunk in job.chunks[from_pointer:]:
-        yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
-    if len(job.chunks) > 0:
-        last = int(job.chunks[-1]['message_id'])
-    else:
-        last = 0
+    last = int(job.chunks[-1]["message_id"]) if job.chunks else 0
 
-    # Stream from queue (new chunks being generated)
     while True:
         try:
             chunk = await asyncio.wait_for(job.chunk_queue.get(), timeout=0.5)
-            if chunk is None:
-                yield f"data: {json.dumps({'end': True})}\n\n"
-                break
-            if int(chunk['message_id']) <= last:
-                continue
-            yield f"data: {json.dumps({'chunk': chunk['chunk'], 'type': chunk['type'], 'message_id': chunk['message_id']})}\n\n"
         except asyncio.TimeoutError:
             if job.status != "active":
-                yield f"data: {json.dumps({'end': True})}\n\n"
-                break
+                yield _sse({"end": True})
+                return
+            continue
+        if chunk is None:
+            yield _sse({"end": True})
+            return
+        if int(chunk["message_id"]) <= last:
+            continue
+        yield _sse(_serialize_chunk(chunk))
 
 
 @router.post("/stream")
-async def stream_chat(request: ChatRequest):
-    conversation_id = request.conversation_id
+async def stream_chat(
+    request: ChatRequest,
+    chat_service: ChatService = Depends(get_chat_service),
+):
+    conversation_id = request.conversation_id or str(uuid.uuid4())
 
-    if conversation_id is None:
-        conversation_id = str(uuid.uuid4())
-
-    # Check if this is a new conversation (not yet in storage)
-    existing_conv = file_storage.get_conversation(conversation_id)
-    is_new_conversation = existing_conv is None
+    # Ensure the conversation exists in storage so it appears in the sidebar
+    # immediately (and is updated in-place as the assistant response streams).
+    file_storage.create_conversation(conversation_id)
+    file_storage.append_message(conversation_id, "user", request.message)
 
     job = get_or_create_job(conversation_id, [])
 
-    # If job is not active, start background task
     if job.status != "active":
-        job.status = "active"
-        job.tokens = []
-        job.thinking_tokens = []
-        job.sent_pointer = 0
-        job.thinking_sent_pointer = 0
-        job.chunks = []  # Clear chunks from previous message
+        job.reset()
 
-        # Append message to storage immediately for new conversations
-        # so the conversation appears in the list with correct title
-        if is_new_conversation:
-            file_storage.append_message(conversation_id, "user", request.message)
-
-        asyncio.create_task(
-            chat_service.generate_background(request.message, conversation_id)
-        )
+    asyncio.create_task(
+        chat_service.generate_background(request.message, conversation_id)
+    )
 
     return StreamingResponse(
-        stream_from_job(job),
+        stream_from_active_job(job),
         media_type="text/event-stream",
     )
 
@@ -135,14 +147,21 @@ async def stream_chat(request: ChatRequest):
 @router.get("/stream/{conversation_id}")
 async def stream_resume(
     conversation_id: str,
-    from_pointer: int = Query(default=0)
+    from_pointer: int = Query(default=0),
 ):
     job = get_job(conversation_id)
     if job is None:
         raise HTTPException(status_code=404, detail="No stream job found")
 
+    if job.status == "active":
+        gen = stream_from_active_job(job, from_pointer=from_pointer)
+    else:
+        gen = stream_from_inactive_job(job, from_pointer=from_pointer)
+    # Only the resume path cleans up. The job exists to support resume; once
+    # a resume has fully replayed the cached chunks, the cache is no longer
+    # needed. Cancellation / early return / exception leaves the job in place.
     return StreamingResponse(
-        stream_from_job(job, from_pointer=from_pointer),
+        consume_with_cleanup(gen, job.conversation_id),
         media_type="text/event-stream",
     )
 
@@ -151,24 +170,17 @@ async def stream_resume(
 async def get_stream_status(conversation_id: str):
     job = get_job(conversation_id)
     if job is None:
-        return StreamStatusResponse(
-            streaming=False,
-            status="none",
-            chunks_count=0,
-            is_complete=False,
-        )
+        return StreamStatusResponse(status="none", chunks_count=0)
     return StreamStatusResponse(
-        streaming=job.status == "active",
         status=job.status,
         chunks_count=len(job.chunks),
-        is_complete=job.status == "completed",
-        partial_content="".join(c["chunk"] for c in job.chunks if c["type"] == "token") if job.chunks else None
+        partial_content="".join(c["chunk"] for c in job.chunks if c["type"] == "token") or None,
     )
 
 
 @router.get("/history/{conversation_id}", response_model=ChatHistoryResponse)
 async def get_chat_history(conversation_id: str):
-    history = chat_service.get_history(conversation_id)
+    history = file_storage.get_conversation(conversation_id)
     if history is None:
         return ChatHistoryResponse(conversation_id=conversation_id, messages=[])
     return ChatHistoryResponse(**history)

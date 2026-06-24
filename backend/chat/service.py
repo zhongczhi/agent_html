@@ -1,7 +1,4 @@
-import asyncio
 import logging
-import uuid
-from typing import Optional
 
 from backend.storage import file_storage
 from backend.chat.stream_manager import get_or_create_job, get_job
@@ -24,12 +21,12 @@ class ChatService:
         """
         job = get_or_create_job(conversation_id, [])
 
-        # Load history and append user message (if not already last message)
-        # This avoids duplicates when message was already appended in stream_chat for new conversations
+        # The user message is already appended to storage by routes.stream_chat
+        # (so the conversation appears in the sidebar with the correct title
+        # during streaming). Load it from storage here — no need to append
+        # again, since storage is the single source of truth.
         history = file_storage.get_conversation(conversation_id)
         messages = history["messages"] if history else []
-        if not messages or messages[-1]["content"] != message:
-            messages.append({"role": "user", "content": message})
         job.messages = messages
 
         try:
@@ -82,21 +79,5 @@ class ChatService:
         })
         file_storage.save_conversation(conversation_id, messages)
 
-    def get_history(self, conversation_id: str) -> Optional[dict]:
+    def get_history(self, conversation_id: str) -> dict | None:
         return file_storage.get_conversation(conversation_id)
-
-    def get_stream_status(self, conversation_id: str) -> dict:
-        job = get_job(conversation_id)
-        if job is None:
-            return {
-                "streaming": False,
-                "status": "none",
-                "chunks_count": 0,
-                "is_complete": False
-            }
-        return {
-            "streaming": job.status == "active",
-            "status": job.status,
-            "chunks_count": len(job.chunks),
-            "is_complete": job.status == "completed"
-        }

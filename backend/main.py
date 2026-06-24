@@ -23,10 +23,5 @@ async def root():
     return FileResponse(frontend_path / "index.html")
 
 
-@app.get("/index.html")
-async def index_html():
-    return FileResponse(frontend_path / "index.html")
-
-
 if (frontend_path / "index.html").exists():
-    app.mount("/static", StaticFiles(directory=str(frontend_path)), name="static")
+    app.mount("/static", StaticFiles(directory=str(frontend_path / "static")), name="static")

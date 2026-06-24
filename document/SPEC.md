@@ -6,7 +6,7 @@ A modular chatbot application that provides streaming AI responses with conversa
 
 **Core Goal:** Deliver a chat interface with real-time streaming responses, persistent conversation history, and LLM thinking content display.
 
-**Recent Improvements:** The system now includes a frontend conversation history cache for fast load, immediate sidebar visibility for new conversations, robust SSE event boundary handling, streaming markdown parser state preservation, an updated LLM model configuration with extended thinking, refined stream resume boundary semantics, a streamlined new-chat UX, stream resume that survives any number of mid-stream refreshes, a themed confirmation modal that replaces the browser-native dialog, batch delete for conversations, a fix for the streaming-conversation resurrection bug, smart auto-scroll that respects manual scrolling during streaming, and a guard that blocks sending messages while in batch-deletion selection mode.
+**Recent Improvements:** The system now includes a frontend conversation history cache for fast load, immediate sidebar visibility for new conversations, robust SSE event boundary handling, streaming markdown parser state preservation, an updated LLM model configuration with extended thinking, refined stream resume boundary semantics, a streamlined new-chat UX, stream resume that survives any number of mid-stream refreshes, a themed confirmation modal that replaces the browser-native dialog, batch delete for conversations, a fix for the streaming-conversation resurrection bug, smart auto-scroll that respects manual scrolling during streaming, a guard that blocks sending messages while in batch-deletion selection mode, code-quality cleanup across the codebase (frontend split into `index.html` + `static/styles.css` + `static/app.js`, all `localStorage` access consolidated into a `cache.js` module, `StreamStatusResponse` simplified to a single `status` string, FastAPI `Depends` for the chat service, typed `convert_messages` using `HumanMessage`/`AIMessage`), multi-turn thinking continuity (prior assistant `thinking` is fed back to the LLM as a content block so turns 2+ emit `thinking` chunks), stream-registry memory cleanup (a `StreamJob` is removed from `STREAM_REGISTRY` after a successful resume), file-storage concurrency safety (a per-process `threading.Lock` plus an atomic write helper so concurrent writers don't lose updates and a crash mid-write leaves the previous file fully intact), and explicit `TODO(U2 — known issue)` comments at the two `DOMPurify` no-op call sites in the frontend.
 
 ---
 
@@ -204,6 +204,52 @@ A modular chatbot application that provides streaming AI responses with conversa
 | FR-19.3 | The `messageInput` `keydown` handler (Enter key, when Shift is not held) routes through `sendMessage()` and is therefore blocked by FR-19.1 |
 | FR-19.4 | After exiting selection mode (Cancel button), Send and Enter both work normally — no regression |
 
+### FR-20: Multi-Turn Thinking Continuity
+
+| ID | Requirement |
+|----|-------------|
+| FR-20.1 | On every turn of a multi-turn conversation, the assistant response includes at least one `thinking` content chunk |
+| FR-20.2 | The previous assistant's `thinking` content is preserved when fed back to the LLM as a content block, so the chain of reasoning can continue across the conversation |
+| FR-20.3 | Prior assistant messages still have only their visible `content` available to the LLM as the assistant's "output" |
+| FR-20.4 | The change is contained to message conversion; no other code paths are affected |
+
+### FR-21: Stream Registry Memory Cleanup
+
+| ID | Requirement |
+|----|-------------|
+| FR-21.1 | A `StreamJob` is removed from `STREAM_REGISTRY` after a **successful** resume call has delivered the full cached chunk history (including the `end` marker) |
+| FR-21.2 | A resume that is interrupted (client disconnect, browser navigation), returns early without yielding the `end` marker, or raises an exception leaves the job in place — a future resume must be able to continue |
+| FR-21.3 | The cleanup applies only to the **resume** route (`GET /api/chat/stream/{conversation_id}`). The **initial** stream (`POST /api/chat/stream`) does not trigger cleanup, so a later resume is still possible if the initial stream is interrupted |
+| FR-21.4 | A `StreamJob` for which the user never calls resume still leaks for the lifetime of the process (no TTL-based sweep) — a known limitation, not addressed in this iteration |
+
+### FR-22: File Storage Concurrency Safety
+
+| ID | Requirement |
+|----|-------------|
+| FR-22.1 | Two threads writing to `conversations.json` concurrently (e.g., two `append_message` calls) must both be reflected in the final file — no lost updates |
+| FR-22.2 | A process crash (or any failure) during a write must leave the previous on-disk file fully intact — readers see either the fully-old or fully-new file, never partial |
+| FR-22.3 | A failed write must clean up any leftover `.tmp` file in `STORAGE_DIR` so the directory does not accumulate stale partial writes |
+| FR-22.4 | The behavior is observable to existing callers as "still produces a valid JSON file at `CONVERSATIONS_FILE`" — no signature change |
+| FR-22.5 | The lock is per-process; a multi-worker deployment (`uvicorn --workers N`) is not addressed and would need a file-level lock — out of scope |
+
+### FR-23: Frontend Cache Module
+
+| ID | Requirement |
+|----|-------------|
+| FR-23.1 | All `localStorage` access in the frontend is encapsulated in [`frontend/static/cache.js`](../frontend/static/cache.js) |
+| FR-23.2 | The module exposes typed accessors for each cache: history (get/set/append/clear), chunks (get/set/append/clear), consumed (get/set/clear), streaming (is/get/set/clear), and currentConversationId (get/set) |
+| FR-23.3 | The five keys and their JSON-vs-string encoding remain identical to the pre-refactor behavior |
+| FR-23.4 | `app.js` contains no `localStorage`, no `STORAGE_KEYS`, no `JSON.parse` / `JSON.stringify` related to cached state, and no helper functions for localStorage access. The only `JSON.*` calls that remain are for the `fetch` request body and SSE event parsing, which are not localStorage-related |
+| FR-23.5 | The five caches keep their existing roles: `history` is the per-conversation message history (for instant load), `chunks` is the per-conversation streaming chunks (for page-refresh-during-stream resume), `consumed` is the per-conversation resume pointer, `streaming` is the per-conversation "is this conversation being streamed" flag, `currentConversationId` is the global "which conversation is open" key |
+
+### FR-24: Frontend Asset Path
+
+| ID | Requirement |
+|----|-------------|
+| FR-24.1 | The URL path `/static/...` references an actual `static` directory in the project tree |
+| FR-24.2 | `index.html` is served at `/` |
+| FR-24.3 | The four frontend files (`index.html`, `styles.css`, `app.js`, `cache.js`) are served by FastAPI's `StaticFiles` mount at `/static` (for the three under `frontend/static/`) and the explicit route at `/` (for `index.html`) |
+
 ---
 
 ## Non-Functional Requirements
@@ -224,10 +270,12 @@ A modular chatbot application that provides streaming AI responses with conversa
 
 ### NFR-3: Reliability
 
-- Invalid JSON in storage file returns empty dict with warning log
+- Invalid JSON in storage file: the file is renamed to `conversations.json.corrupt` and the application starts fresh (with a warning log)
 - LLM generation errors are logged
 - Storage directory auto-created if missing
 - StreamJob continues in background when EventSource disconnects
+- Concurrent writes to `conversations.json` within a process are serialized by a `threading.Lock` so the read-modify-write cycle never interleaves
+- A process crash during a write leaves the previous on-disk file fully intact (atomic write via `<path>.tmp` + `os.replace`)
 
 ### NFR-4: Security
 
@@ -357,36 +405,40 @@ Note: `thinking` field is optional and only present on assistant messages when t
 
 ```json
 {
-  "streaming": "boolean",
-  "status": "active|completed|failed",
+  "status": "none|pending|active|completed|failed",
   "chunks_count": "integer",
-  "is_complete": "boolean",
-  "partial_content": "string",
-  "error": "string|null"
+  "partial_content": "string|null"
 }
 ```
+
+The `status` string is the single contract: `"none"` when no `StreamJob` exists, `"active"` while the LLM is producing, `"completed"` when it finished normally, `"failed"` if the LLM errored, `"pending"` if a job exists but has not started streaming yet.
 
 ### StreamJob Schema (Backend)
 
 ```json
 {
-  "chunks": [{"chunk": "string", "type": "thinking|token"}],
+  "chunks": [{"chunk": "string", "type": "thinking|token", "message_id": "string"}],
   "chunk_queue": "asyncio.Queue",
   "messages": [{"role": "string", "content": "string"}],
   "status": "pending|active|completed|failed",
-  "error": "string|null"
+  "error": "string|null",
+  "cancelled": "boolean"
 }
 ```
 
+`cancelled` is set by `clear_job` to signal the background task to stop cleanly.
+
 ### localStorage Schema (Frontend)
 
-The frontend maintains two separate caches per conversation: a **history cache** for the full message list (the "done" state) and a **chunks cache** for in-flight streaming chunks (the "in-flight" state).
+All `localStorage` access is encapsulated in [`frontend/static/cache.js`](../frontend/static/cache.js). The module exposes typed accessors; `app.js` does not touch `localStorage` directly. The five keys are:
 
 | Key | Content |
 |-----|---------|
 | `chunks_{conv_id}` | JSON array of stream chunks `[{"chunk": str, "type": "thinking\|token", "message_id": str?}]` — `message_id` is emitted by the backend for debug tracing; the frontend does not depend on or consume it |
-| `pointer_{conv_id}` | Integer position for resume |
-| `streaming_{conv_id}` | Boolean flag for active streaming |
+| `consumed_{conv_id}` | Integer position for resume (renamed from `pointer_{conv_id}`) |
+| `streaming_{conv_id}` | `"true"` or `"false"` flag for active streaming |
+| `history_{conv_id}` | JSON array of complete messages `[{role, content, thinking?}]` for fast load on switch/refresh |
+| `currentConversationId` | UUID of the currently open conversation (global, not per-conversation) |
 | `history_{conv_id}` | JSON array of complete messages `[{"role": "user"\|"assistant", "content": "...", "thinking": "..."?}]` |
 
 ---
@@ -417,18 +469,21 @@ The frontend maintains two separate caches per conversation: a **history cache**
 
 ### Markdown Rendering
 
-- Use marked.js via CDN for text responses only
+- Use `streaming-markdown` (CDN) for streamed token rendering, preserving parser state across resume
+- `marked.js` is not loaded — the streaming parser handles final-message rendering as well
 - Thinking content: plain text only
 
 ---
 
 ## Dependencies
 
-### Frontend
+### Frontend (CDN scripts in `index.html`)
 
-```html
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-```
+- `katex` — LaTeX math rendering
+- `dompurify` — loaded but currently unused at two no-op call sites; see `TODO(U2 — known issue)` comments in `frontend/static/app.js`
+- `streaming-markdown` — incremental markdown parser
+
+Styles live in `frontend/static/styles.css`; app logic in `frontend/static/app.js`; `localStorage` access in `frontend/static/cache.js`. `index.html` lives at `frontend/index.html` and is served at `/` by FastAPI.
 
 ---
 
