@@ -60,12 +60,15 @@ frontend_path = Path(__file__).parent.parent / "frontend"
 
 @app.get("/")
 async def root():
-    return FileResponse(frontend_path / "index.html")
-
-
-@app.get("/compare")
-async def compare():
+    # Iteration 7: landing page is the side-by-side compare UI.
+    # The original single-pane chat is preserved at /single for users
+    # who prefer it.
     return FileResponse(frontend_path / "compare.html")
+
+
+@app.get("/single")
+async def single():
+    return FileResponse(frontend_path / "index.html")
 
 
 if (frontend_path / "index.html").exists():

@@ -215,6 +215,14 @@
             gap: 12px;
             color: var(--text-primary);
         }
+        .chat-header .header-link {
+            margin-left: auto;
+            font-size: 13px;
+            font-weight: 400;
+            color: var(--accent, #7aa2f7);
+            text-decoration: none;
+        }
+        .chat-header .header-link:hover { text-decoration: underline; }
         .chat-header::before {
             content: '';
             width: 8px;
