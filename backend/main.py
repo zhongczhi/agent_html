@@ -13,6 +13,12 @@ from backend.chat.routes import router as chat_router
 from backend.rag.config import RagSettings
 
 logging.basicConfig(level=logging.INFO)
+# Silence noisy INFO-level chatter from external libraries so the operator
+# log only shows what's actually relevant to this app.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+logging.getLogger("faiss.loader").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
