@@ -16,6 +16,24 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
 _chat_service: ChatService | None = None
+# Module-level reference to the long-lived RagService, set by main.py's
+# lifespan when RAG is enabled. Read at chat-service-construction time so
+# the Depends() reference in route decorators still resolves correctly.
+_rag_service = None
+
+
+def set_rag_service(rag) -> None:
+    """Set the module-level rag service. Called from main.py at startup."""
+    global _rag_service
+    _rag_service = rag
+    # If the chat service was already constructed (e.g., tests that build
+    # the service before app startup), inject now so a freshly returned
+    # service picks it up too. The standard lifespan order builds the rag
+    # service BEFORE the first chat request, so this branch is the
+    # unusual case.
+    global _chat_service
+    if _chat_service is not None and _chat_service.rag_service is None:
+        _chat_service.rag_service = rag
 
 
 def get_chat_service() -> ChatService:
@@ -23,7 +41,7 @@ def get_chat_service() -> ChatService:
     constructing the LLM client at module-import time."""
     global _chat_service
     if _chat_service is None:
-        _chat_service = ChatService(create_chain())
+        _chat_service = ChatService(create_chain(), rag_service=_rag_service)
     return _chat_service
 
 

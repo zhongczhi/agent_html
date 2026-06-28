@@ -11,6 +11,9 @@ const KEYS = {
     streaming: (convId) => `streaming_${convId}`,
     history: (convId) => `history_${convId}`,
     currentConversationId: () => 'currentConversationId',
+    baseConversationId: () => 'baseConversationId',
+    currentChannel: () => 'currentChannel',
+    ragEnabled: () => 'ragEnabled',
 };
 
 function readJSON(key) {
@@ -52,6 +55,46 @@ export const cache = {
         } else {
             remove(KEYS.currentConversationId());
         }
+    },
+
+    // --- base conversation id + current channel (RAG iteration 7) -------
+    //
+    // The two channels (vanilla, RAG) share a single base UUID and each
+    // derive a distinct conversation_id from it: `${base}-0` and
+    // `${base}-1`. The base is generated once on first load and persisted
+    // so the channel pair survives page reloads. The current channel is
+    // also persisted so the user returns to the last channel they were on.
+
+    getBaseConversationId() {
+        return readString(KEYS.baseConversationId());
+    },
+
+    setBaseConversationId(id) {
+        if (id) {
+            writeString(KEYS.baseConversationId(), id);
+        } else {
+            remove(KEYS.baseConversationId());
+        }
+    },
+
+    getCurrentChannel() {
+        return readString(KEYS.currentChannel()) || 'vanilla';
+    },
+
+    setCurrentChannel(channel) {
+        if (channel === 'vanilla' || channel === 'rag') {
+            writeString(KEYS.currentChannel(), channel);
+        } else {
+            remove(KEYS.currentChannel());
+        }
+    },
+
+    getRagEnabled() {
+        return readString(KEYS.ragEnabled()) === 'true';
+    },
+
+    setRagEnabled(enabled) {
+        writeString(KEYS.ragEnabled(), enabled ? 'true' : 'false');
     },
 
     // --- history (per-conversation, JSON array) ------------------------

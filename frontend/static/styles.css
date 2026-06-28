@@ -223,6 +223,84 @@
             text-decoration: none;
         }
         .chat-header .header-link:hover { text-decoration: underline; }
+
+        /* RAG channel switcher — added in iteration 7. Hidden when RAG is
+           disabled so the iteration-6 UI is preserved exactly. */
+        .chat-header .channel-switcher {
+            margin-left: auto;
+            display: inline-flex;
+            border: 1px solid var(--border-color, #2a2f3a);
+            border-radius: 6px;
+            overflow: hidden;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        .chat-header .channel-btn {
+            background: transparent;
+            color: var(--text-primary, #e6e6e6);
+            border: none;
+            padding: 6px 14px;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .chat-header .channel-btn:hover {
+            background: var(--bg-tertiary, rgba(255,255,255,0.04));
+        }
+        .chat-header .channel-btn.active {
+            background: var(--accent, #7aa2f7);
+            color: var(--bg-primary, #0e1117);
+        }
+        .chat-header .channel-btn + .channel-btn {
+            border-left: 1px solid var(--border-color, #2a2f3a);
+        }
+        .chat-header .upload-btn {
+            margin-left: 8px;
+            padding: 6px 12px;
+            border: 1px solid var(--border-color, #2a2f3a);
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            color: var(--text-primary, #e6e6e6);
+        }
+        .chat-header .upload-btn:hover {
+            background: var(--bg-tertiary, rgba(255,255,255,0.04));
+        }
+        .chat-header .upload-btn:has(input:focus) { outline: 2px solid var(--accent, #7aa2f7); }
+
+        /* RAG sources block — shown above the assistant response when the
+           server emits a 'sources' SSE event. */
+        .sources-block {
+            background: var(--bg-card, #1a1d24);
+            border: 1px solid var(--border-color, #2a2f3a);
+            border-left: 3px solid var(--accent, #7aa2f7);
+            border-radius: 6px;
+            padding: 8px 12px;
+            margin: 4px 0;
+            font-size: 12px;
+            color: var(--text-secondary, #aaa);
+            font-family: var(--font-mono, 'JetBrains Mono', monospace);
+        }
+        .sources-block .sources-header {
+            color: var(--accent, #7aa2f7);
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .sources-block .src-row {
+            padding: 1px 0;
+        }
+        .sources-block .src-scope {
+            color: var(--accent, #7aa2f7);
+            font-weight: 600;
+            margin-right: 6px;
+        }
+        .upload-status {
+            font-size: 12px;
+            color: var(--text-secondary, #888);
+            padding: 4px 8px;
+        }
+        .upload-status.error { color: #f7768e; }
+        .upload-status.ok    { color: #9ece6a; }
         .chat-header::before {
             content: '';
             width: 8px;

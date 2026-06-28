@@ -8,6 +8,9 @@ const sidebar = document.getElementById('sidebar');
 const sidebarHeader = document.getElementById('sidebarHeader');
 const conversationList = document.getElementById('conversationList');
 const toggleSidebarMain = document.getElementById('toggleSidebarMain');
+const channelSwitcher = document.getElementById('channelSwitcher');
+const ragUploadBtn = document.getElementById('ragUploadBtn');
+const ragUploadInput = document.getElementById('ragUploadInput');
 
 // Modal elements
 const confirmModal = document.getElementById('confirmModal');
@@ -16,7 +19,31 @@ const modalMessage = document.getElementById('modalMessage');
 const modalCancelBtn = document.getElementById('modalCancelBtn');
 const modalConfirmBtn = document.getElementById('modalConfirmBtn');
 
-let currentConversationId = cache.getCurrentConversationId();
+// Channel state (RAG iteration 7). The two channels share a base UUID
+// and each derive a distinct conversation_id: `${base}-0` for vanilla,
+// `${base}-1` for RAG. The current channel is persisted in cache so the
+// user returns to the last channel they were on after a page reload.
+let currentChannel = cache.getCurrentChannel();  // 'vanilla' | 'rag'
+let baseConversationId = cache.getBaseConversationId();
+if (!baseConversationId) {
+    baseConversationId = crypto.randomUUID();
+    cache.setBaseConversationId(baseConversationId);
+    // Initialize both channel conversations so they appear in the sidebar
+    // immediately. Without this, only the active channel would have a
+    // conversation_id at all, and switching to the inactive channel would
+    // create it on the fly (which works, but loses the "easy to identify as
+    // a pair" property from the spec).
+    cache.setHistory(`${baseConversationId}-0`, []);
+    cache.setHistory(`${baseConversationId}-1`, []);
+}
+const conversationIdFor = (channel) => `${baseConversationId}-${channel === 'rag' ? '1' : '0'}`;
+
+// currentConversationId is the existing global; keep its semantics so the
+// rest of app.js (loadConversation, sendMessage, processStreamResponse,
+// etc.) continues to work unchanged. It always points at the active
+// channel's conversation_id.
+let currentConversationId = conversationIdFor(currentChannel);
+
 let conversations = {};
 let currentAbortController = null;  // For cancelling ongoing streams
 let selectionMode = false;
@@ -24,6 +51,40 @@ let selectedConvIds = new Set();
 
 // Track rendered equation elements per div to avoid O(N²) re-rendering
 const renderedEquations = new WeakMap();
+
+function retrievalForChannel(channel) {
+    if (channel === 'rag') {
+        return { library: true, uploads: true, top_k: 4 };
+    }
+    return null;
+}
+
+function setChannel(channel) {
+    if (channel !== 'vanilla' && channel !== 'rag') return;
+    if (channel === currentChannel) return;
+    currentChannel = channel;
+    cache.setCurrentChannel(channel);
+    currentConversationId = conversationIdFor(channel);
+    cache.setCurrentConversationId(currentConversationId);
+
+    // Update the toggle button visuals
+    if (channelSwitcher) {
+        channelSwitcher.querySelectorAll('.channel-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.channel === channel);
+        });
+    }
+    // Show/hide the upload button (RAG only)
+    if (ragUploadBtn) {
+        ragUploadBtn.hidden = channel !== 'rag';
+    }
+
+    // Reload the conversation's history and re-render. The existing
+    // loadConversation() handles history fetching, SSE-resume check, and
+    // empty-state — we reuse it.
+    loadConversation(currentConversationId).then(() => {
+        loadConversationList();
+    });
+}
 
 function applyLaTeX(div) {
     const rendered = renderedEquations.get(div) || new Set();
@@ -75,6 +136,36 @@ function end_parser(parser){
 
 // Initialize
 async function init() {
+    // Probe the server to see if RAG is enabled. If yes, show the channel
+    // switcher and upload button. If no, hide them — the iteration-6 UI
+    // is preserved exactly. The probe is fire-and-forget; failure to
+    // reach the server is treated as "RAG disabled".
+    try {
+        const resp = await fetch('/api/rag/stats');
+        if (resp.ok) {
+            cache.setRagEnabled(true);
+            if (channelSwitcher) channelSwitcher.hidden = false;
+            // Active button reflects the persisted channel
+            if (channelSwitcher) {
+                channelSwitcher.querySelectorAll('.channel-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.channel === currentChannel);
+                });
+            }
+            if (ragUploadBtn) ragUploadBtn.hidden = currentChannel !== 'rag';
+        } else {
+            // RAG disabled — hide the switcher entirely. The persisted
+            // currentChannel is left alone; the server ignores the
+            // retrieval field anyway when RAG is disabled.
+            cache.setRagEnabled(false);
+            if (channelSwitcher) channelSwitcher.hidden = true;
+            if (ragUploadBtn) ragUploadBtn.hidden = true;
+        }
+    } catch {
+        cache.setRagEnabled(false);
+        if (channelSwitcher) channelSwitcher.hidden = true;
+        if (ragUploadBtn) ragUploadBtn.hidden = true;
+    }
+
     await loadConversationList();
 
     if (currentConversationId) {
@@ -653,7 +744,7 @@ async function sendMessage() {
     if (!message) return;
 
     if (!currentConversationId) {
-        currentConversationId = crypto.randomUUID();
+        currentConversationId = conversationIdFor(currentChannel);
         cache.setCurrentConversationId(currentConversationId);
     }
 
@@ -693,7 +784,11 @@ async function sendMessage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 message,
-                conversation_id: currentConversationId
+                conversation_id: currentConversationId,
+                // Channel-aware retrieval config: null for vanilla, full
+                // config for RAG. The server resolves "retrieval is set
+                // AND rag_service is set" to decide whether to retrieve.
+                retrieval: retrievalForChannel(currentChannel),
             }),
             signal: currentAbortController.signal
         });
@@ -800,6 +895,18 @@ async function processStreamResponse(response, isResume, existingMessage = null,
                             thinkingElement.textContent += data.chunk;
                             thinkingContent += data.chunk;
                             updateThinkingDisplay(assistantMessage);
+                        }
+                    } else if (data.type === 'sources') {
+                        // RAG channel: the server emits a one-time 'sources'
+                        // chunk before the first token. The chunk's text is a
+                        // JSON string: {"sources": [{filename, excerpt, scope}, ...]}.
+                        // Render a Sources block immediately above the
+                        // assistant message, before any tokens.
+                        try {
+                            const ev = JSON.parse(data.chunk);
+                            renderSourcesBlock(assistantMessage, ev.sources || []);
+                        } catch (e) {
+                            console.warn('Failed to parse sources chunk', e);
                         }
                     } else if (data.type === 'token') {
                         // Capture pinned-to-bottom state BEFORE the DOM update. The
@@ -971,6 +1078,45 @@ function addAssistantPlaceholder() {
     return messageDiv;
 }
 
+// Insert a "Sources" block immediately above the assistant message element.
+// Called when the server emits a 'sources' SSE chunk (RAG channel only).
+// Idempotent: if a sources block is already present for this assistant
+// message, replace it (handles resume-from-cache where sources may replay).
+function renderSourcesBlock(assistantMessageEl, sources) {
+    if (!assistantMessageEl || !sources || sources.length === 0) return;
+    // Remove any existing block (idempotency for cache replay)
+    const existing = assistantMessageEl.parentElement?.querySelector(
+        '.sources-block[data-for="assistant"]'
+    );
+    if (existing) existing.remove();
+
+    const block = document.createElement('div');
+    block.className = 'sources-block';
+    block.dataset.for = 'assistant';
+    const header = document.createElement('div');
+    header.className = 'sources-header';
+    header.textContent = `Sources (${sources.length})`;
+    block.appendChild(header);
+    for (const s of sources) {
+        const row = document.createElement('div');
+        row.className = 'src-row';
+        const scope = document.createElement('span');
+        scope.className = 'src-scope';
+        scope.textContent = `[${s.scope || '?'}]`;
+        row.appendChild(scope);
+        const filename = document.createElement('span');
+        filename.textContent = ` ${s.filename || '?'}`;
+        row.appendChild(filename);
+        if (s.excerpt) {
+            const excerpt = document.createElement('span');
+            excerpt.textContent = ` — ${s.excerpt.slice(0, 200)}${s.excerpt.length > 200 ? '…' : ''}`;
+            row.appendChild(excerpt);
+        }
+        block.appendChild(row);
+    }
+    assistantMessageEl.parentElement?.insertBefore(block, assistantMessageEl);
+}
+
 function updateThinkingDisplay(messageElement) {
     const thinkingSection = messageElement.querySelector('.thinking-section');
     if (!thinkingSection) return;
@@ -1040,6 +1186,54 @@ messageInput.addEventListener('input', function() {
     autoResizeInput(this);
 });
 toggleSidebarMain.addEventListener('click', () => sidebar.classList.toggle('collapsed'));
+
+// Channel switcher (RAG iteration 7). Click a button to switch the active
+// channel; the conversation_id changes, history reloads.
+if (channelSwitcher) {
+    channelSwitcher.querySelectorAll('.channel-btn').forEach(btn => {
+        btn.addEventListener('click', () => setChannel(btn.dataset.channel));
+    });
+}
+// Upload button: only meaningful on the RAG channel. The button label
+// triggers the hidden file input.
+if (ragUploadBtn && ragUploadInput) {
+    ragUploadBtn.addEventListener('click', () => ragUploadInput.click());
+    ragUploadInput.addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        await uploadForRagChannel(file);
+        ragUploadInput.value = '';
+    });
+}
+
+// Upload a file to the current RAG channel's conversation. Posts to
+// /api/rag/upload with the active conversation_id. Status messages are
+// rendered as small italic lines in the chat (not stored in history).
+async function uploadForRagChannel(file) {
+    if (currentChannel !== 'rag') return;
+    const status = document.createElement('div');
+    status.className = 'upload-status';
+    status.textContent = `Uploading ${file.name}…`;
+    messagesContainer.appendChild(status);
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    try {
+        const form = new FormData();
+        form.append('conversation_id', currentConversationId);
+        form.append('file', file);
+        const resp = await fetch('/api/rag/upload', { method: 'POST', body: form });
+        if (!resp.ok) {
+            status.classList.add('error');
+            status.textContent = `Upload failed: HTTP ${resp.status}`;
+            return;
+        }
+        const body = await resp.json();
+        status.classList.add('ok');
+        status.textContent = `Indexed ${body.chunks_added} chunks from ${body.filename}.`;
+    } catch (e) {
+        status.classList.add('error');
+        status.textContent = `Upload error: ${e}`;
+    }
+}
 
 // Sidebar header: event delegation for the dynamically-rendered buttons
 sidebarHeader.addEventListener('click', (e) => {

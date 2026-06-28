@@ -27,6 +27,12 @@ async def lifespan(app: FastAPI):
         rag = RagService.from_settings()
         app.state.rag = rag
 
+        # Inject the rag service into the chat service. The chat routes
+        # module has a set_rag_service() helper that we call here so any
+        # chat service constructed later (lazy-init) will pick it up.
+        from backend.chat import routes as chat_routes
+        chat_routes.set_rag_service(rag)
+
         # Wire the upload/del callback. We monkey-patch the module-level
         # function (file_storage.delete_conversation) so existing call sites
         # in chat/routes.py automatically trigger RAG cleanup. The patch
@@ -60,14 +66,6 @@ frontend_path = Path(__file__).parent.parent / "frontend"
 
 @app.get("/")
 async def root():
-    # Iteration 7: landing page is the side-by-side compare UI.
-    # The original single-pane chat is preserved at /single for users
-    # who prefer it.
-    return FileResponse(frontend_path / "compare.html")
-
-
-@app.get("/single")
-async def single():
     return FileResponse(frontend_path / "index.html")
 
 

@@ -109,17 +109,17 @@
 
 **Trade-off:** Sources are formatted as a single JSON blob in a chunk string. Alternative would be a structured SSE event with `event: sources\ndata: {...}` headers; chosen approach uses the existing chunk format for simplicity.
 
-### 1.10 Frontend Comparison UI Layout
+### 1.10 Frontend Channel Switcher (extends existing single-pane UI)
 
-**Choice:** Two chat panels side by side, one shared input box at the top, upload button only on the RAG panel, sources toggle only on the RAG panel.
+**Choice:** Add a channel switcher to the existing `index.html` and `static/app.js`. Two channels — **vanilla** and **RAG** — share a base UUID. Each maps to its own conversation ID (`<base>-0` for vanilla, `<base>-1` for RAG). Both conversations appear in the existing sidebar; clicking the channel switcher (or the conversation in the sidebar) toggles the active channel. The single chat panel, input box, send button, message rendering, and conversation list are all unchanged.
 
 **Rationale:**
-- Side-by-side is the most intuitive layout for A/B comparison.
-- Shared input eliminates retyping the same query into both panels.
-- Each panel keeps its own conversation history (`<uuid>-0` and `<uuid>-1`) so the comparison is repeatable across page refreshes.
-- The `-0` / `-1` suffix convention makes pairs visually adjacent in the conversation list and deletable as a group.
+- Preserves the existing architecture and UI surface — no parallel `compare.html` or `compare.js` files. The user navigates the same sidebar, sees the same messages, types in the same input.
+- The two channels are distinct conversations in storage (`<base>-0` and `<base>-1`) so the existing CRUD operations, sidebar listing, and conversation deletion all work without modification.
+- The user can switch channels anytime to read the vanilla or RAG response to the same question — a sequential comparison, not simultaneous, by design.
+- When `RAG_ENABLED=false`, the channel switcher is hidden and the UI behaves exactly as iteration 6 (vanilla-only).
 
-**Trade-off:** Takes up more horizontal screen space than a single chat. Mobile/narrow viewports are out of scope for v1.
+**Trade-off:** The user types the same question twice to compare responses (once per channel), versus a side-by-side view where one send populates both. Accepted in exchange for keeping the single-pane architecture and not introducing a parallel UI implementation.
 
 ---
 
@@ -165,8 +165,9 @@ backend/rag/
 | `backend/storage/file_storage.py` | `delete_conversation` signature gains `on_delete: Callable[[str], None] \| None = None`. Calls it after the JSON delete succeeds, with exception swallowing. |
 | `backend/main.py` | Lifespan: if `RAG_ENABLED`, build `RagService.from_settings()`, mount rag routes, wrap `delete_conversation` with `partial(..., on_delete=rag.purge_uploads)`. |
 | `requirements.txt` | Add `faiss-cpu`, `sentence-transformers`, `pypdf`. |
-| `frontend/static/app.js` | **Refactor required** before adding the second panel: extract the existing single-panel rendering into a `createChatPanel(config)` function (returns an object with `appendMessage`, `clear`, `setStreaming`, `send(text)`, etc.). The two-panel UI instantiates this function twice. Without this refactor, the comparison UI becomes unmaintainable copy-paste. |
-| `frontend/index.html` | Two-panel comparison UI: shared input, two `createChatPanel(...)` instances with different `conversation_id` and `retrieval` configs, upload button on RAG panel only, sources toggle on RAG panel only, conversation ID generation (`<uuid>-0` / `<uuid>-1`). |
+| `frontend/index.html` | Add a channel switcher (two buttons: Vanilla / RAG) in the existing chat header, plus an upload button shown only when RAG is enabled. No other layout changes. |
+| `frontend/static/app.js` | Track the active channel and a base UUID in `cache.js`; on channel switch, update `currentConversationId` to `<base>-<channel>` and reload the channel's history. In `sendMessage`, include `retrieval: null` for vanilla and `retrieval: {library, uploads, top_k}` for RAG. In `processStreamResponse`, handle the new `sources` chunk type by rendering a "Sources" block under the assistant message before tokens. |
+| `frontend/static/cache.js` | Add two new accessors: `getBaseConversationId / setBaseConversationId` and `getCurrentChannel / setCurrentChannel`. Both are plain strings stored in localStorage so the channel pair survives page reloads. |
 
 ### 2.4 New Tests
 

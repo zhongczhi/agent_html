@@ -80,17 +80,22 @@ This iteration adds a **Retrieval-Augmented Generation (RAG) module** to the cha
 | FR-14.4 | The RAG panel has a "Show sources" checkbox (default ON). When OFF, the panel renders no sources block even if the event arrives. |
 | FR-14.5 | Sources state is local to the RAG panel — the server does not know or care whether the user is rendering them. |
 
-### FR-15: Comparison UI
+### FR-15: Channel Switcher (Two Channels in the Existing UI)
+
+The RAG iteration extends the existing single-pane chat UI with a channel switcher. The same `index.html` and `static/app.js` are modified — no parallel UI files are introduced. The user can switch the active chat between two channels: **vanilla** (no retrieval) and **RAG** (full retrieval). Each channel has its own conversation history, but both appear in the existing sidebar so the user can see and switch between them.
 
 | ID | Requirement |
 |----|-------------|
-| FR-15.1 | The page shows two chat panels side by side: a vanilla panel and a RAG panel. |
-| FR-15.2 | A single shared input box and Send button at the top of the page. |
-| FR-15.3 | On Send, both panels POST to `/api/chat/stream` with the same `message` text but different `conversation_id` and `retrieval` settings. |
-| FR-15.4 | Each panel maintains its own conversation history, scroll position, and SSE stream. |
-| FR-15.5 | Each panel generates its own `conversation_id` on page load: vanilla = `<random>-0`, RAG = `<random>-1`, where `<random>` is a shared UUID base. |
-| FR-15.6 | The pair is easy to identify in the conversation list and easy to delete together. |
-| FR-15.7 | Each panel can independently load its history from `GET /api/chat/history/<conversation_id>` on mount. |
+| FR-15.1 | The existing chat header gains a channel switcher: two buttons labeled "Vanilla" and "RAG". The active channel is visually marked. |
+| FR-15.2 | The two channels map to two distinct conversation IDs sharing a base UUID: `<base>-0` (vanilla) and `<base>-1` (RAG). The base is generated once and persisted in localStorage so the pair survives page reloads. |
+| FR-15.3 | Switching channel: updates the active button, sets `currentConversationId` to the new channel's ID, and reloads that channel's history from `GET /api/chat/history/<id>`. |
+| FR-15.4 | Both conversations are visible in the existing sidebar (they are normal conversations in `conversations.json`). Clicking either one in the sidebar also switches the channel to that conversation. |
+| FR-15.5 | When the user sends a message, the request body includes `retrieval: null` for the vanilla channel and `retrieval: {library: true, uploads: true, top_k: 4}` for the RAG channel. |
+| FR-15.6 | The RAG channel renders the `sources` SSE event (when present) as a collapsible "Sources" block under the assistant message, before the first token. |
+| FR-15.7 | The vanilla channel never emits sources and never renders a sources block. |
+| FR-15.8 | The RAG channel shows an upload button in the chat header. The vanilla channel does not. The upload posts to `POST /api/rag/upload` with the RAG channel's `conversation_id`. |
+| FR-15.9 | Sending the same question in both channels (user types, sends, switches, types, sends) produces two independent responses for comparison. The comparison is sequential, not simultaneous — by design, since the single-pane UI is preserved. |
+| FR-15.10 | When `RAG_ENABLED=false`, the channel switcher is hidden. Only the vanilla channel is visible. The user can chat normally with no RAG option shown. |
 
 ### FR-16: Upload Lifecycle
 
