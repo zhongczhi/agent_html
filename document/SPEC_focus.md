@@ -55,7 +55,8 @@ This iteration adds a **Retrieval-Augmented Generation (RAG) module** to the cha
 | FR-12.3 | Each chunk is tagged with `conversation_id`, `filename`, `chunk_id`, and `source="upload"` metadata. |
 | FR-12.4 | Upload returns `{filename, chunks_added, chunk_ids}` to the client. |
 | FR-12.5 | If embedding/indexing fails, the file is kept on disk; the index is untouched; the response is 500. The user can retry. |
-| FR-12.6 | The uploads index is persisted to disk at `storage/rag/uploads_index/` after every upload. |
+| FR-12.6 | The uploads index is persisted to disk at `storage/rag/uploads_index.<backend_tag>/` after every upload. |
+| FR-12.7 | The upload endpoint calls `file_storage.create_conversation(conversation_id)` first (idempotent). This guarantees the conversation is visible in the sidebar immediately after upload, even if the user hasn't sent any message yet. |
 
 ### FR-13: Retrieval-Augmented Chat
 

@@ -53,8 +53,9 @@
 │                       │ when retrieval is set and RAG is enabled:        │
 │                       ▼                                                 │
 │                  ┌─────────────────────────────────────┐                 │
-│                  │ 1. retriever.with_conversation(id) │                 │
-│                  │ 2. hits = retriever.invoke(msg)    │                 │
+│                  │ 1. rag_service.make_scoped_retr(id,│                 │
+│                  │      top_k)                        │                 │
+│                  │ 2. hits = scoped.invoke(msg)       │                 │
 │                  │ 3. job.append_chunk("sources", …)  │                 │
 │                  │ 4. messages = augment(messages, …) │                 │
 │                  └─────────────────────────────────────┘                 │
@@ -71,7 +72,7 @@
 │      ├─► ingest_file(conversation_id, path)   ─► upload path            │
 │      ├─► purge_uploads(conversation_id)         ─► delete path          │
 │      ├─► reindex_library()                      ─► library path         │
-│      └─► get_retriever() → ScopedRetriever      ─► chat path            │
+│      └─► make_scoped_retriever(id, top_k) ─► ScopedRetriever            │
 │                       │                                                 │
 │                       ▼                                                 │
 │             ScopedRetriever (merge + explicit metadata filter)          │
@@ -93,8 +94,8 @@
 **Key properties:**
 
 - **Plugin-off = literally identical chain.** `RAG_ENABLED=false` → `create_chain()` returns today's `RunnableLambda(convert_messages) | llm`. The chain source file is unchanged.
-- **Chat depends on RagService only for the retriever interface.** `BaseRetriever` comes from `langchain_core.retrievers`, not from `rag/`. So `chat/chain.py` does not import anything from `rag/`.
-- **Two write paths, one read path.** Library admin updates → `RagService.reindex_library()`. User uploads → `RagService.ingest_file()`. Both mutate indexes in place. Chat → `RagService.get_retriever()` returns the same singleton `ScopedRetriever` configured per-request with the conversation id.
+- **Chat depends on RagService only via `make_scoped_retriever`.** `ChatService.__init__` accepts an optional `rag_service: RagService | None` and the chat code only ever calls `rag_service.make_scoped_retriever(conv_id, top_k)`. `ScopedRetriever` is a `BaseRetriever` from `langchain_core.retrievers`, not from `rag/`. So `chat/chain.py` does not import anything from `rag/`.
+- **Two write paths, one read path.** Library admin updates → `RagService.reindex_library()`. User uploads → `RagService.ingest_file()`. Both mutate indexes in place. Chat → `RagService.make_scoped_retriever(conv_id, top_k)` returns a per-request `ScopedRetriever` wrapping the long-lived FAISS retrievers.
 
 ---
 
@@ -155,8 +156,8 @@
 1. routes.stream_chat() appends user message to storage, kicks off background task
 2. ChatService.generate_background(message, conversation_id, retrieval):
      a. messages = file_storage.get_conversation(conversation_id)["messages"]
-     b. IF retrieval is not None AND self.rag_retriever is not None:
-          scoped = self.rag_retriever.with_conversation(conversation_id)
+     b. IF retrieval is not None AND self.rag_service is not None:
+          scoped = self.rag_service.make_scoped_retriever(conversation_id, retrieval.top_k)
           hits = scoped.invoke(message)
           job.append_chunk("sources", json.dumps({
               "sources": [
@@ -234,7 +235,7 @@ delete_with_purge = partial(file_storage.delete_conversation,
 backend/rag/
 ├── __init__.py          # public surface: RagService, ScopedRetriever
 ├── config.py            # RAG settings (RAG_ENABLED, EMBEDDING_BACKEND, chunk size, paths)
-├── service.py           # RagService facade: ingest, purge, reindex, get_retriever
+├── service.py           # RagService facade: ingest, purge, reindex, make_scoped_retriever
 ├── retriever.py         # ScopedRetriever (merge + explicit metadata filter)
 ├── vector_store.py      # FAISS load/save/rebuild helpers
 ├── embeddings.py        # Embeddings factory: sentence-transformers OR MiniMax
@@ -257,12 +258,14 @@ backend/rag/
 | File | Change |
 |---|---|
 | [backend/chat/chain.py](backend/chat/chain.py) | **No changes.** `create_chain()` returns today's chain. |
-| [backend/chat/service.py](backend/chat/service.py) | `__init__` accepts `rag_retriever`. `generate_background` adds the retrieval+augmentation block when `retrieval` is set. |
+| [backend/chat/service.py](backend/chat/service.py) | `__init__` accepts optional `rag_service: RagService \| None`. `generate_background(message, conversation_id, retrieval=None)` calls `rag_service.make_scoped_retriever(conv_id, retrieval.top_k)` and adds the retrieval+augmentation block when `retrieval is not None and self.rag_service is not None`. |
 | [backend/chat/routes.py](backend/chat/routes.py) | `ChatRequest` gains optional `retrieval: RetrievalConfig \| None`. `stream_chat` passes `retrieval` to `generate_background`. |
 | [backend/storage/file_storage.py](backend/storage/file_storage.py) | `delete_conversation` accepts `on_delete: Callable \| None`. |
+| [backend/rag/routes.py](backend/rag/routes.py) (NEW) | `POST /api/rag/upload` calls `file_storage.create_conversation(conversation_id)` first (idempotent), guaranteeing the conversation appears in the sidebar immediately. |
 | [backend/main.py](backend/main.py) | Lifespan: if `RAG_ENABLED`, build `RagService`, wire `delete_conversation` with `purge_uploads`, mount rag routes. |
 | [requirements.txt](requirements.txt) | Add `faiss-cpu`, `sentence-transformers`, `pypdf`. |
-| [frontend/index.html](frontend/index.html) | Two-panel comparison UI with shared input, upload button, sources toggle. |
+| [frontend/static/app.js](frontend/static/app.js) | **Refactor** — extract single-panel rendering into `createChatPanel(config)` function. Two-panel UI instantiates this twice. Without this refactor, the comparison UI is unmaintainable copy-paste. |
+| [frontend/index.html](frontend/index.html) | Two-panel comparison UI: shared input, two `createChatPanel(...)` instances, upload button on RAG panel, sources toggle on RAG panel, conversation ID generation (`<uuid>-0` / `<uuid>-1`). |
 
 ### 4.3 Wiring at startup
 
@@ -344,6 +347,8 @@ POST /api/rag/upload
   → 400 if file unreadable / too large
   → 503 if RAG disabled
   → 500 if embedding/indexing fails (file kept on disk for retry)
+  (Calls file_storage.create_conversation(conversation_id) first, idempotent, so
+   the conversation is visible in the sidebar immediately after upload.)
 
 POST /api/rag/library/reindex
   → 200 {files_processed, chunks_added, errors: [...]}
@@ -416,10 +421,23 @@ All three are mounted under `/api/rag` and registered in `main.py` only when `RA
 
 ```python
 class ScopedRetriever(BaseRetriever):
-    """Wraps multiple retrievers, filtering specific ones by metadata."""
+    """Wraps multiple retrievers, filtering specific ones by metadata.
+
+    Per-scope cap is applied by the underlying retrievers (via
+    search_kwargs={"k": k}) — ScopedRetriever does NOT cap the merged
+    result, so the LLM can see top_k hits from each scope (e.g., 4 library
+    + 4 uploads = 8 total when both scopes are enabled).
+
+    Convention: library chunks are tagged with metadata.source == "library"
+    and have NO "conversation_id" field. Upload chunks have both. The
+    filter `metadata.get("conversation_id") == self.conversation_id` is
+    False for library chunks, so they pass through unfiltered under the
+    should_filter=False branch. Do not add a "conversation_id" field to
+    library chunks; the asymmetric metadata is the mechanism that makes
+    the "library is global, uploads are per-conversation" property work.
+    """
     retrievers: list[tuple[BaseRetriever, bool]]   # (retriever, should_filter_by_conv)
     conversation_id: str
-    top_k: int = 4
 
     def _get_relevant_documents(self, query, *, run_manager):
         hits = []
@@ -429,14 +447,7 @@ class ScopedRetriever(BaseRetriever):
                 r_hits = [d for d in r_hits
                           if d.metadata.get("conversation_id") == self.conversation_id]
             hits.extend(r_hits)
-        return hits[:self.top_k]
-
-    def with_conversation(self, conversation_id: str) -> "ScopedRetriever":
-        return ScopedRetriever(
-            retrievers=self.retrievers,
-            conversation_id=conversation_id,
-            top_k=self.top_k,
-        )
+        return hits
 ```
 
 The bool flag makes filter application explicit. Library retrievers get `False`; upload retrievers get `True`. No magic.
@@ -445,14 +456,27 @@ The bool flag makes filter application explicit. Library retrievers get `False`;
 
 ```python
 class RagService:
-    def __init__(self, embeddings, splitter, library_dir, uploads_dir, rag_dir):
-        self.embeddings = embeddings
-        self.splitter = splitter
-        self.library_dir = library_dir
-        self.uploads_dir = uploads_dir
-        self.rag_dir = rag_dir
-        self.library_index = self._load_or_init_library_index()
-        self.uploads_index = self._load_or_init_uploads_index()
+    def __init__(self, settings: RagSettings):
+        self.settings = settings
+        self.embeddings = make_embeddings(settings.embedding_backend)
+        self.splitter = make_splitter(settings.chunk_size, settings.chunk_overlap)
+
+        # Anchor paths to backend/ — same pattern as backend/storage/file_storage.py.
+        backend_root = Path(__file__).parent.parent
+        self.library_dir = (backend_root / settings.library_dir).resolve()
+        self.uploads_dir = (backend_root / settings.uploads_dir).resolve()
+        self.rag_dir = (backend_root / settings.rag_dir).resolve()
+
+        # Index files are tagged with the embedding backend name. Prevents the
+        # silent-failure mode where switching EMBEDDING_BACKEND loads a stale
+        # index built with a different embedding model. After a backend change,
+        # the tagged path is new and load_or_init starts fresh.
+        self.backend_tag = settings.embedding_backend
+        self.library_index = load_or_init(self._index_path("library_index"), self.embeddings)
+        self.uploads_index = load_or_init(self._index_path("uploads_index"), self.embeddings)
+
+    def _index_path(self, name: str) -> Path:
+        return self.rag_dir / f"{name}.{self.backend_tag}"
 
     @classmethod
     def from_settings(cls) -> "RagService": ...
@@ -460,23 +484,25 @@ class RagService:
     def ingest_file(self, conversation_id: str, file_path: Path) -> list[str]: ...
     def purge_uploads(self, conversation_id: str) -> None: ...
     def reindex_library(self) -> dict: ...
-    def get_retriever(self) -> ScopedRetriever:
-        # Returns a template ScopedRetriever. Callers must invoke .with_conversation(id)
-        # before .invoke(query). The conversation_id field is required by the dataclass
-        # shape but is always overwritten by with_conversation at the call site.
+
+    def make_scoped_retriever(self, conversation_id: str, top_k: int) -> ScopedRetriever:
+        """Per-request: build a ScopedRetriever scoped to this conversation
+        with the requested top_k. Called by ChatService on every chat turn
+        that has retrieval enabled. Cheap — no I/O, just wraps the long-lived
+        FAISS retrievers."""
         return ScopedRetriever(
             retrievers=[
-                (self.library_index.as_retriever(search_kwargs={"k": self.top_k}), False),
-                (self.uploads_index.as_retriever(search_kwargs={"k": self.top_k}), True),
+                (self.library_index.as_retriever(search_kwargs={"k": top_k}), False),
+                (self.uploads_index.as_retriever(search_kwargs={"k": top_k}), True),
             ],
-            conversation_id="",
-            top_k=self.top_k,
+            conversation_id=conversation_id,
         )
+
     def persist_all(self) -> None: ...
     def stats(self) -> dict: ...
 ```
 
-The retriever factory is called once at startup; per-request scoping happens via `.with_conversation(id)` which returns a copy with the conversation field set.
+`make_scoped_retriever(conv_id, top_k)` is the only public read path. `ChatService` calls it once per chat turn and immediately invokes `scoped.invoke(message)`. The `top_k` parameter comes from the request's `RetrievalConfig`, not from settings — the user can tune it per turn.
 
 ---
 
@@ -554,7 +580,7 @@ RAG_ENABLED=false                       # master switch; default false
 EMBEDDING_BACKEND=sentence-transformers # or "minimax"
 RAG_LIBRARY_DIR=storage/library          # admin-seeded corpus
 RAG_UPLOADS_DIR=storage/uploads          # per-conversation uploads
-RAG_INDEX_DIR=storage/rag                # FAISS index files live here
+RAG_INDEX_DIR=storage/rag                # FAISS index files live here (per-backend subdirs)
 RAG_CHUNK_SIZE=800
 RAG_CHUNK_OVERLAP=200
 RAG_TOP_K=4
@@ -566,7 +592,9 @@ ANTHROPIC_API_KEY=...                              # existing, reused for MiniMa
 **Notes:**
 - `RAG_ENABLED=false` is the default — this means the system runs as today, with zero rag-related imports executed.
 - `EMBEDDING_BACKEND=minimax` requires verification that the MiniMax endpoint exposes an `/embeddings` route. If it doesn't, only `sentence-transformers` is available.
+- **Switching `EMBEDDING_BACKEND` invalidates the existing index** (different vector space). Index files are stored under `storage/rag/library_index.<backend>/` and `storage/rag/uploads_index.<backend>/`. Switching backends starts with a fresh empty index; re-running `POST /api/rag/library/reindex` is required to repopulate the library, and any previously uploaded files are no longer retrievable.
 - New pip dependencies: `faiss-cpu`, `sentence-transformers`, `pypdf`.
+- All paths (`RAG_LIBRARY_DIR`, `RAG_UPLOADS_DIR`, `RAG_INDEX_DIR`) are anchored to the `backend/` directory at runtime, not to CWD. The settings store them as relative strings; `RagService.__init__` resolves them via `Path(__file__).parent.parent / settings.<dir>`.
 
 ---
 
