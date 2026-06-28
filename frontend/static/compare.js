@@ -116,27 +116,31 @@ async function sendToPanel(panelKey, text) {
                 if (!dataLine) continue;
                 let payload;
                 try { payload = JSON.parse(dataLine.slice(6)); } catch { continue; }
+                // SSE payload shape: { chunk: <text>, type: "token"|"thinking"|"sources", message_id: "..." }
                 if (payload.chunk !== undefined) {
-                    if (payload.chunk.type === 'token') {
+                    const text = payload.chunk;
+                    const type = payload.type;
+                    if (type === 'token') {
                         if (!assistantDiv) {
                             assistantDiv = appendMessage(panelKey, 'assistant', '');
                         }
-                        fullText += payload.chunk.chunk;
+                        fullText += text;
                         // Plain-text rendering only (no smd streaming-markdown here —
                         // kept simple for the compare page; can be added later).
                         assistantDiv.textContent = fullText;
                         panel.messagesEl.scrollTop = panel.messagesEl.scrollHeight;
-                    } else if (payload.chunk.type === 'sources') {
+                    } else if (type === 'sources') {
+                        // text is a JSON string of { sources: [...] }
                         try {
-                            const ev = JSON.parse(payload.chunk.chunk);
+                            const ev = JSON.parse(text);
                             appendSources(panelKey, ev.sources || []);
                         } catch { /* ignore malformed sources */ }
-                    } else if (payload.chunk.type === 'thinking') {
-                        // Display thinking as a separate italic line
+                    } else if (type === 'thinking') {
                         const t = document.createElement('div');
                         t.className = 'msg thinking';
-                        t.textContent = `💭 ${payload.chunk.chunk}`;
+                        t.textContent = `💭 ${text}`;
                         panel.messagesEl.appendChild(t);
+                        panel.messagesEl.scrollTop = panel.messagesEl.scrollHeight;
                     }
                 } else if (payload.end) {
                     return;
