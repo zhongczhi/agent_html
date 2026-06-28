@@ -27,9 +27,16 @@ def get_chat_service() -> ChatService:
     return _chat_service
 
 
+class RetrievalConfig(BaseModel):
+    library: bool = True
+    uploads: bool = True
+    top_k: int = 4
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=10000)
     conversation_id: str | None = None
+    retrieval: RetrievalConfig | None = None
 
 
 class ChatHistoryResponse(BaseModel):
@@ -135,7 +142,9 @@ async def stream_chat(
         job.reset()
 
     asyncio.create_task(
-        chat_service.generate_background(request.message, conversation_id)
+        chat_service.generate_background(
+            request.message, conversation_id, retrieval=request.retrieval,
+        )
     )
 
     return StreamingResponse(

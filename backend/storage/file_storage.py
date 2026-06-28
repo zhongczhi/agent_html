@@ -146,8 +146,17 @@ def get_conversation_list() -> List[Dict[str, Any]]:
     return result
 
 
-def delete_conversation(conversation_id: str) -> bool:
-    """Delete a conversation. Returns True if deleted, False if not found."""
+def delete_conversation(
+    conversation_id: str,
+    on_delete=None,
+) -> bool:
+    """Delete a conversation. Returns True if deleted, False if not found.
+
+    on_delete: optional callable invoked with the conversation_id AFTER the
+    JSON delete succeeds. Exceptions are caught and logged — the JSON
+    state is the source of truth and remains consistent. Wired to
+    RagService.purge_uploads at app startup when RAG is enabled.
+    """
     with _write_lock:
         data = _load_conversations()
         if "conversations" not in data:
@@ -157,4 +166,9 @@ def delete_conversation(conversation_id: str) -> bool:
 
         del data["conversations"][conversation_id]
         _atomic_write_json(CONVERSATIONS_FILE, data)
-        return True
+    if on_delete is not None:
+        try:
+            on_delete(conversation_id)
+        except Exception:
+            logger.exception("on_delete hook failed for %s", conversation_id)
+    return True

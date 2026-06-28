@@ -1,3 +1,4 @@
+import json
 import logging
 
 from backend.storage import file_storage
@@ -7,17 +8,26 @@ logger = logging.getLogger(__name__)
 
 
 class ChatService:
-    def __init__(self, chain):
+    def __init__(self, chain, rag_service=None):
         self.chain = chain
+        self.rag_service = rag_service
 
     async def generate_background(
         self,
         message: str,
-        conversation_id: str
+        conversation_id: str,
+        retrieval=None,
     ) -> None:
         """
         Background task: fetches from LLM and stores in StreamJob.
         Does not yield to caller - runs independently.
+
+        retrieval: optional RetrievalConfig. When set AND rag_service is set,
+        the service retrieves chunks via RagService.make_scoped_retriever,
+        pushes a 'sources' SSE chunk, and augments the messages with a
+        system message containing the retrieved context. When retrieval is
+        None or rag_service is None, the chat runs identically to the
+        pre-RAG version (the plugin-off guarantee).
         """
         job = get_or_create_job(conversation_id, [])
 
@@ -28,6 +38,36 @@ class ChatService:
         history = file_storage.get_conversation(conversation_id)
         messages = history["messages"] if history else []
         job.messages = messages
+
+        # ── RAG pre-processing block ──────────────────────────────────
+        if retrieval is not None and self.rag_service is not None:
+            try:
+                scoped = self.rag_service.make_scoped_retriever(
+                    conversation_id, retrieval.top_k,
+                )
+                hits = scoped.invoke(message)
+                if hits:
+                    sources_event = {
+                        "sources": [
+                            {
+                                "filename": h.metadata.get("filename"),
+                                "excerpt": h.page_content[:300],
+                                "scope": h.metadata.get("source"),
+                            }
+                            for h in hits
+                        ]
+                    }
+                    job.append_chunk("sources", json.dumps(sources_event))
+                    context_str = "\n\n".join(
+                        f"[{h.metadata.get('filename')}]: {h.page_content}" for h in hits
+                    )
+                    messages = messages[:-1] + [
+                        {"role": "system", "content": f"Use this retrieved context:\n{context_str}"},
+                        messages[-1],
+                    ]
+            except Exception as e:
+                logger.exception("Retrieval failed; continuing without context: %s", e)
+        # ──────────────────────────────────────────────────────────────
 
         try:
             async for chunk in self.chain.astream(messages):
