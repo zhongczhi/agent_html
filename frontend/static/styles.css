@@ -224,8 +224,11 @@
         }
         .chat-header .header-link:hover { text-decoration: underline; }
 
-        /* RAG channel switcher — added in iteration 7. Hidden when RAG is
-           disabled so the iteration-6 UI is preserved exactly. */
+        /* RAG channel switcher — added in iteration 7. Visible by default
+           (so the new feature is always discoverable), but the JS hides
+           it via the .rag-disabled class when RAG_ENABLED=false on the
+           server. Class-based instead of the `hidden` attribute so a stale
+           cache / failed probe still leaves the toggle visible. */
         .chat-header .channel-switcher {
             margin-left: auto;
             display: inline-flex;
@@ -234,6 +237,10 @@
             overflow: hidden;
             font-size: 13px;
             font-weight: 500;
+        }
+        .chat-header .channel-switcher.rag-disabled,
+        .chat-header .upload-btn.rag-disabled {
+            display: none;
         }
         .chat-header .channel-btn {
             background: transparent;
@@ -262,11 +269,16 @@
             font-weight: 500;
             cursor: pointer;
             color: var(--text-primary, #e6e6e6);
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
         }
         .chat-header .upload-btn:hover {
             background: var(--bg-tertiary, rgba(255,255,255,0.04));
         }
-        .chat-header .upload-btn:has(input:focus) { outline: 2px solid var(--accent, #7aa2f7); }
+        .chat-header .upload-btn input[type="file"] {
+            display: none;
+        }
 
         /* RAG sources block — shown above the assistant response when the
            server emits a 'sources' SSE event. */

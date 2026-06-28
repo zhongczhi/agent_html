@@ -75,7 +75,7 @@ function setChannel(channel) {
     }
     // Show/hide the upload button (RAG only)
     if (ragUploadBtn) {
-        ragUploadBtn.hidden = channel !== 'rag';
+        ragUploadBtn.classList.toggle('rag-disabled', channel !== 'rag');
     }
 
     // Reload the conversation's history and re-render. The existing
@@ -144,26 +144,32 @@ async function init() {
         const resp = await fetch('/api/rag/stats');
         if (resp.ok) {
             cache.setRagEnabled(true);
-            if (channelSwitcher) channelSwitcher.hidden = false;
+            // RAG is enabled: remove the rag-disabled class so the toggle
+            // and upload button are visible.
+            if (channelSwitcher) channelSwitcher.classList.remove('rag-disabled');
+            if (ragUploadBtn) ragUploadBtn.classList.remove('rag-disabled');
             // Active button reflects the persisted channel
             if (channelSwitcher) {
                 channelSwitcher.querySelectorAll('.channel-btn').forEach(btn => {
                     btn.classList.toggle('active', btn.dataset.channel === currentChannel);
                 });
             }
-            if (ragUploadBtn) ragUploadBtn.hidden = currentChannel !== 'rag';
+            if (ragUploadBtn) {
+                ragUploadBtn.classList.toggle('rag-disabled', currentChannel !== 'rag');
+            }
         } else {
-            // RAG disabled — hide the switcher entirely. The persisted
-            // currentChannel is left alone; the server ignores the
-            // retrieval field anyway when RAG is disabled.
+            // RAG disabled — apply the rag-disabled class to hide the
+            // toggle and upload button. The persisted currentChannel is
+            // left alone; the server ignores the retrieval field when
+            // RAG is disabled.
             cache.setRagEnabled(false);
-            if (channelSwitcher) channelSwitcher.hidden = true;
-            if (ragUploadBtn) ragUploadBtn.hidden = true;
+            if (channelSwitcher) channelSwitcher.classList.add('rag-disabled');
+            if (ragUploadBtn) ragUploadBtn.classList.add('rag-disabled');
         }
     } catch {
         cache.setRagEnabled(false);
-        if (channelSwitcher) channelSwitcher.hidden = true;
-        if (ragUploadBtn) ragUploadBtn.hidden = true;
+        if (channelSwitcher) channelSwitcher.classList.add('rag-disabled');
+        if (ragUploadBtn) ragUploadBtn.classList.add('rag-disabled');
     }
 
     await loadConversationList();

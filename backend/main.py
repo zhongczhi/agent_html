@@ -6,6 +6,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
 from backend.chat.routes import router as chat_router
 from backend.rag.config import RagSettings
@@ -62,6 +64,23 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(chat_router)
 
 frontend_path = Path(__file__).parent.parent / "frontend"
+
+
+# Disable HTTP caching for static files and the index. Without this, a
+# browser may keep serving stale index.html / app.js / styles.css even
+# after the user restarts the server with new code, hiding new features.
+class _NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
+
+app.add_middleware(_NoCacheStaticMiddleware)
 
 
 @app.get("/")

@@ -24,13 +24,16 @@
             <div class="chat-header">
                 <button class="toggle-sidebar" id="toggleSidebarMain">&#9776;</button>
                 <span>Neural Chat</span>
-                <div class="channel-switcher" id="channelSwitcher" hidden>
+                <!-- Channel switcher (RAG iteration 7). Visible by default so
+                     the new feature is always discoverable; JS hides it via
+                     the .rag-disabled class when RAG_ENABLED=false. -->
+                <div class="channel-switcher" id="channelSwitcher">
                     <button class="channel-btn active" data-channel="vanilla">Vanilla</button>
                     <button class="channel-btn" data-channel="rag">RAG</button>
                 </div>
-                <label class="upload-btn" id="ragUploadBtn" hidden title="Upload a file for retrieval in this conversation">
+                <label class="upload-btn" id="ragUploadBtn" title="Upload a file for retrieval in this conversation">
                     Upload
-                    <input type="file" id="ragUploadInput" hidden>
+                    <input type="file" id="ragUploadInput">
                 </label>
             </div>
             <div class="chat-messages" id="messages"></div>
