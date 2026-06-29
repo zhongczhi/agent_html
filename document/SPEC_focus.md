@@ -46,17 +46,29 @@ This iteration adds a **Retrieval-Augmented Generation (RAG) module** to the cha
 | FR-11.6 | Unreadable files are reported in the response's `errors` list and do not abort the run. |
 | FR-11.7 | The library index is loaded once at startup and persisted to disk after every reindex. |
 
-### FR-12: Per-Conversation File Upload
+### FR-12: Per-Conversation File Upload (size-based routing)
+
+The upload feature is available from **both** columns (Vanilla and RAG). Each column has its own upload button beside the Send button. Files are routed to one of two pipelines based on their **raw size** compared to a configurable threshold (`RAG_INLINE_CONTEXT_THRESHOLD_BYTES`, default 8192 bytes):
+
+- **Small files** (≤ threshold): file text content is sent inline with the next chat request and injected as a system message into the LLM call. No FAISS ingestion, no chunking, no retrieval. The file content is bound to that conversation and survives across turns until the conversation is deleted.
+- **Large files** (> threshold): embedded and indexed in FAISS as today; retrieved per-turn via the existing ScopedRetriever path.
+
+The threshold applies to **raw upload size**, not post-extraction text size. PDFs and HTML always go through FAISS (they're typically > threshold in raw form); `.md`/`.txt` files under the threshold use the inline path.
 
 | ID | Requirement |
 |----|-------------|
-| FR-12.1 | The RAG chat panel exposes an upload button that accepts a single file at a time. |
-| FR-12.2 | Uploaded files are saved to `storage/uploads/<conversation_id>/` before indexing. |
-| FR-12.3 | Each chunk is tagged with `conversation_id`, `filename`, `chunk_id`, and `source="upload"` metadata. |
-| FR-12.4 | Upload returns `{filename, chunks_added, chunk_ids}` to the client. |
-| FR-12.5 | If embedding/indexing fails, the file is kept on disk; the index is untouched; the response is 500. The user can retry. |
-| FR-12.6 | The uploads index is persisted to disk at `storage/rag/uploads_index.<backend_tag>/` after every upload. |
-| FR-12.7 | The upload endpoint calls `file_storage.create_conversation(conversation_id)` first (idempotent). This guarantees the conversation is visible in the sidebar immediately after upload, even if the user hasn't sent any message yet. |
+| FR-12.1 | Both columns expose an Upload button in their column header. The button accepts a single file at a time. Only files with extensions in the allowlist `{".md", ".txt", ".pdf", ".html"}` are accepted. The frontend's `<input type="file" accept="...">` attribute hints this to the browser's file picker. The server enforces the allowlist and rejects any other extension with HTTP 400. |
+| FR-12.2 | **Inline path (small file):** the upload endpoint reads the file content server-side and returns `{filename, content, mode: "inline"}` to the client. The client includes this content in the next `/api/chat/stream` request via the `uploaded_files` field. No file is written to disk. |
+| FR-12.3 | **FAISS path (large file):** the upload endpoint saves the file to `storage/uploads/<conversation_id>/` and ingests it into the uploads FAISS index. Returns `{filename, chunks_added, chunk_ids, mode: "indexed"}` to the client. |
+| FR-12.4 | The threshold comparison uses raw upload size in bytes, not post-extraction text size. `.md`/`.txt` ≤ 8 KB typically take the inline path; `.pdf`/`.html` always take the indexed path. |
+| FR-12.5 | The `RAG_INLINE_CONTEXT_THRESHOLD_BYTES` env var (default 8192) controls the threshold. The threshold value is exposed via `GET /api/rag/stats` so the frontend can apply the same boundary the server uses. |
+| FR-12.6 | When the client sends `uploaded_files` with a chat request, the `ChatService` injects each file's content as a single system message before the user message: `"Use this uploaded file as context:\n\n[filename]:\n<content>"`. The files are appended to a server-side pending-files list keyed by `conversation_id`, so subsequent turns in the same conversation also see them without re-sending. |
+| FR-12.7 | The pending-files list is cleared when the conversation is deleted (via the same `on_delete` callback that clears FAISS uploads). |
+| FR-12.8 | `ChatRequest` gains an optional `uploaded_files: list[UploadedFile]` field. Each `UploadedFile` has `filename: str` and `content: str`. When this field is non-empty, the RAG retriever step is **skipped** for that turn — the inline context takes its place. The vanilla and RAG columns both use this path for small files. |
+| FR-12.9 | When `uploaded_files` is non-empty, the server emits a `sources` SSE event listing `{filename, scope: "upload", excerpt: first 300 chars}` for each file before the first token. This makes it visible in the RAG column that uploaded files were used (and the vanilla column renders the same sources block). |
+| FR-12.10 | FAISS path persistence: each indexed chunk is tagged with `conversation_id`, `filename`, `chunk_id`, and `source="upload"` metadata. The uploads index is persisted at `storage/rag/uploads_index.<backend_tag>/` after every upload. |
+| FR-12.11 | FAISS path error handling: if embedding/indexing fails, the file is kept on disk; the index is untouched; the response is 500. The user can retry. |
+| FR-12.12 | The upload endpoint calls `file_storage.create_conversation(conversation_id)` first (idempotent). This guarantees the conversation is visible in the sidebar immediately after upload, even if the user hasn't sent any message yet. |
 
 ### FR-13: Retrieval-Augmented Chat
 
@@ -80,22 +92,23 @@ This iteration adds a **Retrieval-Augmented Generation (RAG) module** to the cha
 | FR-14.4 | The RAG panel has a "Show sources" checkbox (default ON). When OFF, the panel renders no sources block even if the event arrives. |
 | FR-14.5 | Sources state is local to the RAG panel — the server does not know or care whether the user is rendering them. |
 
-### FR-15: Channel Switcher (Two Channels in the Existing UI)
+### FR-15: Side-by-Side Comparison UI
 
-The RAG iteration extends the existing single-pane chat UI with a channel switcher. The same `index.html` and `static/app.js` are modified — no parallel UI files are introduced. The user can switch the active chat between two channels: **vanilla** (no retrieval) and **RAG** (full retrieval). Each channel has its own conversation history, but both appear in the existing sidebar so the user can see and switch between them.
+The chat UI is replaced with a side-by-side comparison layout: a single shared input at the bottom, and two message columns above — **Vanilla** (left) and **RAG** (right). One Send click triggers two parallel POSTs to `/api/chat/stream`, one per column, with `retrieval: null` for vanilla and `retrieval: {library: true, uploads: true, top_k: 4}` for RAG. The two columns stream their responses independently and simultaneously, so the user sees both answers at once and can directly compare them.
 
 | ID | Requirement |
 |----|-------------|
-| FR-15.1 | The existing chat header gains a channel switcher: two buttons labeled "Vanilla" and "RAG". The active channel is visually marked. |
-| FR-15.2 | The two channels map to two distinct conversation IDs sharing a base UUID: `<base>-0` (vanilla) and `<base>-1` (RAG). The base is generated once and persisted in localStorage so the pair survives page reloads. |
-| FR-15.3 | Switching channel: updates the active button, sets `currentConversationId` to the new channel's ID, and reloads that channel's history from `GET /api/chat/history/<id>`. |
-| FR-15.4 | Both conversations are visible in the existing sidebar (they are normal conversations in `conversations.json`). Clicking either one in the sidebar also switches the channel to that conversation. |
-| FR-15.5 | When the user sends a message, the request body includes `retrieval: null` for the vanilla channel and `retrieval: {library: true, uploads: true, top_k: 4}` for the RAG channel. |
-| FR-15.6 | The RAG channel renders the `sources` SSE event (when present) as a collapsible "Sources" block under the assistant message, before the first token. |
-| FR-15.7 | The vanilla channel never emits sources and never renders a sources block. |
-| FR-15.8 | The RAG channel shows an upload button in the chat header. The vanilla channel does not. The upload posts to `POST /api/rag/upload` with the RAG channel's `conversation_id`. |
-| FR-15.9 | Sending the same question in both channels (user types, sends, switches, types, sends) produces two independent responses for comparison. The comparison is sequential, not simultaneous — by design, since the single-pane UI is preserved. |
-| FR-15.10 | When `RAG_ENABLED=false`, the channel switcher is hidden. Only the vanilla channel is visible. The user can chat normally with no RAG option shown. |
+| FR-15.1 | The chat container renders two message columns side-by-side: a "Vanilla" panel (left) and a "RAG" panel (right). Each column has its own scrollable message list and its own header label. |
+| FR-15.2 | A single shared input box and Send button sit below both columns. Typing a message and pressing Send triggers two parallel `/api/chat/stream` POSTs — one per column — using the same `message` text and two distinct `conversation_id`s. |
+| FR-15.3 | The two columns map to two distinct conversation IDs sharing a base UUID: `<base>-0` (vanilla) and `<base>-1` (RAG). The base is generated once and persisted in localStorage so the pair survives page reloads. |
+| FR-15.4 | The vanilla POST sends `retrieval: null`. The RAG POST sends `retrieval: {library: true, uploads: true, top_k: 4}`. Each column streams its SSE response into its own column only — vanilla's tokens never appear in the RAG column, and vice versa. |
+| FR-15.5 | The RAG column renders the `sources` SSE event (when present) as a "Sources" block at the top of its assistant message, before the first token. The vanilla column never emits or renders sources. |
+| FR-15.6 | Both columns expose an Upload button beside the Send button (FR-12.1). The vanilla column's upload uses the inline path (FR-12.6/12.8) — the file content becomes system context but no retrieval happens, so the vanilla stream stays a pure LLM response grounded on the file. The RAG column's upload may use either path depending on file size. |
+| FR-15.7 | Both conversations are visible in the sidebar (they are normal conversations in `conversations.json`). Clicking a sidebar entry loads that conversation into the column it belongs to (vanilla entries → vanilla column, RAG entries → RAG column). The other column keeps its current conversation. |
+| FR-15.8 | On page load, both columns render empty (no prior history) or load the histories for `<base>-0` and `<base>-1` if they exist. The shared input is empty. |
+| FR-15.9 | When `RAG_ENABLED=false`, the RAG column is hidden. The vanilla column takes the full width. The user can chat normally with no RAG option shown. The shared input is still present, but only one POST fires per Send. |
+| FR-15.10 | Cancelling (or a stream error in) one column must not cancel the other column's stream. Each column manages its own abort controller and resume-from-cache state. |
+| FR-15.11 | The columns share a single "Send" affordance. The Send button is disabled while EITHER column is streaming. Re-enabled when BOTH columns have completed (or aborted). |
 
 ### FR-16: Upload Lifecycle
 

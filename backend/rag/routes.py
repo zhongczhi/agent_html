@@ -3,10 +3,30 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 import backend.storage.file_storage as file_storage
+from backend.rag.config import RagSettings
 from backend.rag.service import RagService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/rag", tags=["rag"])
+
+
+# FR-12.1: file extension allowlist. Matches FR-11.2 (library supports the
+# same formats). Extension comparison is case-insensitive and includes the
+# leading dot (".MD" normalizes to ".md").
+ALLOWED_EXTENSIONS = {".md", ".txt", ".pdf", ".html"}
+
+
+def _check_extension(filename: str | None) -> str:
+    """Return the lowercased extension (with dot) for `filename`, or raise
+    HTTP 400 if it's outside the allowlist."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{suffix}'. Allowed: {allowed}",
+        )
+    return suffix
 
 
 def get_rag_service() -> RagService | None:
@@ -27,7 +47,11 @@ def _service_or_503() -> RagService:
 @router.get("/stats")
 def stats():
     svc = _service_or_503()
-    return svc.stats()
+    data = svc.stats()
+    # Surface the threshold so the client can apply the same boundary
+    # without a separate env var. (FR-12.5)
+    data["inline_context_threshold_bytes"] = RagSettings().rag_inline_context_threshold_bytes
+    return data
 
 
 @router.post("/library/reindex")
@@ -42,22 +66,52 @@ def upload(
     file: UploadFile = File(...),
 ):
     svc = _service_or_503()
+    # FR-12.1: reject disallowed file types up front, before any IO.
+    # Raises HTTP 400 if the extension isn't in the allowlist.
+    suffix = _check_extension(file.filename)
+
     # Idempotent — guarantees the conversation is visible in the sidebar
     # immediately after upload, even if the user hasn't sent any message.
     file_storage.create_conversation(conversation_id)
 
-    # Save the upload to a temp file then ingest by path. service.ingest_file
-    # copies the file into the per-conversation uploads dir.
+    threshold = RagSettings().rag_inline_context_threshold_bytes
+
+    # Read the raw upload into memory. We need its size + content to decide
+    # which path to take; reading it twice would double-IO for large files.
+    raw = file.file.read()
+    size = len(raw)
+
+    if size <= threshold:
+        # ── Inline path ──────────────────────────────────────────────
+        # Small file: decode as UTF-8 text, return content. The client will
+        # include this in the next chat request's `uploaded_files` field.
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # Binary file that happens to be small — fall through to FAISS.
+            logger.info("Small upload %s is not UTF-8; falling back to FAISS", file.filename)
+            content = None
+        if content is not None:
+            return {
+                "filename": file.filename,
+                "mode": "inline",
+                "bytes": size,
+                "content": content,
+            }
+
+    # ── FAISS path ──────────────────────────────────────────────────
+    # Either the file is large OR it's small but binary. Either way: save
+    # to a temp file then ingest by path (service.ingest_file copies into
+    # the per-conversation uploads dir). `suffix` was already validated
+    # above; reuse it for the temp file name.
     import tempfile
-    suffix = Path(file.filename or "").suffix
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(file.file.read())
+        tmp.write(raw)
         tmp_path = Path(tmp.name)
     try:
         chunk_ids = svc.ingest_file(conversation_id, tmp_path)
     except Exception as e:
         logger.exception("Upload ingestion failed: %s", e)
-        # File may be in storage/uploads/<conv_id>/ already; leave it for retry.
         raise HTTPException(status_code=500, detail=f"Embedding/indexing failed: {e}")
     finally:
         try:
@@ -66,6 +120,8 @@ def upload(
             pass
     return {
         "filename": file.filename,
+        "mode": "indexed",
+        "bytes": size,
         "chunks_added": len(chunk_ids),
         "chunk_ids": chunk_ids,
     }

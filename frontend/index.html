@@ -23,20 +23,39 @@
         <div class="chat-container">
             <div class="chat-header">
                 <button class="toggle-sidebar" id="toggleSidebarMain">&#9776;</button>
-                <span>Neural Chat</span>
-                <!-- Channel switcher (RAG iteration 7). Visible by default so
-                     the new feature is always discoverable; JS hides it via
-                     the .rag-disabled class when RAG_ENABLED=false. -->
-                <div class="channel-switcher" id="channelSwitcher">
-                    <button class="channel-btn active" data-channel="vanilla">Vanilla</button>
-                    <button class="channel-btn" data-channel="rag">RAG</button>
-                </div>
-                <label class="upload-btn" id="ragUploadBtn" title="Upload a file for retrieval in this conversation">
-                    Upload
-                    <input type="file" id="ragUploadInput">
-                </label>
+                <span>Neural Chat — Side-by-Side Compare</span>
             </div>
-            <div class="chat-messages" id="messages"></div>
+
+            <!-- Side-by-side comparison layout (RAG iteration 7). Two
+                 message columns share a single input box. Each column has
+                 its own Upload button in its header, bound to that
+                 column's conversation_id. One Send fires two parallel POSTs:
+                 vanilla column with retrieval=null, RAG column with
+                 retrieval={library,uploads,top_k}. The RAG column is hidden
+                 via .rag-disabled when RAG_ENABLED=false. -->
+            <div class="compare-grid" id="compareGrid">
+                <section class="column" data-channel="vanilla">
+                    <div class="column-header">
+                        <span class="column-title">Vanilla</span>
+                        <label class="upload-btn" title="Upload a file to the vanilla conversation (small files go inline; large files are indexed)">
+                            Upload
+                            <input type="file" class="upload-input" data-column="vanilla" accept=".md,.txt,.pdf,.html">
+                        </label>
+                    </div>
+                    <div class="column-messages" id="vanillaMessages"></div>
+                </section>
+                <section class="column rag-column" id="ragColumn" data-channel="rag">
+                    <div class="column-header">
+                        <span class="column-title">RAG</span>
+                        <label class="upload-btn" title="Upload a file to the RAG conversation (small files go inline; large files are indexed)">
+                            Upload
+                            <input type="file" class="upload-input" data-column="rag" accept=".md,.txt,.pdf,.html">
+                        </label>
+                    </div>
+                    <div class="column-messages" id="ragMessages"></div>
+                </section>
+            </div>
+
             <div class="chat-input-container">
                 <textarea class="chat-input" id="messageInput" placeholder="Type your message..." rows="1"></textarea>
                 <button class="send-button" id="sendButton">Send</button>

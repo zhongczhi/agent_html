@@ -109,17 +109,35 @@
 
 **Trade-off:** Sources are formatted as a single JSON blob in a chunk string. Alternative would be a structured SSE event with `event: sources\ndata: {...}` headers; chosen approach uses the existing chunk format for simplicity.
 
-### 1.10 Frontend Channel Switcher (extends existing single-pane UI)
+### 1.10 Size-Based Upload Routing
 
-**Choice:** Add a channel switcher to the existing `index.html` and `static/app.js`. Two channels — **vanilla** and **RAG** — share a base UUID. Each maps to its own conversation ID (`<base>-0` for vanilla, `<base>-1` for RAG). Both conversations appear in the existing sidebar; clicking the channel switcher (or the conversation in the sidebar) toggles the active channel. The single chat panel, input box, send button, message rendering, and conversation list are all unchanged.
+**Choice:** Upload is **not** a RAG-only feature. Both columns expose an Upload button beside the Send button. Files are routed to one of two pipelines based on a server-side threshold (`RAG_INLINE_CONTEXT_THRESHOLD_BYTES`, default 8192 bytes), applied to the raw upload size:
+
+- **Small files** (≤ threshold): the upload endpoint reads the file content, returns `{filename, content, mode: "inline"}` to the client. The client includes this content in the next `/api/chat/stream` request via the `uploaded_files` field. `ChatService` injects each file's content as a single system message before the user message. No FAISS, no chunking, no retrieval. The file is also added to a per-conversation pending-files list, so subsequent turns in the same conversation see the same context without re-sending.
+- **Large files** (> threshold): the existing FAISS path — save to `storage/uploads/<conversation_id>/`, embed, index, retrieve per-turn via ScopedRetriever.
 
 **Rationale:**
-- Preserves the existing architecture and UI surface — no parallel `compare.html` or `compare.js` files. The user navigates the same sidebar, sees the same messages, types in the same input.
-- The two channels are distinct conversations in storage (`<base>-0` and `<base>-1`) so the existing CRUD operations, sidebar listing, and conversation deletion all work without modification.
-- The user can switch channels anytime to read the vanilla or RAG response to the same question — a sequential comparison, not simultaneous, by design.
-- When `RAG_ENABLED=false`, the channel switcher is hidden and the UI behaves exactly as iteration 6 (vanilla-only).
+- A small `.md` or `.txt` file (a paragraph or two) doesn't justify the embedding + indexing round-trip. Reading the whole file inline is faster, has no embedding cost, and the LLM can see all of it at once.
+- Per-conversation pending-files list keeps the feature stateful: the user uploads once, then can send multiple follow-up turns without re-uploading.
+- The threshold is server-side and exposed via `/api/rag/stats` so the frontend doesn't need a separate env var to know which path to take.
+- Both columns use the same upload logic. The semantic difference: the vanilla column's `uploaded_files` content is the **only** context it sees (no library, no FAISS), so vanilla stays a "pure LLM grounded on the file" comparison arm. The RAG column sees library + uploads + the new file's content — a fully-grounded answer.
+- Threshold applies to **raw upload size**, not post-extraction text. PDFs and HTML always go through FAISS (raw sizes are typically megabytes). `.md`/`.txt` under 8 KB take the inline path. This matches the user's intuition: "small text file" vs. "anything larger".
 
-**Trade-off:** The user types the same question twice to compare responses (once per channel), versus a side-by-side view where one send populates both. Accepted in exchange for keeping the single-pane architecture and not introducing a parallel UI implementation.
+**Trade-off:**
+- The pending-files list is in-memory state. A server restart clears it. If the user uploaded a small file and then the server restarts, the file's content is lost. This is acceptable for v1 because small files are small enough that re-uploading is cheap. (Future work: persist pending files to disk or to a separate `storage/inline_uploads/` keyed by conversation_id.)
+- The threshold is a single number. A more sophisticated policy could route based on file type, post-extraction text size, or token count. Single number keeps the v1 simple.
+
+### 1.11 Frontend Side-by-Side Comparison UI
+
+**Choice:** The chat UI is a side-by-side comparison layout: one shared input at the bottom, two message columns above (Vanilla on the left, RAG on the right). The two columns share a base UUID; vanilla maps to `<base>-0`, RAG maps to `<base>-1`. One Send click fires two parallel `/api/chat/stream` POSTs — vanilla with `retrieval: null`, RAG with `retrieval: {library, uploads, top_k}` — and each column streams its SSE response into its own column. The two columns are otherwise independent: separate histories, separate abort controllers, separate cache state.
+
+**Rationale:**
+- Direct visual comparison on the same question is the core evaluation use case. A side-by-side layout answers "did RAG actually improve this answer?" without making the user retype and re-send.
+- The backend already supports per-request `retrieval` toggling (`RetrievalConfig` on `ChatRequest`). The frontend fan-out is a thin client-side loop: two `fetch` calls with the same `message` and different `retrieval` / `conversation_id`. No backend changes required.
+- Conversation IDs `<base>-0` and `<base>-1` keep the existing storage model: the two columns are normal conversations in `conversations.json`, so the sidebar, CRUD, and deletion work without modification.
+- When `RAG_ENABLED=false`, the RAG column is hidden, the vanilla column takes full width, and only one POST fires per Send. The layout degrades cleanly to iteration-6 behavior.
+
+**Trade-off:** The frontend is more complex than a single-pane UI: two parallel SSE readers, two `AbortController`s, per-column resume-from-cache, per-column badge/state. To keep this manageable, the existing `processStreamResponse` is parameterized by a per-column context object (assistant message element, cache keys, abort controller) and invoked twice in parallel from `sendMessage`.
 
 ---
 
@@ -160,14 +178,18 @@ backend/rag/
 | File | Change |
 |---|---|
 | `backend/chat/chain.py` | **No changes.** `create_chain()` returns today's chain, unmodified. |
-| `backend/chat/service.py` | `ChatService.__init__` accepts optional `rag_service: RagService \| None`. `generate_background(message, conversation_id, retrieval=None)` adds a pre-processing block that builds a per-request `ScopedRetriever` via `rag_service.make_scoped_retriever(conv_id, retrieval.top_k)`, retrieves, pushes sources to the job, and augments messages when `retrieval is not None and self.rag_service is not None`. |
-| `backend/chat/routes.py` | `ChatRequest` gains optional `retrieval: RetrievalConfig \| None`. `stream_chat` passes `retrieval` to `generate_background`. |
+| `backend/chat/service.py` | `ChatService.__init__` accepts optional `rag_service: RagService \| None` and a `pending_inline_files: dict[str, list[dict]]` keyed by conversation_id. `generate_background(message, conversation_id, retrieval=None, uploaded_files=None)` does two pre-processing blocks: (1) when `uploaded_files` is non-empty, inject each file's content as a system message and merge the list into `pending_inline_files` for that conversation (subsequent turns in the same conversation re-use it without re-sending); (2) when `retrieval is not None and self.rag_service is not None and not uploaded_files`, do the existing FAISS retrieval path. The two paths are mutually exclusive per turn: inline files take precedence over retrieval. When the conversation is deleted (via the `on_delete` callback), the entry for that conversation is removed from `pending_inline_files`. |
+| `backend/chat/routes.py` | `ChatRequest` gains optional `retrieval: RetrievalConfig \| None` and optional `uploaded_files: list[UploadedFile] \| None`. Each `UploadedFile` has `filename: str` and `content: str`. `stream_chat` passes both to `generate_background`. |
+| `backend/rag/config.py` | `RagSettings` gains `inline_context_threshold_bytes: int = 8192` (env `RAG_INLINE_CONTEXT_THRESHOLD_BYTES`). |
+| `backend/rag/service.py` | `stats()` includes `inline_context_threshold_bytes` in its payload. `purge_uploads(conversation_id)` now also calls the `clear_pending_inline_files` callback (wired by main.py) so a conversation delete clears both FAISS chunks and pending inline files. |
+| `backend/rag/routes.py` | `POST /api/rag/upload` checks raw upload size against `RagSettings.inline_context_threshold_bytes`. If ≤ threshold: read the file content, return `{filename, content, mode: "inline", bytes: N}`. If > threshold: save to disk + FAISS ingest as before, return `{filename, chunks_added, chunk_ids, mode: "indexed", bytes: N}`. |
 | `backend/storage/file_storage.py` | `delete_conversation` signature gains `on_delete: Callable[[str], None] \| None = None`. Calls it after the JSON delete succeeds, with exception swallowing. |
-| `backend/main.py` | Lifespan: if `RAG_ENABLED`, build `RagService.from_settings()`, mount rag routes, wrap `delete_conversation` with `partial(..., on_delete=rag.purge_uploads)`. |
+| `backend/main.py` | Lifespan: if `RAG_ENABLED`, build `RagService.from_settings()`, mount rag routes. Wire **two** callbacks on `delete_conversation`: `rag.purge_uploads` (FAISS cleanup) AND `chat_service.clear_pending_inline_files` (in-memory list cleanup). Pass both via a single `partial` chain. |
+| `backend/chat/routes.py` (chat service singleton) | `set_rag_service` is updated to also wire `chat_service.clear_pending_inline_files` into the same callback. The `get_chat_service` factory passes `clear_pending_inline_files` as a method reference. |
 | `requirements.txt` | Add `faiss-cpu`, `sentence-transformers`, `pypdf`. |
-| `frontend/index.html` | Add a channel switcher (two buttons: Vanilla / RAG) in the existing chat header, plus an upload button shown only when RAG is enabled. No other layout changes. |
-| `frontend/static/app.js` | Track the active channel and a base UUID in `cache.js`; on channel switch, update `currentConversationId` to `<base>-<channel>` and reload the channel's history. In `sendMessage`, include `retrieval: null` for vanilla and `retrieval: {library, uploads, top_k}` for RAG. In `processStreamResponse`, handle the new `sources` chunk type by rendering a "Sources" block under the assistant message before tokens. |
-| `frontend/static/cache.js` | Add two new accessors: `getBaseConversationId / setBaseConversationId` and `getCurrentChannel / setCurrentChannel`. Both are plain strings stored in localStorage so the channel pair survives page reloads. |
+| `frontend/index.html` | Replace the single `chat-messages` pane with a two-column layout: a "Vanilla" column and a "RAG" column side-by-side, each with its own header (channel title only) and message list, plus a single shared input box, **Upload button** (both columns), and Send button below. The RAG column is hidden when `RAG_ENABLED=false`; in that case the Upload button is hidden too (only the Send button remains). |
+| `frontend/static/app.js` | Maintain a `baseConversationId` in `cache.js`; the vanilla column maps to `<base>-0`, the RAG column maps to `<base>-1`. `sendMessage` fans out to two parallel `fetch('/api/chat/stream', ...)` calls (one per column) and pipes each SSE stream into its column. `processStreamResponse` is parameterized by a per-column context (target message element, cache key, abort controller) and is invoked twice in parallel. The `sources` chunk type renders a Sources block in **both** columns when the column's request sent `uploaded_files` (the inline path also emits a sources event so the user sees which file was used). Upload button: each column has its own `pendingInlineFiles` array (in-memory). Click → `POST /api/rag/upload` with multipart; server returns `{mode: "inline" \| "indexed"}`. If `inline`: append `{filename, content}` to the column's `pendingInlineFiles`; the next `sendToColumn` includes them in the `uploaded_files` field of the stream request. If `indexed`: no further client action needed (FAISS retrievable on next turn via the existing `retrieval` field). Threshold is read once from `/api/rag/stats` at init and cached. |
+| `frontend/static/cache.js` | Add `getBaseConversationId / setBaseConversationId` for the base UUID. Per-column streaming flags, chunk caches, and consumed pointers are keyed by the column's full conversation_id. Pending inline files are NOT persisted — they're in-memory only (a page reload drops them; re-upload is cheap for small files). |
 
 ### 2.4 New Tests
 

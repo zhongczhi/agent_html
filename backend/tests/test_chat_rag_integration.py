@@ -196,3 +196,130 @@ def test_rag_path_handles_retrieval_failure_gracefully(temp_storage_dir):
 
     clear_job("c1")
     fs.delete_conversation("c1")
+
+
+def test_inline_files_path_injects_content_and_skips_retrieval(temp_storage_dir):
+    """When uploaded_files is non-empty, ChatService injects file content as
+    a system message and skips FAISS retrieval — the two paths are mutually
+    exclusive per turn. (FR-12.6 / 12.8)"""
+    fs, _ = temp_storage_dir
+    fs.create_conversation("c1")
+    fs.append_message("c1", "user", "summarize this")
+
+    rag = MagicMock()
+    chain = _make_chain()
+    service = ChatService(chain, rag_service=rag)
+
+    from backend.chat.routes import UploadedFile
+    _run(service.generate_background(
+        "summarize this",
+        "c1",
+        retrieval=None,
+        uploaded_files=[UploadedFile(filename="notes.txt", content="important context")],
+    ))
+
+    # FAISS retrieval was NOT consulted
+    rag.make_scoped_retriever.assert_not_called()
+
+    job = get_job("c1")
+    sources_chunks = [c for c in job.chunks if c["type"] == "sources"]
+    assert len(sources_chunks) == 1
+    payload = json.loads(sources_chunks[0]["chunk"])
+    assert len(payload["sources"]) == 1
+    assert payload["sources"][0]["filename"] == "notes.txt"
+    assert payload["sources"][0]["scope"] == "upload"
+
+    sent = chain._last_input
+    sys_msgs = [m for m in sent if isinstance(m, dict) and m.get("role") == "system"]
+    assert len(sys_msgs) == 1
+    assert "notes.txt" in sys_msgs[0]["content"]
+    assert "important context" in sys_msgs[0]["content"]
+    assert sent[-1] == {"role": "user", "content": "summarize this"}
+
+    clear_job("c1")
+    fs.delete_conversation("c1")
+
+
+def test_inline_files_persist_across_turns(temp_storage_dir):
+    """Files uploaded in turn 1 stay available for turn 2 without re-sending.
+    Subsequent turns without uploaded_files still see them. (FR-12.6)"""
+    fs, _ = temp_storage_dir
+    fs.create_conversation("c1")
+    fs.append_message("c1", "user", "first")
+
+    chain = _make_chain()
+    service = ChatService(chain, rag_service=None)
+
+    from backend.chat.routes import UploadedFile
+    # Turn 1: send with the file
+    _run(service.generate_background(
+        "first", "c1",
+        retrieval=None,
+        uploaded_files=[UploadedFile(filename="x.txt", content="the data")],
+    ))
+    fs.append_message("c1", "assistant", "ok")
+
+    # Turn 2: no uploaded_files, but the conversation's pending list still has x.txt
+    _run(service.generate_background("second", "c1", retrieval=None, uploaded_files=None))
+
+    sys_msgs = [m for m in chain._last_input if isinstance(m, dict) and m.get("role") == "system"]
+    assert len(sys_msgs) == 1
+    assert "x.txt" in sys_msgs[0]["content"]
+    assert "the data" in sys_msgs[0]["content"]
+
+    clear_job("c1")
+    fs.delete_conversation("c1")
+
+
+def test_inline_files_take_precedence_over_retrieval(temp_storage_dir):
+    """When BOTH uploaded_files and retrieval are set, the inline path wins.
+    FAISS retrieval is skipped to avoid double-grounding. (FR-12.8)"""
+    fs, _ = temp_storage_dir
+    fs.create_conversation("c1")
+    fs.append_message("c1", "user", "hi")
+
+    rag = MagicMock()
+    chain = _make_chain()
+    service = ChatService(chain, rag_service=rag)
+
+    from backend.chat.routes import RetrievalConfig, UploadedFile
+    _run(service.generate_background(
+        "hi", "c1",
+        retrieval=RetrievalConfig(),
+        uploaded_files=[UploadedFile(filename="x.txt", content="x")],
+    ))
+
+    rag.make_scoped_retriever.assert_not_called()
+    sent = chain._last_input
+    sys_msgs = [m for m in sent if isinstance(m, dict) and m.get("role") == "system"]
+    assert len(sys_msgs) == 1
+    # Inline path uses "uploaded file" wording, not "retrieved context"
+    assert "uploaded file" in sys_msgs[0]["content"]
+    assert "retrieved context" not in sys_msgs[0]["content"]
+
+    clear_job("c1")
+    fs.delete_conversation("c1")
+
+
+def test_clear_pending_inline_files_drops_conversation_entry(temp_storage_dir):
+    """clear_pending_inline_files(conversation_id) drops only that
+    conversation's pending list; other conversations' lists are untouched."""
+    fs, _ = temp_storage_dir
+    chain = _make_chain()
+    service = ChatService(chain, rag_service=None)
+
+    from backend.chat.routes import UploadedFile
+    # Seed two conversations with pending files
+    for cid in ("c1", "c2"):
+        fs.create_conversation(cid)
+        fs.append_message(cid, "user", "hi")
+        _run(service.generate_background("hi", cid, retrieval=None, uploaded_files=[
+            UploadedFile(filename=f"{cid}.txt", content=f"data for {cid}"),
+        ]))
+
+    assert "c1" in service._pending_inline_files
+    assert "c2" in service._pending_inline_files
+
+    service.clear_pending_inline_files("c1")
+    assert "c1" not in service._pending_inline_files
+    assert "c2" in service._pending_inline_files

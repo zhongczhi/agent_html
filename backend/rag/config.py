@@ -17,3 +17,4 @@ class RagSettings(BaseSettings):
     rag_chunk_size: int = 800
     rag_chunk_overlap: int = 200
     rag_top_k: int = 4
+    rag_inline_context_threshold_bytes: int = 8192

@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI):
         from backend.rag.service import RagService
         from backend.rag import routes as rag_routes
         from backend.storage import file_storage
+        from backend.chat import routes as chat_routes
 
         rag = RagService.from_settings()
         app.state.rag = rag
@@ -38,18 +39,33 @@ async def lifespan(app: FastAPI):
         # Inject the rag service into the chat service. The chat routes
         # module has a set_rag_service() helper that we call here so any
         # chat service constructed later (lazy-init) will pick it up.
-        from backend.chat import routes as chat_routes
         chat_routes.set_rag_service(rag)
 
-        # Wire the upload/del callback. We monkey-patch the module-level
-        # function (file_storage.delete_conversation) so existing call sites
-        # in chat/routes.py automatically trigger RAG cleanup. The patch
-        # uses functools.partial to set the callback.
+        # Build the chat service now (so we can capture its
+        # clear_pending_inline_files method) and inject it back into the
+        # chat routes module for the Depends() reference.
+        chat_service = chat_routes.get_chat_service()
+
+        # The delete-conversation callback chain:
+        # 1. rag.purge_uploads           — drop FAISS chunks + on-disk files
+        # 2. chat_service.clear_pending_inline_files — drop in-memory small-file list
+        # Both are wrapped to swallow exceptions; the JSON state must remain
+        # consistent even if cleanup fails. file_storage.delete_conversation
+        # already swallows on_delete exceptions, so a thrown error here just
+        # gets logged.
+        def _on_delete_chain(conversation_id: str) -> None:
+            try:
+                rag.purge_uploads(conversation_id)
+            except Exception:
+                logger.exception("rag.purge_uploads failed for %s", conversation_id)
+            try:
+                chat_service.clear_pending_inline_files(conversation_id)
+            except Exception:
+                logger.exception("clear_pending_inline_files failed for %s", conversation_id)
+
         from functools import partial
         original_delete = file_storage.delete_conversation
-        patched = partial(original_delete, on_delete=rag.purge_uploads)
-        # Replace the function in the module's namespace. The chat routes
-        # import the name (not the function object), so this works.
+        patched = partial(original_delete, on_delete=_on_delete_chain)
         file_storage.delete_conversation = patched
 
         # Tell the rag routes module how to find the service.

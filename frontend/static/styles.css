@@ -178,6 +178,23 @@
             margin-left: 8px;
             animation: pulse-glow 2s infinite;
         }
+        /* Pair badge: small chip indicating this sidebar row is a
+           side-by-side comparison pair (two panels: Vanilla + RAG). */
+        .conversation-item .pair-badge {
+            font-size: 10px;
+            font-weight: 600;
+            padding: 2px 7px;
+            border-radius: 10px;
+            margin-left: 8px;
+            background: rgba(0, 212, 255, 0.1);
+            color: var(--accent-cyan);
+            border: 1px solid rgba(0, 212, 255, 0.25);
+            letter-spacing: 0.03em;
+        }
+        .conversation-item.active .pair-badge {
+            background: rgba(0, 212, 255, 0.18);
+            border-color: rgba(0, 212, 255, 0.5);
+        }
         @keyframes pulse-glow {
             0%, 100% { box-shadow: 0 0 5px rgba(0, 212, 255, 0.5); }
             50% { box-shadow: 0 0 15px rgba(0, 212, 255, 0.8); }
@@ -224,59 +241,40 @@
         }
         .chat-header .header-link:hover { text-decoration: underline; }
 
-        /* RAG channel switcher — added in iteration 7. Visible by default
-           (so the new feature is always discoverable), but the JS hides
-           it via the .rag-disabled class when RAG_ENABLED=false on the
+        /* RAG column visibility — hidden when RAG_ENABLED=false on the
            server. Class-based instead of the `hidden` attribute so a stale
-           cache / failed probe still leaves the toggle visible. */
-        .chat-header .channel-switcher {
-            margin-left: auto;
-            display: inline-flex;
-            border: 1px solid var(--border-color, #2a2f3a);
-            border-radius: 6px;
-            overflow: hidden;
-            font-size: 13px;
-            font-weight: 500;
-        }
-        .chat-header .channel-switcher.rag-disabled,
-        .chat-header .upload-btn.rag-disabled {
+           cache / failed probe still leaves the column visible by default. */
+        .column.rag-column.rag-disabled {
             display: none;
         }
-        .chat-header .channel-btn {
-            background: transparent;
-            color: var(--text-primary, #e6e6e6);
-            border: none;
-            padding: 6px 14px;
-            cursor: pointer;
-            transition: background 0.15s;
+        /* When RAG is disabled, vanilla column takes the full grid width. */
+        .compare-grid.rag-disabled {
+            grid-template-columns: 1fr;
         }
-        .chat-header .channel-btn:hover {
-            background: var(--bg-tertiary, rgba(255,255,255,0.04));
-        }
-        .chat-header .channel-btn.active {
-            background: var(--accent, #7aa2f7);
-            color: var(--bg-primary, #0e1117);
-        }
-        .chat-header .channel-btn + .channel-btn {
-            border-left: 1px solid var(--border-color, #2a2f3a);
-        }
-        .chat-header .upload-btn {
-            margin-left: 8px;
-            padding: 6px 12px;
-            border: 1px solid var(--border-color, #2a2f3a);
+
+        /* Per-column Upload button — lives in each column header. Bound
+           to that column's conversation_id by data-column attribute. The
+           button is hidden when its column is rag-disabled (vanilla always
+           shown; RAG shown only when RAG_ENABLED=true). */
+        .column-header .upload-btn {
+            padding: 4px 10px;
+            border: 1px solid var(--border-color);
             border-radius: 6px;
-            font-size: 13px;
+            font-size: 12px;
             font-weight: 500;
             cursor: pointer;
-            color: var(--text-primary, #e6e6e6);
+            color: var(--text-primary);
             display: inline-flex;
             align-items: center;
             gap: 4px;
+            transition: all 0.2s ease;
         }
-        .chat-header .upload-btn:hover {
-            background: var(--bg-tertiary, rgba(255,255,255,0.04));
+        .column-header .upload-btn:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
         }
-        .chat-header .upload-btn input[type="file"] {
+        .column-header .upload-btn input[type="file"] {
             display: none;
         }
 
@@ -322,33 +320,68 @@
             box-shadow: var(--glow-cyan);
             animation: pulse-glow 2s infinite;
         }
-        .chat-messages {
+        /* Side-by-side compare grid (RAG iteration 7). Two columns with a
+           small gap; each column has its own scrollable message list. */
+        .compare-grid {
             flex: 1;
-            overflow-y: auto;
-            padding: 24px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1px;
+            background: var(--border-color);
+            min-height: 0;
+        }
+        .compare-grid > .column {
             display: flex;
             flex-direction: column;
-            gap: 20px;
-            background: transparent;
+            background: var(--bg-card);
+            min-height: 0;
+            min-width: 0;
         }
-        .chat-messages::-webkit-scrollbar {
-            width: 8px;
+        .column-header {
+            padding: 12px 16px;
+            background: linear-gradient(180deg, var(--bg-tertiary) 0%, var(--bg-card) 100%);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            flex-shrink: 0;
         }
-        .chat-messages::-webkit-scrollbar-track {
-            background: transparent;
+        .column-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            min-height: 0;
         }
-        .chat-messages::-webkit-scrollbar-thumb {
+        .column-messages::-webkit-scrollbar { width: 6px; }
+        .column-messages::-webkit-scrollbar-track { background: transparent; }
+        .column-messages::-webkit-scrollbar-thumb {
             background: var(--border-color);
             border-radius: 4px;
         }
-        /* Empty state - centered input */
-        .chat-messages.empty {
+        .column-messages.empty {
             justify-content: center;
             align-items: center;
+            color: var(--text-muted);
+            font-size: 13px;
+            font-style: italic;
         }
-        .chat-messages:not(.empty) {
+        .empty-placeholder {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+        .column-messages:not(.empty) {
             justify-content: flex-start;
         }
+
         /* Message wrapper - handles alignment and contains avatar + bubble */
         .message-wrapper {
             display: flex;
@@ -650,8 +683,9 @@
                 margin: 8px;
                 border-radius: 12px;
             }
-            .chat-messages {
-                padding: 16px;
+            .compare-grid {
+                grid-template-columns: 1fr;
+                grid-template-rows: 1fr 1fr;
             }
             .message-wrapper {
                 max-width: 90%;

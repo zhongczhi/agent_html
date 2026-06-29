@@ -51,10 +51,20 @@ class RetrievalConfig(BaseModel):
     top_k: int = 4
 
 
+class UploadedFile(BaseModel):
+    """A small file whose content is sent inline with the chat request
+    instead of being embedded into FAISS. Used for files under the
+    `rag_inline_context_threshold_bytes` threshold so the LLM sees the
+    full content without paying embedding/indexing cost."""
+    filename: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=10000)
     conversation_id: str | None = None
     retrieval: RetrievalConfig | None = None
+    uploaded_files: list[UploadedFile] | None = None
 
 
 class ChatHistoryResponse(BaseModel):
@@ -161,7 +171,10 @@ async def stream_chat(
 
     asyncio.create_task(
         chat_service.generate_background(
-            request.message, conversation_id, retrieval=request.retrieval,
+            request.message,
+            conversation_id,
+            retrieval=request.retrieval,
+            uploaded_files=request.uploaded_files,
         )
     )
 
