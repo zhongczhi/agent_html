@@ -90,7 +90,7 @@
 **Choice:** `file_storage.delete_conversation` accepts an optional `on_delete: Callable[[str], None]` parameter. `main.py` wires `rag_service.purge_uploads` as the callback at startup.
 
 **Rationale:**
-- Explicit over implicit. No monkey-patching — the storage layer's signature declares its extensibility.
+- Explicit over implicit. The storage layer declares its extensibility via the `on_delete` parameter on `delete_conversation`; the application layer wires the actual callback at startup (via `functools.partial`), so the storage module itself is never modified.
 - Default `None` keeps old callers unaffected.
 - Exceptions in the callback are caught and logged but don't fail the delete — the JSON state remains consistent.
 - Testable: tests pass a fake callback to verify the wiring without needing a real `RagService`.
@@ -119,7 +119,7 @@
 **Rationale:**
 - A small `.md` or `.txt` file (a paragraph or two) doesn't justify the embedding + indexing round-trip. Reading the whole file inline is faster, has no embedding cost, and the LLM can see all of it at once.
 - Per-conversation pending-files list keeps the feature stateful: the user uploads once, then can send multiple follow-up turns without re-uploading.
-- The threshold is server-side and exposed via `/api/rag/stats` so the frontend doesn't need a separate env var to know which path to take.
+- The threshold is server-side and authoritative — the upload endpoint reads it and routes to inline vs. FAISS. The threshold value is also exposed via `/api/rag/stats` so the client can observe (not enforce) the same boundary. Routing decisions live in the server's response (`mode: "inline" | "indexed"`); the frontend does not duplicate the comparison.
 - Both columns use the same upload logic. The semantic difference: the vanilla column's `uploaded_files` content is the **only** context it sees (no library, no FAISS), so vanilla stays a "pure LLM grounded on the file" comparison arm. The RAG column sees library + uploads + the new file's content — a fully-grounded answer.
 - Threshold applies to **raw upload size**, not post-extraction text. PDFs and HTML always go through FAISS (raw sizes are typically megabytes). `.md`/`.txt` under 8 KB take the inline path. This matches the user's intuition: "small text file" vs. "anything larger".
 
@@ -181,7 +181,7 @@ backend/rag/
 | `backend/chat/service.py` | `ChatService.__init__` accepts optional `rag_service: RagService \| None` and a `pending_inline_files: dict[str, list[dict]]` keyed by conversation_id. `generate_background(message, conversation_id, retrieval=None, uploaded_files=None)` does two pre-processing blocks: (1) when `uploaded_files` is non-empty, inject each file's content as a system message and merge the list into `pending_inline_files` for that conversation (subsequent turns in the same conversation re-use it without re-sending); (2) when `retrieval is not None and self.rag_service is not None and not uploaded_files`, do the existing FAISS retrieval path. The two paths are mutually exclusive per turn: inline files take precedence over retrieval. When the conversation is deleted (via the `on_delete` callback), the entry for that conversation is removed from `pending_inline_files`. |
 | `backend/chat/routes.py` | `ChatRequest` gains optional `retrieval: RetrievalConfig \| None` and optional `uploaded_files: list[UploadedFile] \| None`. Each `UploadedFile` has `filename: str` and `content: str`. `stream_chat` passes both to `generate_background`. |
 | `backend/rag/config.py` | `RagSettings` gains `inline_context_threshold_bytes: int = 8192` (env `RAG_INLINE_CONTEXT_THRESHOLD_BYTES`). |
-| `backend/rag/service.py` | `stats()` includes `inline_context_threshold_bytes` in its payload. `purge_uploads(conversation_id)` now also calls the `clear_pending_inline_files` callback (wired by main.py) so a conversation delete clears both FAISS chunks and pending inline files. |
+| `backend/rag/service.py` | `stats()` includes `inline_context_threshold_bytes` in its payload. `purge_uploads(conversation_id)` clears only the FAISS uploads for that conversation; the pending inline files are cleared separately by `chat_service.clear_pending_inline_files`. The two cleanup calls are chained together at the application layer by `main.py`'s startup wiring (see below). |
 | `backend/rag/routes.py` | `POST /api/rag/upload` checks raw upload size against `RagSettings.inline_context_threshold_bytes`. If ≤ threshold: read the file content, return `{filename, content, mode: "inline", bytes: N}`. If > threshold: save to disk + FAISS ingest as before, return `{filename, chunks_added, chunk_ids, mode: "indexed", bytes: N}`. |
 | `backend/storage/file_storage.py` | `delete_conversation` signature gains `on_delete: Callable[[str], None] \| None = None`. Calls it after the JSON delete succeeds, with exception swallowing. |
 | `backend/main.py` | Lifespan: if `RAG_ENABLED`, build `RagService.from_settings()`, mount rag routes. Wire **two** callbacks on `delete_conversation`: `rag.purge_uploads` (FAISS cleanup) AND `chat_service.clear_pending_inline_files` (in-memory list cleanup). Pass both via a single `partial` chain. |
@@ -314,6 +314,13 @@ class RagService:
                     "chunk_id": hashlib.sha256(chunk_text.encode()).hexdigest()[:16],
                 },
             ))
+        # The uploads_index may hold a placeholder doc when first initialized
+        # (see vector_store.load_or_init). FAISS.add_documents does not handle
+        # this cleanly, so rebuild against the existing docstore first to drop
+        # the placeholder, then add the new chunks.
+        self.uploads_index = rebuild_filtered(
+            self.uploads_index, self.embeddings, keep=lambda d: True,
+        )
         self.uploads_index.add_documents(docs)
         save(self.uploads_index, self._index_path("uploads_index"))
         return [d.metadata["chunk_id"] for d in docs]
@@ -398,12 +405,17 @@ class ChatService:
     def __init__(self, chain, rag_service: RagService | None = None):
         self.chain = chain
         self.rag_service = rag_service
+        self._pending_inline_files: dict[str, list[dict]] = {}
+
+    def clear_pending_inline_files(self, conversation_id: str) -> None:
+        self._pending_inline_files.pop(conversation_id, None)
 
     async def generate_background(
         self,
         message: str,
         conversation_id: str,
         retrieval: RetrievalConfig | None = None,
+        uploaded_files: list[UploadedFile] | None = None,
     ) -> None:
         job = get_or_create_job(conversation_id, [])
 
@@ -411,8 +423,40 @@ class ChatService:
         messages = history["messages"] if history else []
         job.messages = messages
 
-        # ── RAG pre-processing block ───────────────────────────────
-        if retrieval is not None and self.rag_service is not None:
+        # Merge this turn's uploaded_files into the per-conversation pending list.
+        if uploaded_files:
+            self._pending_inline_files.setdefault(conversation_id, []).extend(
+                {"filename": uf.filename, "content": uf.content}
+                for uf in uploaded_files
+            )
+
+        pending = self._pending_inline_files.get(conversation_id, [])
+
+        # ── Inline-files pre-processing block ────────────────────────
+        # Takes precedence over RAG retrieval: a small file uploaded this turn
+        # (or any earlier turn) means the response should be grounded on that
+        # file directly, not augmented with unrelated FAISS hits.
+        if pending:
+            sources_event = {
+                "sources": [
+                    {
+                        "filename": f["filename"],
+                        "excerpt": f["content"][:300],
+                        "scope": "upload",
+                    }
+                    for f in pending
+                ]
+            }
+            job.append_chunk("sources", json.dumps(sources_event))
+            context_str = "\n\n".join(
+                f"[{f['filename']}]:\n{f['content']}" for f in pending
+            )
+            messages = messages[:-1] + [
+                {"role": "system", "content": f"Use this uploaded file as context:\n\n{context_str}"},
+                messages[-1],
+            ]
+        # ── RAG pre-processing block ────────────────────────────────
+        elif retrieval is not None and self.rag_service is not None:
             try:
                 scoped = self.rag_service.make_scoped_retriever(
                     conversation_id, retrieval.top_k
@@ -511,15 +555,12 @@ def rebuild_filtered(
     surviving = [doc for doc in index.docstore._dict.values() if keep(doc)]
     surviving = [d for d in surviving if not d.metadata.get("_placeholder")]
     if not surviving:
-        return load_or_init(index.save_local_path or Path("/dev/null"), embeddings)
+        return load_or_init(
+            Path(index.index_dir_or_path) if hasattr(index, "index_dir_or_path") else Path("/dev/null"),
+            embeddings,
+        )
     return FAISS.from_documents(surviving, embeddings)
 ```
-
-> Implementation note: the exact path-handling for `rebuild_filtered` is a
-> small refactor — `load_or_init` needs to know where to look. The clean
-> version stores the index's save path as an attribute on the FAISS instance
-> (e.g., `index._rag_save_path = path`) or threads it through the call. Final
-> detail left to the implementation plan.
 
 ---
 
@@ -597,7 +638,7 @@ def test_no_rag_path_is_byte_identical_to_today():
 3. Vanilla answer is general; RAG answer references the library doc (if seeded).
 4. Upload `doc.txt` to RAG panel → re-ask → answer references `doc.txt`.
 5. Toggle "Show sources" off → sources block disappears; response still streams.
-6. Refresh page → conversation list shows both `-0` and `-1` IDs paired by base.
+6. Refresh page → conversation list shows one row per pair (the base UUID; the `-0`/`-1` suffix is not displayed in the sidebar).
 7. Delete both → both disappear; uploads dir cleaned.
 
 ---

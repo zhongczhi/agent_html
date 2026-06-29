@@ -40,7 +40,7 @@ This iteration adds a **Retrieval-Augmented Generation (RAG) module** to the cha
 |----|-------------|
 | FR-11.1 | The system reads documents from a configurable directory (default `storage/library/`). |
 | FR-11.2 | Supported file types: `.md`, `.txt`, `.pdf`, `.html`. |
-| FR-11.3 | Documents are chunked, embedded, and stored in a FAISS index on disk at `storage/rag/library_index/`. |
+| FR-11.3 | Documents are chunked, embedded, and stored in a FAISS index on disk at `storage/rag/library_index.<embedding_backend>/`. The `<embedding_backend>` tag is appended to the directory name so that switching `EMBEDDING_BACKEND` does not silently load an index built with a different embedding model — after a backend change, the tagged path is new and a reindex is required to repopulate it. |
 | FR-11.4 | `POST /api/rag/library/reindex` rebuilds the library index from the directory contents. |
 | FR-11.5 | Reindex is idempotent: running it twice with unchanged files produces the same chunks. |
 | FR-11.6 | Unreadable files are reported in the response's `errors` list and do not abort the run. |
@@ -78,7 +78,7 @@ The threshold applies to **raw upload size**, not post-extraction text size. PDF
 | FR-13.2 | Retrieved chunks from the library scope are not filtered; library chunks pass through to all conversations. |
 | FR-13.3 | Retrieved chunks from the uploads scope are filtered by `conversation_id`. A conversation cannot retrieve another conversation's uploads. |
 | FR-13.4 | The number of chunks returned is at most `top_k` per scope (default 4). |
-| FR-13.5 | Retrieved chunks are formatted into a system message inserted just before the last user message, in the form `"Use this retrieved context:\n\n[filename]: text..."`. |
+| FR-13.5 | Retrieved chunks are formatted into a system message inserted just before the last user message, in the form `"Use this retrieved context:\n[filename]: text..."` (single newline between the header and the chunks; chunks are separated by `\n\n`). |
 | FR-13.6 | Retrieval happens once per turn, before the first token of the LLM response streams. |
 | FR-13.7 | If retrieval fails mid-turn, the chat continues with the original (un-augmented) messages and the user receives an error chunk via SSE. |
 
@@ -102,9 +102,9 @@ The chat UI is replaced with a side-by-side comparison layout: a single shared i
 | FR-15.2 | A single shared input box and Send button sit below both columns. Typing a message and pressing Send triggers two parallel `/api/chat/stream` POSTs — one per column — using the same `message` text and two distinct `conversation_id`s. |
 | FR-15.3 | The two columns map to two distinct conversation IDs sharing a base UUID: `<base>-0` (vanilla) and `<base>-1` (RAG). The base is generated once and persisted in localStorage so the pair survives page reloads. |
 | FR-15.4 | The vanilla POST sends `retrieval: null`. The RAG POST sends `retrieval: {library: true, uploads: true, top_k: 4}`. Each column streams its SSE response into its own column only — vanilla's tokens never appear in the RAG column, and vice versa. |
-| FR-15.5 | The RAG column renders the `sources` SSE event (when present) as a "Sources" block at the top of its assistant message, before the first token. The vanilla column never emits or renders sources. |
+| FR-15.5 | Each column renders the `sources` SSE event (when present) as a "Sources" block above its assistant message, before the first token. The vanilla chain only emits a `sources` event when the user has uploaded files to it (FR-12.9); the RAG column emits sources from FAISS retrieval and also from inline uploads. |
 | FR-15.6 | Both columns expose an Upload button beside the Send button (FR-12.1). The vanilla column's upload uses the inline path (FR-12.6/12.8) — the file content becomes system context but no retrieval happens, so the vanilla stream stays a pure LLM response grounded on the file. The RAG column's upload may use either path depending on file size. |
-| FR-15.7 | Both conversations are visible in the sidebar (they are normal conversations in `conversations.json`). Clicking a sidebar entry loads that conversation into the column it belongs to (vanilla entries → vanilla column, RAG entries → RAG column). The other column keeps its current conversation. |
+| FR-15.7 | Both sub-conversations live as normal entries in `conversations.json`, but the sidebar shows a single row per pair (identified by the base UUID; the `-0`/`-1` suffix is not displayed). Clicking a pair row loads both columns with that pair's sub-conversations (`<base>-0` into the vanilla column, `<base>-1` into the RAG column). The columns are not loaded independently — a pair is the unit of selection. |
 | FR-15.8 | On page load, both columns render empty (no prior history) or load the histories for `<base>-0` and `<base>-1` if they exist. The shared input is empty. |
 | FR-15.9 | When `RAG_ENABLED=false`, the RAG column is hidden. The vanilla column takes the full width. The user can chat normally with no RAG option shown. The shared input is still present, but only one POST fires per Send. |
 | FR-15.10 | Cancelling (or a stream error in) one column must not cancel the other column's stream. Each column manages its own abort controller and resume-from-cache state. |
@@ -118,15 +118,14 @@ The chat UI is replaced with a side-by-side comparison layout: a single shared i
 | FR-16.2 | When a conversation is deleted, all index chunks tagged with that conversation's `conversation_id` are removed from the uploads index. |
 | FR-16.3 | Library chunks are untouched by conversation deletion. |
 | FR-16.4 | If the index rebuild on delete fails, the conversation is still removed from the user's view; orphan chunks remain invisible because no conversation_id matches them. |
-| FR-16.5 | The deletion flow is wired through a callback parameter on `file_storage.delete_conversation`; no monkey-patching. |
+| FR-16.5 | The storage layer's `delete_conversation` accepts an optional `on_delete: Callable[[str], None]` parameter, so the deletion flow is extended via the signature rather than by patching the storage layer's internals. The callback itself is wired at application startup. |
 
 ### FR-17: RAG Stats Endpoint
 
 | ID | Requirement |
 |----|-------------|
-| FR-17.1 | `GET /api/rag/stats` returns `{enabled, embedding_backend, library_chunks, uploads_chunks, uploads_conversations}`. |
+| FR-17.1 | `GET /api/rag/stats` returns `{enabled, embedding_backend, library_chunks, uploads_chunks, uploads_conversations, inline_context_threshold_bytes}`. |
 | FR-17.2 | Returns 503 when `RAG_ENABLED=false`. |
-| FR-17.3 | Used by the frontend to render an optional "X docs indexed" indicator. |
 
 ### FR-18: RAG Disabled Behavior
 
