@@ -214,13 +214,15 @@ async function checkStreamStatus(col) {
         if (status.status === 'active' || cache.isStreaming(convId)) {
             showStreamingBadge(true);
             return await resumeStreamFromPosition(col, cache.getConsumed(convId));
-        } else if (status.status === 'completed' || status.status === 'failed') {
-            // Backend is the source of truth: the stream is over. Clear the
-            // local streaming flag — it can be stale if the original fetch
-            // was aborted (e.g. the user switched to another pair mid-stream
-            // and we never received `data.end`). Without this, the sidebar
-            // badge would stay on forever even after switching back.
+        } else if (status.status === 'completed' || status.status === 'failed' || status.status === 'none') {
+            // Backend is the source of truth: the stream is over. Clear
+            // both the local streaming flag AND the history cache — the
+            // history may be stale (missing the assistant message) if
+            // the original fetch was aborted mid-stream and we never
+            // received `data.end`. The backend has the full history;
+            // loadColumn will refetch on its next call.
             cache.setStreaming(convId, false);
+            cache.clearHistory(convId);
             showStreamingBadge(false);
         }
     } catch (error) {
@@ -884,36 +886,6 @@ function showConfirmModal({ title, message, confirmText = 'Confirm', cancelText 
     });
 }
 
-// Reconcile the local streaming flag for one sub-conversation with the
-// backend. The flag can be stale (e.g., the original fetch was aborted
-// by a switch mid-stream and we never received `data.end`). When the
-// backend reports the stream is over, clear the flag so the sidebar
-// badge isn't left on. The local cache is treated as a hint; the
-// backend is the source of truth.
-//
-// The local HISTORY is also invalidated when we learn a stream is over:
-// while the stream was running we only had the user message in the
-// history cache (the assistant message is appended to local history
-// only on `data.end`, which we never received). The backend now has
-// the full history, so we drop the stale local copy and let
-// loadColumn re-fetch it. Otherwise loadColumn would render the stale
-// [user] history and the assistant message would never appear.
-async function reconcileStreamStatus(convId) {
-    if (!cache.isStreaming(convId)) return;
-    try {
-        const response = await fetch(`/api/chat/stream/status/${convId}`);
-        const status = await response.json();
-        // `none` (no job on the backend) and `completed`/`failed` all
-        // mean the stream is over from the backend's perspective.
-        if (status.status === 'none' || status.status === 'completed' || status.status === 'failed') {
-            cache.setStreaming(convId, false);
-            cache.clearHistory(convId);
-        }
-    } catch (error) {
-        console.error('Failed to reconcile stream status:', error);
-    }
-}
-
 // Switch the active pair. Both columns reload their histories from the
 // new pair's sub-conversations.
 async function switchToPair(pairId) {
@@ -930,13 +902,18 @@ async function switchToPair(pairId) {
     activePairId = pairId;
     cache.setBaseConversationId(pairId);
 
-    // Reconcile each sub-conversation's streaming flag with the backend
-    // BEFORE refreshing the sidebar or loading columns. This guarantees
-    // the badge state is correct regardless of which path got us here:
-    // a normal send, a resume, or a switch that left a stale flag in
-    // the cache. Without this, a stuck badge could survive across
-    // switches.
-    await Promise.all(subIdsFor(pairId).map(id => reconcileStreamStatus(id)));
+    // For each sub-conv locally flagged as streaming, probe the backend
+    // and reconcile in a single round-trip. checkStreamStatus will:
+    //   - resume the stream if the backend still has it active
+    //   - clear the flag and history cache if the backend says done/none
+    // This MUST run before loadPairsList so the sidebar badge reflects
+    // truth. We only probe subs that are flagged as streaming — non-
+    // streaming subs skip the round-trip entirely.
+    await Promise.all(
+        Object.values(columns)
+            .filter(c => c.active && cache.isStreaming(c.conversationId))
+            .map(c => checkStreamStatus(c))
+    );
 
     document.querySelectorAll('.conversation-item').forEach(el => {
         el.classList.toggle('active', el.dataset.id === pairId);
