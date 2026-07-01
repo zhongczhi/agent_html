@@ -126,11 +126,15 @@ async function init() {
         compareGrid.classList.add('rag-disabled');
     }
 
+    // Render the sidebar first. loadColumn may block for the full duration
+    // of an in-flight stream (it awaits the SSE resume), so doing the
+    // sidebar first matches the old single-panel order and keeps the
+    // conversation list visible during streaming.
+    await loadPairsList();
     await Promise.all([
         loadColumn('vanilla'),
         columns.rag.active ? loadColumn('rag') : Promise.resolve(),
     ]);
-    await loadPairsList();
 }
 
 async function loadColumn(channel) {
@@ -151,10 +155,14 @@ async function loadColumn(channel) {
             console.error(`Failed to load ${channel} history:`, e);
         }
     }
-    cache.clearChunks(convId);
-
     if (cache.isStreaming(convId)) {
+        // Streaming: keep the chunks cache so renderCachedChunks inside
+        // resumeStreamFromPosition can replay the partial assistant message
+        // that was already streamed before the page reload. processStreamResponse
+        // clears chunks on data.end, so we don't lose the cleanup.
         await checkStreamStatus(col);
+    } else {
+        cache.clearChunks(convId);
     }
 }
 
@@ -206,7 +214,13 @@ async function checkStreamStatus(col) {
         if (status.status === 'active' || cache.isStreaming(convId)) {
             showStreamingBadge(true);
             return await resumeStreamFromPosition(col, cache.getConsumed(convId));
-        } else if (status.status === 'completed') {
+        } else if (status.status === 'completed' || status.status === 'failed') {
+            // Backend is the source of truth: the stream is over. Clear the
+            // local streaming flag — it can be stale if the original fetch
+            // was aborted (e.g. the user switched to another pair mid-stream
+            // and we never received `data.end`). Without this, the sidebar
+            // badge would stay on forever even after switching back.
+            cache.setStreaming(convId, false);
             showStreamingBadge(false);
         }
     } catch (error) {
@@ -282,7 +296,12 @@ function showStreamingBadge(show) {
         badge.textContent = 'Streaming';
         activeItem.appendChild(badge);
     } else if (!show && badge) {
-        badge.remove();
+        // Two-panel: vanilla and RAG columns can finish at different times.
+        // Before removing the badge, confirm that no sub-conversation of
+        // the active pair is still streaming — otherwise a fast-finishing
+        // column would clear the badge out from under a still-streaming one.
+        const anyStreaming = subIdsFor(pairId).some(id => cache.isStreaming(id));
+        if (!anyStreaming) badge.remove();
     }
 }
 
@@ -340,6 +359,13 @@ async function sendToColumn(col, message) {
             signal: col.abortController.signal,
         });
         if (!response.ok) throw new Error('Failed to get response');
+
+        // Refresh sidebar now that the backend has the conversation in
+        // storage. Done before processStreamResponse so the new pair shows
+        // up immediately rather than after the full stream finishes. Both
+        // columns run in parallel; whichever fetch returns first triggers
+        // the refresh, the second is a harmless re-render of the same data.
+        await loadPairsList();
 
         await processStreamResponse(col, response, assistantMessage);
     } catch (error) {
@@ -712,13 +738,6 @@ function addPairToList(pair) {
     titleSpan.textContent = pair.title || 'New chat';
     div.appendChild(titleSpan);
 
-    // Subtle "compare" badge hinting at the two-panel structure.
-    const columnBadge = document.createElement('span');
-    columnBadge.className = 'pair-badge';
-    columnBadge.textContent = '2-pane';
-    columnBadge.title = 'Side-by-side comparison pair';
-    div.appendChild(columnBadge);
-
     if (!selectionMode) {
         const deleteBtn = document.createElement('button');
         deleteBtn.className = 'delete-btn';
@@ -865,6 +884,36 @@ function showConfirmModal({ title, message, confirmText = 'Confirm', cancelText 
     });
 }
 
+// Reconcile the local streaming flag for one sub-conversation with the
+// backend. The flag can be stale (e.g., the original fetch was aborted
+// by a switch mid-stream and we never received `data.end`). When the
+// backend reports the stream is over, clear the flag so the sidebar
+// badge isn't left on. The local cache is treated as a hint; the
+// backend is the source of truth.
+//
+// The local HISTORY is also invalidated when we learn a stream is over:
+// while the stream was running we only had the user message in the
+// history cache (the assistant message is appended to local history
+// only on `data.end`, which we never received). The backend now has
+// the full history, so we drop the stale local copy and let
+// loadColumn re-fetch it. Otherwise loadColumn would render the stale
+// [user] history and the assistant message would never appear.
+async function reconcileStreamStatus(convId) {
+    if (!cache.isStreaming(convId)) return;
+    try {
+        const response = await fetch(`/api/chat/stream/status/${convId}`);
+        const status = await response.json();
+        // `none` (no job on the backend) and `completed`/`failed` all
+        // mean the stream is over from the backend's perspective.
+        if (status.status === 'none' || status.status === 'completed' || status.status === 'failed') {
+            cache.setStreaming(convId, false);
+            cache.clearHistory(convId);
+        }
+    } catch (error) {
+        console.error('Failed to reconcile stream status:', error);
+    }
+}
+
 // Switch the active pair. Both columns reload their histories from the
 // new pair's sub-conversations.
 async function switchToPair(pairId) {
@@ -881,9 +930,19 @@ async function switchToPair(pairId) {
     activePairId = pairId;
     cache.setBaseConversationId(pairId);
 
+    // Reconcile each sub-conversation's streaming flag with the backend
+    // BEFORE refreshing the sidebar or loading columns. This guarantees
+    // the badge state is correct regardless of which path got us here:
+    // a normal send, a resume, or a switch that left a stale flag in
+    // the cache. Without this, a stuck badge could survive across
+    // switches.
+    await Promise.all(subIdsFor(pairId).map(id => reconcileStreamStatus(id)));
+
     document.querySelectorAll('.conversation-item').forEach(el => {
         el.classList.toggle('active', el.dataset.id === pairId);
     });
+    // Re-render the sidebar so the badge reflects the reconciled state.
+    await loadPairsList();
 
     await Promise.all([
         loadColumn('vanilla'),
