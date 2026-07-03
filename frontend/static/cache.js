@@ -14,6 +14,8 @@ const KEYS = {
     baseConversationId: () => 'baseConversationId',
     currentChannel: () => 'currentChannel',
     ragEnabled: () => 'ragEnabled',
+    currentSidebarTab: () => 'currentSidebarTab',
+    showSources: () => 'showSources',
 };
 
 function readJSON(key) {
@@ -95,6 +97,39 @@ export const cache = {
 
     setRagEnabled(enabled) {
         writeString(KEYS.ragEnabled(), enabled ? 'true' : 'false');
+    },
+
+    // --- sidebar tab (iter-8 Phase E) --------------------------------
+    //
+    // The sidebar has two tabs: "conversations" (default) and "library"
+    // (visible only when RAG is enabled). The active tab persists so
+    // reload returns the user to where they were.
+
+    getCurrentSidebarTab() {
+        const raw = readString(KEYS.currentSidebarTab());
+        return raw === 'library' ? 'library' : 'conversations';
+    },
+
+    setCurrentSidebarTab(tab) {
+        if (tab === 'conversations' || tab === 'library') {
+            writeString(KEYS.currentSidebarTab(), tab);
+        } else {
+            remove(KEYS.currentSidebarTab());
+        }
+    },
+
+    // --- show-sources toggle (iter-8 Phase F) -----------------------
+    //
+    // Per-column preference (RAG column only — vanilla column never has
+    // sources unless an inline file was uploaded). Defaults to ON.
+
+    getShowSources() {
+        const raw = readString(KEYS.showSources());
+        return raw === null ? true : raw === 'true';
+    },
+
+    setShowSources(value) {
+        writeString(KEYS.showSources(), value ? 'true' : 'false');
     },
 
     // --- history (per-conversation, JSON array) ------------------------

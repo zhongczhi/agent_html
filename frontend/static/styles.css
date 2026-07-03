@@ -862,3 +862,137 @@
             border-color: #dc2626;
             box-shadow: 0 0 16px rgba(239, 68, 68, 0.4);
         }
+
+
+/* ── iter-8 sidebar tabs ─────────────────────────────────────────────── */
+
+.sidebar-tabs {
+    display: flex;
+    gap: 0;
+    padding: 0.5rem 0.75rem 0;
+    border-bottom: 1px solid var(--border-color, #2a2a2a);
+}
+
+.sidebar-tab {
+    background: transparent;
+    color: var(--text-secondary, #888);
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    font-family: inherit;
+}
+
+.sidebar-tab:hover {
+    color: var(--text-primary, #eee);
+}
+
+.sidebar-tab.active {
+    color: var(--text-primary, #eee);
+    border-bottom-color: var(--accent-color, #4a9eff);
+}
+
+
+/* ── iter-8 library view ─────────────────────────────────────────────── */
+
+.library-view {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.75rem;
+    gap: 0.5rem;
+}
+
+.library-header {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.library-upload-btn,
+.library-reindex-btn {
+    background: var(--bg-secondary, #1f1f1f);
+    color: var(--text-primary, #eee);
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 4px;
+    padding: 0.35rem 0.75rem;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-family: inherit;
+    transition: background 0.15s;
+}
+
+.library-upload-btn:hover,
+.library-reindex-btn:hover {
+    background: var(--bg-hover, #2a2a2a);
+}
+
+.library-error {
+    width: 100%;
+    color: #ff6b6b;
+    font-size: 0.8rem;
+    margin-top: 0.25rem;
+    min-height: 1em;
+}
+
+.library-empty {
+    color: var(--text-secondary, #888);
+    text-align: center;
+    padding: 2rem 0.5rem;
+    font-size: 0.85rem;
+}
+
+.library-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.library-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.6rem;
+    background: var(--bg-secondary, #1f1f1f);
+    border-radius: 4px;
+    font-size: 0.85rem;
+}
+
+.library-filename {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.library-meta {
+    color: var(--text-secondary, #888);
+    font-size: 0.75rem;
+}
+
+.library-delete-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary, #888);
+    cursor: pointer;
+    padding: 0 0.4rem;
+    font-size: 1rem;
+    line-height: 1;
+    font-family: inherit;
+}
+
+.library-delete-btn:hover {
+    color: #ff6b6b;
+}
+
+.library-footer {
+    color: var(--text-secondary, #888);
+    font-size: 0.8rem;
+    text-align: center;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border-color, #2a2a2a);
+}

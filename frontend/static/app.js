@@ -110,6 +110,9 @@ async function init() {
             cache.setRagEnabled(true);
             columns.rag.active = true;
             ragColumn.classList.remove('rag-disabled');
+            // Show the Library tab button (it was hidden by default).
+            const libBtn = document.getElementById('libraryTabBtn');
+            if (libBtn) libBtn.hidden = false;
             if (typeof data.inline_context_threshold_bytes === 'number') {
                 inlineContextThresholdBytes = data.inline_context_threshold_bytes;
             }
@@ -1156,3 +1159,223 @@ function autoResizeInput(textarea) {
 
 renderSidebarHeader();
 init();
+
+// ── Library tab (iter-8 Phase E) ───────────────────────────────────────────
+
+const libraryView = document.getElementById('libraryView');
+const sidebarTabsEl = document.getElementById('sidebarTabs');
+
+// State for the library view. Rebuilt on every renderLibraryView() call.
+let libraryFilesCache = [];
+let libraryStatsCache = null;
+
+function switchSidebarTab(tab) {
+    cache.setCurrentSidebarTab(tab);
+    applyActiveTab();
+}
+
+function applyActiveTab() {
+    const tab = cache.getCurrentSidebarTab();
+    // Update tab button active states
+    sidebarTabsEl.querySelectorAll('.sidebar-tab').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === tab);
+    });
+    // Show/hide the two content panels
+    const isLib = tab === 'library';
+    libraryView.hidden = !isLib;
+    conversationList.hidden = isLib;
+    // The selection-header and conversation pair list both belong to the
+    // Conversations tab. When switching to Library, exit selection mode
+    // (otherwise the selection UI would be confusing without its target).
+    if (isLib && selectionMode) {
+        exitSelectionMode();
+    }
+    if (isLib) {
+        renderLibraryView();
+    } else {
+        // Re-render conversation list when switching back so it isn't stale.
+        loadPairsList();
+    }
+}
+
+async function renderLibraryView() {
+    libraryView.innerHTML = '';
+    if (!cache.getRagEnabled()) {
+        libraryView.textContent = 'Library unavailable: RAG is not enabled.';
+        return;
+    }
+    // Fetch files + stats in parallel
+    const [filesResp, statsResp] = await Promise.all([
+        fetch('/api/rag/library/files'),
+        fetch('/api/rag/stats'),
+    ]);
+    libraryFilesCache = filesResp.ok ? (await filesResp.json()).files : [];
+    libraryStatsCache = statsResp.ok ? await statsResp.json() : null;
+
+    // Header: Upload + Reindex buttons + inline error placeholder
+    const header = document.createElement('div');
+    header.className = 'library-header';
+
+    const uploadLabel = document.createElement('label');
+    uploadLabel.className = 'library-upload-btn';
+    uploadLabel.title = 'Upload a file to the library';
+    uploadLabel.textContent = 'Upload';
+    const uploadInput = document.createElement('input');
+    uploadInput.type = 'file';
+    uploadInput.accept = '.md,.txt,.pdf,.html,.docx,.csv';
+    uploadInput.style.display = 'none';
+    uploadInput.addEventListener('change', handleLibraryUpload);
+    uploadLabel.appendChild(uploadInput);
+    header.appendChild(uploadLabel);
+
+    const reindexBtn = document.createElement('button');
+    reindexBtn.className = 'library-reindex-btn';
+    reindexBtn.textContent = 'Reindex';
+    reindexBtn.addEventListener('click', handleLibraryReindex);
+    header.appendChild(reindexBtn);
+
+    const errorMsg = document.createElement('div');
+    errorMsg.className = 'library-error';
+    errorMsg.id = 'libraryErrorMsg';
+    header.appendChild(errorMsg);
+
+    libraryView.appendChild(header);
+
+    // File list
+    if (libraryFilesCache.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'library-empty';
+        empty.textContent = 'No files in library. Click Upload to add one.';
+        libraryView.appendChild(empty);
+    } else {
+        const list = document.createElement('div');
+        list.className = 'library-list';
+        for (const f of libraryFilesCache) {
+            const row = document.createElement('div');
+            row.className = 'library-row';
+            row.dataset.filename = f.filename;
+
+            const name = document.createElement('span');
+            name.className = 'library-filename';
+            name.textContent = f.filename;
+            row.appendChild(name);
+
+            const meta = document.createElement('span');
+            meta.className = 'library-meta';
+            meta.textContent = `${formatBytes(f.size)} · ${formatRelativeTime(f.modified_at)}`;
+            row.appendChild(meta);
+
+            const delBtn = document.createElement('button');
+            delBtn.className = 'library-delete-btn';
+            delBtn.textContent = '×';
+            delBtn.title = `Delete ${f.filename}`;
+            delBtn.addEventListener('click', () => handleLibraryDelete(f.filename));
+            row.appendChild(delBtn);
+
+            list.appendChild(row);
+        }
+        libraryView.appendChild(list);
+    }
+
+    // Stats footer
+    const footer = document.createElement('div');
+    footer.className = 'library-footer';
+    if (libraryStatsCache) {
+        const chunks = libraryStatsCache.library_chunks ?? 0;
+        const fileCount = libraryStatsCache.library_files ?? libraryFilesCache.length;
+        footer.textContent = `${chunks} chunk${chunks === 1 ? '' : 's'} from ${fileCount} file${fileCount === 1 ? '' : 's'}`;
+    }
+    libraryView.appendChild(footer);
+}
+
+function setLibraryError(msg) {
+    const el = document.getElementById('libraryErrorMsg');
+    if (el) el.textContent = msg || '';
+}
+
+async function handleLibraryUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    setLibraryError('');
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+        const resp = await fetch('/api/rag/library/upload', { method: 'POST', body: fd });
+        if (!resp.ok) {
+            const detail = (await resp.json()).detail || resp.statusText;
+            setLibraryError(`Upload failed: ${detail}`);
+            return;
+        }
+    } catch (e) {
+        setLibraryError(`Upload failed: ${e.message}`);
+        return;
+    } finally {
+        event.target.value = '';  // allow re-uploading the same file
+    }
+    await renderLibraryView();
+}
+
+async function handleLibraryReindex() {
+    setLibraryError('');
+    try {
+        const resp = await fetch('/api/rag/library/reindex', { method: 'POST' });
+        if (!resp.ok) {
+            const detail = (await resp.json()).detail || resp.statusText;
+            setLibraryError(`Reindex failed: ${detail}`);
+            return;
+        }
+    } catch (e) {
+        setLibraryError(`Reindex failed: ${e.message}`);
+        return;
+    }
+    await renderLibraryView();
+}
+
+async function handleLibraryDelete(filename) {
+    const confirmed = await showConfirmModal({
+        title: 'Delete from library?',
+        message: `"${filename}" will be removed from the library and the FAISS index will be rebuilt.`,
+        confirmText: 'Delete',
+        cancelText: 'Cancel',
+        danger: true,
+    });
+    if (!confirmed) return;
+    setLibraryError('');
+    try {
+        const resp = await fetch(`/api/rag/library/file/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+        if (!resp.ok) {
+            const detail = (await resp.json()).detail || resp.statusText;
+            setLibraryError(`Delete failed: ${detail}`);
+            return;
+        }
+    } catch (e) {
+        setLibraryError(`Delete failed: ${e.message}`);
+        return;
+    }
+    await renderLibraryView();
+}
+
+function formatBytes(n) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatRelativeTime(unixSeconds) {
+    const t = typeof unixSeconds === 'number' ? unixSeconds * 1000 : Date.now();
+    const diff = Date.now() - t;
+    if (diff < 60_000) return 'just now';
+    if (diff < 3600_000) return `${Math.floor(diff / 60_000)}m ago`;
+    if (diff < 86_400_000) return `${Math.floor(diff / 3600_000)}h ago`;
+    return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+// Tab button click handlers
+sidebarTabsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('.sidebar-tab');
+    if (!btn) return;
+    switchSidebarTab(btn.dataset.tab);
+});
+
+// Apply the persisted tab on initial render
+applyActiveTab();

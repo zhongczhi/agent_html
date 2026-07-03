@@ -15,8 +15,13 @@
 </head>
 <body>
     <div class="sidebar" id="sidebar">
+        <div class="sidebar-tabs" id="sidebarTabs">
+            <button class="sidebar-tab active" data-tab="conversations">Conversations</button>
+            <button class="sidebar-tab" data-tab="library" id="libraryTabBtn" hidden>Library</button>
+        </div>
         <div class="sidebar-header" id="sidebarHeader"></div>
         <div class="conversation-list" id="conversationList"></div>
+        <div class="library-view" id="libraryView" hidden></div>
     </div>
 
     <div class="main-content">
@@ -39,7 +44,7 @@
                         <span class="column-title">Vanilla</span>
                         <label class="upload-btn" title="Upload a file to the vanilla conversation (small files go inline; large files are indexed)">
                             Upload
-                            <input type="file" class="upload-input" data-column="vanilla" accept=".md,.txt,.pdf,.html">
+                            <input type="file" class="upload-input" data-column="vanilla" accept=".md,.txt,.pdf,.html,.docx,.csv">
                         </label>
                     </div>
                     <div class="column-messages" id="vanillaMessages"></div>
@@ -49,7 +54,7 @@
                         <span class="column-title">RAG</span>
                         <label class="upload-btn" title="Upload a file to the RAG conversation (small files go inline; large files are indexed)">
                             Upload
-                            <input type="file" class="upload-input" data-column="rag" accept=".md,.txt,.pdf,.html">
+                            <input type="file" class="upload-input" data-column="rag" accept=".md,.txt,.pdf,.html,.docx,.csv">
                         </label>
                     </div>
                     <div class="column-messages" id="ragMessages"></div>
