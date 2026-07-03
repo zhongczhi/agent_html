@@ -1,4 +1,15 @@
-from backend.rag.splitter import make_splitter, _read_text, _walk_library
+from backend.rag.splitter import (
+    _md_header_path,
+    _read_text,
+    _walk_library,
+    make_splitter,
+    pick_splitter,
+    split_into_documents,
+)
+from langchain_text_splitters import (
+    MarkdownTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 from pathlib import Path
 
 
@@ -62,3 +73,85 @@ def test_walk_library_finds_supported_files(tmp_path):
     names = {p.name for p in found}
     assert names == {"a.md", "b.txt", "c.pdf", "d.html", "f.md"}
     assert "e.bin" not in names
+
+
+# ── iter-8 additions ───────────────────────────────────────────────────────
+
+def test_pick_splitter_returns_markdown_for_md():
+    s = pick_splitter(".md", chunk_size=100, chunk_overlap=20)
+    assert isinstance(s, MarkdownTextSplitter)
+
+
+def test_pick_splitter_returns_recursive_for_other_formats():
+    for ext in (".txt", ".pdf", ".html", ".docx", ".csv"):
+        s = pick_splitter(ext, chunk_size=100, chunk_overlap=20)
+        assert isinstance(s, RecursiveCharacterTextSplitter), f"{ext} should use Recursive"
+
+
+def test_md_header_path_empty_when_no_headers():
+    text = "Just plain text, no headers anywhere."
+    assert _md_header_path(text, len(text)) == ""
+
+
+def test_md_header_path_returns_h1_breadcrumb():
+    text = "# Title\n\nSome content here.\n"
+    # At offset 30 (in "Some content"), the most recent H1 is "Title".
+    assert _md_header_path(text, 30) == "Title"
+
+
+def test_md_header_path_returns_nested_breadcrumb():
+    text = "# H1\n\nIntro.\n\n## H2\n\nDetails.\n\n### H3\n\nEven more.\n"
+    # Offset 50 is past H3 — breadcrumb is "H1 / H2 / H3".
+    assert _md_header_path(text, 50) == "H1 / H2 / H3"
+
+
+def test_md_header_path_drops_deeper_levels_on_shallower_header():
+    """When a shallower header appears after deeper ones, the breadcrumb
+    drops the deeper levels."""
+    text = "# A\n\n## B\n\n### C\n\nbody.\n\n## D\n\nbody2.\n"
+    # After D appears, C and B should be dropped — breadcrumb is "A / D".
+    idx = text.index("body2.")
+    assert _md_header_path(text, idx) == "A / D"
+
+
+def test_split_into_documents_md_attaches_header_path(sample_md, tmp_path):
+    """Markdown chunks should carry header_path metadata matching their section."""
+    chunks = list(split_into_documents(
+        sample_md, source_type="library", conversation_id=None,
+        chunk_size=200, chunk_overlap=20,
+    ))
+    assert len(chunks) >= 1
+    # At least one chunk should have a non-empty header_path
+    paths = [c.metadata.get("header_path", "") for c in chunks]
+    assert any(p for p in paths), f"Expected non-empty header_path, got {paths}"
+
+
+def test_split_into_documents_chunk_id_uses_filename_prefix(tmp_path):
+    """Two identical chunks from different files must have distinct chunk_ids."""
+    f1 = tmp_path / "a.md"
+    f2 = tmp_path / "b.md"
+    content = "# Same Header\n\nSame content for both files."
+    f1.write_text(content, encoding="utf-8")
+    f2.write_text(content, encoding="utf-8")
+    chunks1 = list(split_into_documents(f1, "library", None, 200, 20))
+    chunks2 = list(split_into_documents(f2, "library", None, 200, 20))
+    ids1 = {c.metadata["chunk_id"] for c in chunks1}
+    ids2 = {c.metadata["chunk_id"] for c in chunks2}
+    assert ids1.isdisjoint(ids2), f"Expected distinct IDs, got {ids1} vs {ids2}"
+
+
+def test_split_into_documents_source_type_set(sample_txt):
+    chunks = list(split_into_documents(sample_txt, "upload", "c1", 200, 20))
+    for c in chunks:
+        assert c.metadata["source_type"] == "upload"
+        assert c.metadata["source"] == "upload"  # iter-7 compat
+
+
+def test_split_into_documents_format_metadata_present(sample_txt, sample_docx, sample_csv):
+    """For each format with reliable content, verify format metadata is set
+    on every chunk. PDF (blank-page fixture) is verified in test_loaders.py."""
+    for path, fmt in [(sample_txt, ".txt"), (sample_docx, ".docx"), (sample_csv, ".csv")]:
+        chunks = list(split_into_documents(path, "library", None, 1000, 0))
+        assert chunks, f"{path} should produce chunks"
+        for c in chunks:
+            assert c.metadata["format"] == fmt, f"expected {fmt}, got {c.metadata['format']}"

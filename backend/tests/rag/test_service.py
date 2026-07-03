@@ -141,3 +141,30 @@ def test_scoped_retriever_integration(tmp_path: Path):
     assert any("forty two" in d.page_content for d in hits)
     # Library empty, so only upload hits
     assert all(d.metadata.get("source") == "upload" for d in hits)
+
+
+def test_reindex_library_handles_mixed_formats(tmp_path: Path):
+    """Library reindex ingests every supported format and emits chunks with
+    the correct per-format metadata."""
+    lib = tmp_path / "library"
+    lib.mkdir()
+    (lib / "notes.md").write_text("# Heading\n\nSome markdown content.")
+    (lib / "data.txt").write_text("Plain text content here.")
+    (lib / "page.html").write_text("<html><body><h1>Hi</h1><p>Visible.</p></body></html>")
+
+    svc = _service(tmp_path)
+    result = svc.reindex_library()
+    assert result["files_processed"] == 3
+    assert result["chunks_added"] >= 3
+    assert result["errors"] == []
+
+    docs = [d for d in svc.library_index.docstore._dict.values()
+            if not d.metadata.get("_placeholder")]
+    formats = {d.metadata["format"] for d in docs}
+    assert formats == {".md", ".txt", ".html"}
+    for d in docs:
+        assert d.metadata["source"] == "library"
+        assert d.metadata["source_type"] == "library"  # iter-8 explicit
+        assert "conversation_id" not in d.metadata
+        # All chunks from this run have the new chunk_id formula.
+        assert d.metadata["chunk_id"] == _chunk_id(d.metadata["filename"], d.page_content)

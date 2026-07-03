@@ -58,8 +58,9 @@ def load(path: Path, source: str) -> Iterator[RawDocument]:
 # is defined so they can `from backend.rag.loaders import RawDocument, register`
 # without hitting a partial-module circular import.
 from backend.rag.loaders import text  # noqa: E402, F401  (.txt, .md)
-from backend.rag.loaders import pdf  # noqa: E402, F401  (.pdf) — Phase A stub; Phase B replaces
-from backend.rag.loaders import html  # noqa: E402, F401  (.html) — Phase A stub; Phase B replaces
+from backend.rag.loaders import pdf   # noqa: E402, F401  (.pdf)
+from backend.rag.loaders import html  # noqa: E402, F401  (.html)
+from backend.rag.loaders import docx  # noqa: E402, F401  (.docx)
+from backend.rag.loaders import csv   # noqa: E402, F401  (.csv)
 
-# Routes that want richer formats also import docx, csv (Phase C).
 ALLOWED_EXTENSIONS = frozenset(REGISTRY.keys())
