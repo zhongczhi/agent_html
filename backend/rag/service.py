@@ -1,16 +1,17 @@
-import hashlib
 import logging
 import shutil
 from pathlib import Path
+
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import FAISS
 
 from backend.rag.config import RagSettings
 from backend.rag.retriever import ScopedRetriever
-from backend.rag.vector_store import load_or_init, save, rebuild_filtered
-from backend.rag.splitter import make_splitter, _read_text, _walk_library
+from backend.rag.splitter import _walk_library, split_into_documents
+from backend.rag.vector_store import load_or_init, rebuild_filtered, save
 from backend.rag.embeddings import make_embeddings
+from backend.rag.loaders import UnsupportedFormatError
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,6 @@ class RagService:
     def __init__(self, settings: RagSettings, embeddings: Embeddings):
         self.settings = settings
         self.embeddings = embeddings
-        self.splitter = make_splitter(settings.rag_chunk_size, settings.rag_chunk_overlap)
 
         # Anchor paths to backend/ — same pattern as backend/storage/file_storage.py
         # which uses Path(__file__).parent.parent.parent / "storage". This way uvicorn
@@ -54,24 +54,17 @@ class RagService:
         if file_path.resolve() != dest.resolve():
             shutil.copy2(file_path, dest)
 
-        text = _read_text(dest)
-        chunks = self.splitter.split_text(text)
-        docs = []
-        for chunk_text in chunks:
-            docs.append(Document(
-                page_content=chunk_text,
-                metadata={
-                    "source": "upload",
-                    "conversation_id": conversation_id,
-                    "filename": file_path.name,
-                    "chunk_id": hashlib.sha256(chunk_text.encode()).hexdigest()[:16],
-                },
-            ))
+        docs = list(split_into_documents(
+            dest,
+            source_type="upload",
+            conversation_id=conversation_id,
+            chunk_size=self.settings.rag_chunk_size,
+            chunk_overlap=self.settings.rag_chunk_overlap,
+        ))
+
         # Filter out placeholder if it exists, then re-add (FAISS doesn't
-        # gracefully handle add_documents on an empty placeholder index)
-        self.uploads_index = rebuild_filtered(
-            self.uploads_index, self.embeddings, keep=lambda d: True,
-        )
+        # gracefully handle add_documents on an empty placeholder index).
+        self.uploads_index = rebuild_filtered(self.uploads_index, self.embeddings, keep=lambda d: True)
         # Guard against empty docs (e.g., a DOCX whose paragraphs are all
         # empty). FAISS.add_documents([]) raises on some versions.
         if docs:
@@ -85,17 +78,16 @@ class RagService:
         all_docs: list[Document] = []
         for path in files:
             try:
-                text = _read_text(path)
-                chunks = self.splitter.split_text(text)
-                for chunk_text in chunks:
-                    all_docs.append(Document(
-                        page_content=chunk_text,
-                        metadata={
-                            "source": "library",
-                            "filename": str(path.relative_to(self.library_dir)),
-                            "chunk_id": hashlib.sha256(chunk_text.encode()).hexdigest()[:16],
-                        },
-                    ))
+                all_docs.extend(split_into_documents(
+                    path,
+                    source_type="library",
+                    conversation_id=None,
+                    chunk_size=self.settings.rag_chunk_size,
+                    chunk_overlap=self.settings.rag_chunk_overlap,
+                ))
+            except UnsupportedFormatError:
+                # _walk_library already filters by extension; this is defensive
+                continue
             except Exception as e:
                 errors.append(f"{path}: {e}")
 
@@ -103,7 +95,10 @@ class RagService:
         # placeholder. load_or_init would do the same, but here we want to
         # overwrite the existing index (not just init it on first start).
         if not all_docs:
-            self.library_index = FAISS.from_documents([Document(page_content="", metadata={"_placeholder": True})], self.embeddings)
+            self.library_index = FAISS.from_documents(
+                [Document(page_content="", metadata={"_placeholder": True})],
+                self.embeddings,
+            )
         else:
             self.library_index = FAISS.from_documents(all_docs, self.embeddings)
         save(self.library_index, self._index_path("library_index"))

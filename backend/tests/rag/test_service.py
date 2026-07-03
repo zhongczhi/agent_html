@@ -31,8 +31,10 @@ def _service(tmp_path: Path) -> RagService:
     )
 
 
-def _chunk_id(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+def _chunk_id(filename: str, text: str) -> str:
+    # iter-8 formula: content-addressed within a file, so identical text
+    # in different files gets distinct IDs.
+    return hashlib.sha256(f"{filename}:{text}".encode()).hexdigest()[:16]
 
 
 def test_ingest_file_saves_to_uploads_dir_and_indexes_chunks(tmp_path: Path):
@@ -55,7 +57,7 @@ def test_ingest_file_saves_to_uploads_dir_and_indexes_chunks(tmp_path: Path):
         assert d.metadata["source"] == "upload"
         assert d.metadata["conversation_id"] == "c1"
         assert d.metadata["filename"] == "source.txt"
-        assert d.metadata["chunk_id"] == _chunk_id(d.page_content)
+        assert d.metadata["chunk_id"] == _chunk_id(d.metadata["filename"], d.page_content)
 
 
 def test_ingest_file_persists_to_disk(tmp_path: Path):

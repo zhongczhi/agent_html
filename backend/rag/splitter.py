@@ -24,6 +24,23 @@ def pick_splitter(extension: str, chunk_size: int, chunk_overlap: int) -> TextSp
     return RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
 
+def _md_header_path(full_text: str, offset: int) -> str:
+    """Return the markdown header breadcrumb at `offset`, e.g.
+    "Intro / Setup / Install". Walks back from `offset` collecting the
+    most recent header at each level; deeper levels drop out when a
+    shallower one is found. Returns "" if no header precedes the chunk."""
+    headers: dict[int, str] = {}
+    for m in re.finditer(r"^(#{1,6})\s+(.+)$", full_text[:offset], re.MULTILINE):
+        level = len(m.group(1))
+        headers[level] = m.group(2).strip()
+        for deeper in list(headers.keys()):
+            if deeper > level:
+                headers.pop(deeper)
+    if not headers:
+        return ""
+    return " / ".join(headers[k] for k in sorted(headers))
+
+
 def split_into_documents(
     path: Path,
     source_type: str,        # "library" | "upload"
@@ -35,9 +52,30 @@ def split_into_documents(
     registered loader, runs the format-appropriate splitter on each
     RawDocument, and yields chunk Documents with propagated metadata.
 
-    Used by RagService.ingest_file and RagService.reindex_library."""
+    Used by RagService.ingest_file and RagService.reindex_library.
+
+    Metadata fields guaranteed on every chunk:
+        source         — "library" | "upload" (iter-7 compat)
+        source_type    — same value as `source` (iter-8 explicit name)
+        filename       — basename of the file
+        format         — file extension including leading dot
+        chunk_id       — sha256(f"{path.name}:{chunk_text}") prefix
+        conversation_id — present only when conversation_id is not None
+
+    Per-format metadata propagated from RawDocument:
+        .md  → header_path
+        .pdf → page_number, total_pages
+        .html → title
+        .docx → paragraph_number, style
+        .csv → row_number, headers
+    """
     ext = path.suffix.lower()
     splitter = pick_splitter(ext, chunk_size, chunk_overlap)
+
+    # Markdown chunks need a header breadcrumb derived from the file's
+    # original text. Read it once up front.
+    full_text = path.read_text(encoding="utf-8") if ext == ".md" else ""
+
     for raw in registry_load(path, source_type):
         if not raw.text.strip():
             continue
@@ -49,14 +87,26 @@ def split_into_documents(
             meta["format"] = ext
             if conversation_id is not None:
                 meta["conversation_id"] = conversation_id
-            meta["chunk_id"] = hashlib.sha256(chunk_text.encode()).hexdigest()[:16]
+            if ext == ".md":
+                # Find this chunk's offset in the original file text and
+                # derive the header breadcrumb. Use first-occurrence find
+                # (no cursor) so repeated phrases and overlap don't
+                # misalign the offset.
+                snippet = chunk_text[:80].strip()
+                if snippet:
+                    idx = full_text.find(snippet)
+                    if idx >= 0:
+                        meta["header_path"] = _md_header_path(full_text, idx)
+            meta["chunk_id"] = hashlib.sha256(
+                f"{path.name}:{chunk_text}".encode()
+            ).hexdigest()[:16]
             yield Document(page_content=chunk_text, metadata=meta)
 
 
 # ── Deprecated (iter-7) wrappers — kept for backward compat ────────────────
 # These delegate to the new loader registry where possible, preserving the
 # behavior that iter-7 tests assert. They will be removed once service.py
-# migrates to split_into_documents in iter-8 Phase B.
+# migrates to split_into_documents.
 
 def make_splitter(chunk_size: int, chunk_overlap: int) -> TextSplitter:
     """Iter-7 compat: returns RecursiveCharacterTextSplitter regardless of
@@ -65,14 +115,9 @@ def make_splitter(chunk_size: int, chunk_overlap: int) -> TextSplitter:
 
 
 def _read_text(path: Path) -> str:
-    """Iter-7 compat: returns concatenated text from a file. PDF parsing
-    stays inline (the loaders/pdf module is added in Phase B); .txt/.md
-    delegate to the registered loaders."""
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        from pypdf import PdfReader
-        reader = PdfReader(str(path))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    """Iter-7 compat: returns concatenated text from a file. Delegates to
+    the registered loader (which yields one RawDocument per page for
+    PDFs, one for HTML/txt/md, etc.)."""
     return "\n".join(rd.text for rd in registry_load(path, "upload"))
 
 
