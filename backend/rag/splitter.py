@@ -123,11 +123,7 @@ def _read_text(path: Path) -> str:
 
 def _walk_library(library_dir: Path) -> list[Path]:
     """Iter-7 compat: walks library_dir, returns allowlisted files sorted
-    alphabetically. Imports ALLOWED_EXTENSIONS from the loaders package."""
-    from backend.rag.loaders import ALLOWED_EXTENSIONS
-    if not library_dir.exists():
-        return []
-    return sorted(
-        p for p in library_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
-    )
+    alphabetically. Implementation moved to backend.rag.service in
+    iter-8 Phase D; this re-exports for backward compat with iter-7 tests."""
+    from backend.rag.service import _walk_library as _service_walk_library
+    return _service_walk_library(library_dir)

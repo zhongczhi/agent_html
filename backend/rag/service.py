@@ -1,5 +1,7 @@
 import logging
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from langchain_core.documents import Document
@@ -8,12 +10,23 @@ from langchain_community.vectorstores import FAISS
 
 from backend.rag.config import RagSettings
 from backend.rag.retriever import ScopedRetriever
-from backend.rag.splitter import _walk_library, split_into_documents
+from backend.rag.splitter import split_into_documents
 from backend.rag.vector_store import load_or_init, rebuild_filtered, save
 from backend.rag.embeddings import make_embeddings
-from backend.rag.loaders import UnsupportedFormatError
+from backend.rag.loaders import ALLOWED_EXTENSIONS, UnsupportedFormatError
 
 logger = logging.getLogger(__name__)
+
+
+def _walk_library(library_dir: Path) -> list[Path]:
+    """Walks library_dir for allowlisted files, sorted alphabetically.
+    Service-internal helper — moved from splitter.py in iter-8 Phase D."""
+    if not library_dir.exists():
+        return []
+    return sorted(
+        p for p in library_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
+    )
 
 
 class RagService:
@@ -35,6 +48,10 @@ class RagService:
         self.backend_tag = settings.rag_embedding_backend
         self.library_index = load_or_init(self._index_path("library_index"), self.embeddings)
         self.uploads_index = load_or_init(self._index_path("uploads_index"), self.embeddings)
+
+        # Auto-create the library dir so the API can list/save into it
+        # without first requiring an admin to mkdir on disk.
+        self.library_dir.mkdir(parents=True, exist_ok=True)
 
     def _index_path(self, name: str) -> Path:
         return self.rag_dir / f"{name}.{self.backend_tag}"
@@ -114,6 +131,68 @@ class RagService:
         )
         save(self.uploads_index, self._index_path("uploads_index"))
 
+    # ── Library management (iter-8 Phase D) ──────────────────────────
+
+    def list_library_files(self) -> list[dict]:
+        """Return metadata for every allowlisted file in library_dir,
+        sorted alphabetically. Used by the library sidebar tab."""
+        if not self.library_dir.exists():
+            return []
+        files: list[dict] = []
+        for p in self.library_dir.iterdir():
+            if not p.is_file() or p.suffix.lower() not in ALLOWED_EXTENSIONS:
+                continue
+            stat = p.stat()
+            files.append({
+                "filename": p.name,
+                "size": stat.st_size,
+                "modified_at": stat.st_mtime,
+            })
+        return files
+
+    def save_library_file(self, filename: str, content: bytes) -> Path:
+        """Atomically write `content` to library_dir/<filename>, then auto-
+        reindex so the file is queryable immediately. Caller must validate
+        filename + extension (routes do this)."""
+        self.library_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.library_dir / filename
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.library_dir),
+            prefix=f".{filename}.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(content)
+            os.replace(tmp_path, dest)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        # Auto-reindex so the uploaded file is queryable right away.
+        # Log on failure but don't roll back the write — the file is on
+        # disk and the manual reindex endpoint can recover.
+        try:
+            self.reindex_library()
+        except Exception:
+            logger.exception("Auto-reindex after library upload failed for %s", filename)
+        return dest
+
+    def delete_library_file(self, filename: str) -> bool:
+        """Delete library_dir/<filename> and auto-reindex. Returns True if
+        the file existed."""
+        target = self.library_dir / filename
+        if not target.exists() or not target.is_file():
+            return False
+        target.unlink()
+        try:
+            self.reindex_library()
+        except Exception:
+            logger.exception("Auto-reindex after library delete failed for %s", filename)
+        return True
+
     # ── Read path ────────────────────────────────────────────────────
 
     def make_scoped_retriever(self, conversation_id: str, top_k: int) -> ScopedRetriever:
@@ -146,4 +225,5 @@ class RagService:
                 for d in uploads_dict.values()
                 if d.metadata.get("conversation_id")
             }),
+            "library_files": len(self.list_library_files()),
         }

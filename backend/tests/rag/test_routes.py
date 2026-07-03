@@ -140,8 +140,9 @@ def test_upload_503_when_rag_disabled(monkeypatch, tmp_path):
 
 def test_library_reindex_returns_processed_count(rag_client, tmp_path):
     client, rag = rag_client
+    # The RagService fixture auto-creates the library dir, so use exist_ok=True.
     lib = tmp_path / "library"
-    lib.mkdir()
+    lib.mkdir(exist_ok=True)
     (lib / "doc.md").write_text("library content", encoding="utf-8")
 
     resp = client.post("/api/rag/library/reindex")
@@ -211,3 +212,132 @@ def test_upload_rejects_file_with_no_extension(rag_client):
         files={"file": ("README", b"x", "text/plain")},
     )
     assert resp.status_code == 400
+
+
+# ── iter-8 library management ───────────────────────────────────────────────
+
+def test_library_files_lists_allowlisted(rag_client, tmp_path):
+    """GET /api/rag/library/files returns sorted metadata for allowlisted files."""
+    client, _ = rag_client
+    lib = tmp_path / "library"
+    (lib / "b.md").write_text("b-content", encoding="utf-8")
+    (lib / "a.txt").write_text("a-content", encoding="utf-8")
+    (lib / "ignored.bin").write_bytes(b"nope")  # not in allowlist
+
+    resp = client.get("/api/rag/library/files")
+    assert resp.status_code == 200
+    files = resp.json()["files"]
+    names = [f["filename"] for f in files]
+    assert names == ["a.txt", "b.md"]  # alphabetical
+    assert all("size" in f and "modified_at" in f for f in files)
+
+
+def test_library_upload_writes_and_reindexes(rag_client, tmp_path):
+    """POST /api/rag/library/upload saves the file and triggers reindex."""
+    client, rag = rag_client
+    lib = tmp_path / "library"
+
+    resp = client.post(
+        "/api/rag/library/upload",
+        files={"file": ("new.md", b"# New\n\nfresh content", "text/markdown")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["filename"] == "new.md"
+    assert body["saved"] is True
+    assert (lib / "new.md").exists()
+    # Auto-reindex ran — library_index now has chunks from new.md
+    chunks = [d for d in rag.library_index.docstore._dict.values()
+              if not d.metadata.get("_placeholder")]
+    assert any(d.metadata.get("filename") == "new.md" for d in chunks)
+
+
+def test_library_upload_409_on_duplicate(rag_client, tmp_path):
+    """Uploading a filename that already exists returns 409."""
+    client, _ = rag_client
+    lib = tmp_path / "library"
+    (lib / "exists.md").write_text("already here", encoding="utf-8")
+
+    resp = client.post(
+        "/api/rag/library/upload",
+        files={"file": ("exists.md", b"second", "text/markdown")},
+    )
+    assert resp.status_code == 409
+    assert "already in the library" in resp.json()["detail"]
+
+
+def test_library_upload_400_on_bad_extension(rag_client):
+    client, _ = rag_client
+    resp = client.post(
+        "/api/rag/library/upload",
+        files={"file": ("bad.exe", b"x", "application/octet-stream")},
+    )
+    assert resp.status_code == 400
+
+
+def test_library_upload_400_on_path_traversal(rag_client):
+    client, _ = rag_client
+    resp = client.post(
+        "/api/rag/library/upload",
+        files={"file": ("../escape.md", b"x", "text/markdown")},
+    )
+    assert resp.status_code == 400
+
+
+def test_library_upload_400_on_dotfile(rag_client):
+    client, _ = rag_client
+    resp = client.post(
+        "/api/rag/library/upload",
+        files={"file": (".hidden.md", b"x", "text/markdown")},
+    )
+    assert resp.status_code == 400
+
+
+def test_library_file_delete_removes_and_reindexes(rag_client, tmp_path):
+    """DELETE /api/rag/library/file/{name} removes the file and reindexes."""
+    client, rag = rag_client
+    lib = tmp_path / "library"
+    (lib / "doomed.md").write_text("to be removed", encoding="utf-8")
+    rag.reindex_library()
+    chunks_before = [d for d in rag.library_index.docstore._dict.values()
+                     if not d.metadata.get("_placeholder")]
+    assert any(d.metadata["filename"] == "doomed.md" for d in chunks_before)
+
+    resp = client.delete("/api/rag/library/file/doomed.md")
+    assert resp.status_code == 200
+    assert not (lib / "doomed.md").exists()
+    chunks_after = [d for d in rag.library_index.docstore._dict.values()
+                    if not d.metadata.get("_placeholder")]
+    assert not any(d.metadata["filename"] == "doomed.md" for d in chunks_after)
+
+
+def test_library_file_delete_404_when_missing(rag_client):
+    client, _ = rag_client
+    resp = client.delete("/api/rag/library/file/nonexistent.md")
+    assert resp.status_code == 404
+
+
+def test_library_file_delete_400_on_path_traversal(rag_client):
+    client, _ = rag_client
+    # FastAPI path matching prevents most traversal, but defense-in-depth
+    resp = client.delete("/api/rag/library/file/..")
+    assert resp.status_code in (400, 404)  # either is acceptable
+
+
+def test_library_file_delete_400_on_bad_extension(rag_client):
+    client, _ = rag_client
+    resp = client.delete("/api/rag/library/file/bad.exe")
+    assert resp.status_code == 400
+
+
+def test_stats_includes_library_files_count(rag_client, tmp_path):
+    """stats endpoint reports the library_files count."""
+    client, _ = rag_client
+    lib = tmp_path / "library"
+    (lib / "a.md").write_text("a", encoding="utf-8")
+    (lib / "b.txt").write_text("b", encoding="utf-8")
+
+    resp = client.get("/api/rag/stats")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["library_files"] == 2

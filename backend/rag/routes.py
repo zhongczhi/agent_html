@@ -5,15 +5,15 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 import backend.storage.file_storage as file_storage
 from backend.rag.config import RagSettings
 from backend.rag.service import RagService
+from backend.rag.loaders import ALLOWED_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 
 
-# FR-12.1: file extension allowlist. Matches FR-11.2 (library supports the
-# same formats). Extension comparison is case-insensitive and includes the
-# leading dot (".MD" normalizes to ".md").
-ALLOWED_EXTENSIONS = {".md", ".txt", ".pdf", ".html"}
+# Re-exported for tests that import `ALLOWED_EXTENSIONS` from this module.
+# Single source of truth lives in `backend.rag.loaders`.
+__all__ = ["router", "ALLOWED_EXTENSIONS"]
 
 
 def _check_extension(filename: str | None) -> str:
@@ -51,7 +51,48 @@ def stats():
     # Surface the threshold so the client can apply the same boundary
     # without a separate env var. (FR-12.5)
     data["inline_context_threshold_bytes"] = RagSettings().rag_inline_context_threshold_bytes
+    # library_files is already in svc.stats() (FR-28.8)
     return data
+
+
+# ── Library management (iter-8 Phase D) ─────────────────────────────────────
+
+@router.get("/library/files")
+def library_files():
+    svc = _service_or_503()
+    return {"files": svc.list_library_files()}
+
+
+@router.post("/library/upload")
+def library_upload(file: UploadFile = File(...)):
+    svc = _service_or_503()
+    if not file.filename or "/" in file.filename or "\\" in file.filename or file.filename.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    _check_extension(file.filename)
+    if (svc.library_dir / file.filename).exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{file.filename}' is already in the library; delete first",
+        )
+    content = file.file.read()
+    try:
+        path = svc.save_library_file(file.filename, content)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not save file: {e}")
+    return {"filename": file.filename, "size": path.stat().st_size, "saved": True}
+
+
+@router.delete("/library/file/{filename}")
+def library_file_delete(filename: str):
+    svc = _service_or_503()
+    # Path-traversal and dotfile guards — filenames are taken straight from
+    # the URL path; user-controlled filenames must be strictly validated.
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    _check_extension(filename)
+    if not svc.delete_library_file(filename):
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"deleted": True, "filename": filename}
 
 
 @router.post("/library/reindex")
