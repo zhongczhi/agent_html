@@ -996,3 +996,20 @@
     padding-top: 0.5rem;
     border-top: 1px solid var(--border-color, #2a2a2a);
 }
+
+
+/* ── iter-8 show-sources toggle ─────────────────────────────────── */
+
+.show-sources-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary, #888);
+    cursor: pointer;
+    user-select: none;
+}
+
+.show-sources-toggle input[type="checkbox"] {
+    cursor: pointer;
+}

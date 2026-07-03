@@ -600,6 +600,10 @@ function addAssistantPlaceholder(col) {
 
 function renderSourcesBlock(assistantMessageEl, sources) {
     if (!assistantMessageEl || !sources || sources.length === 0) return;
+    // Show-sources toggle (iter-8 Phase F): if OFF, don't add the block to
+    // the DOM at all. Pre-existing blocks (from earlier chunks in this
+    // message) are hidden via applySourcesVisibility() instead.
+    if (!cache.getShowSources()) return;
     const existing = assistantMessageEl.parentElement?.querySelector('.sources-block[data-for="assistant"]');
     if (existing) existing.remove();
 
@@ -1379,3 +1383,26 @@ sidebarTabsEl.addEventListener('click', (e) => {
 
 // Apply the persisted tab on initial render
 applyActiveTab();
+
+
+// ── Show-sources toggle (iter-8 Phase F) ───────────────────────────────────
+
+const showSourcesToggle = document.getElementById('showSourcesToggle');
+
+function applySourcesVisibility() {
+    const show = cache.getShowSources();
+    // Affect every .sources-block on the page (both columns — the toggle is
+    // RAG-only visually, but vanilla column sources are also gated by it).
+    document.querySelectorAll('.sources-block').forEach(block => {
+        block.style.display = show ? '' : 'none';
+    });
+}
+
+if (showSourcesToggle) {
+    // Initialize from cache (default ON).
+    showSourcesToggle.checked = cache.getShowSources();
+    showSourcesToggle.addEventListener('change', (e) => {
+        cache.setShowSources(e.target.checked);
+        applySourcesVisibility();
+    });
+}
