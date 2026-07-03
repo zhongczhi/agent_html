@@ -16,8 +16,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from backend.rag.loaders import text
-
 LoaderFn = Callable[[Path, str], Iterator["RawDocument"]]
 
 
@@ -56,8 +54,12 @@ def load(path: Path, source: str) -> Iterator[RawDocument]:
     yield from loader(path, source)
 
 
-# Self-registration happens at import time. text.py is imported above;
-# its @register decorators populate REGISTRY for .txt and .md. Other
-# loader modules are imported by `routes.py` and `service.py` so that
-# only the formats in use are loaded into REGISTRY at startup.
+# Self-registration: import the loader modules after the public API above
+# is defined so they can `from backend.rag.loaders import RawDocument, register`
+# without hitting a partial-module circular import.
+from backend.rag.loaders import text  # noqa: E402, F401  (.txt, .md)
+from backend.rag.loaders import pdf  # noqa: E402, F401  (.pdf) — Phase A stub; Phase B replaces
+from backend.rag.loaders import html  # noqa: E402, F401  (.html) — Phase A stub; Phase B replaces
+
+# Routes that want richer formats also import docx, csv (Phase C).
 ALLOWED_EXTENSIONS = frozenset(REGISTRY.keys())

@@ -72,7 +72,10 @@ class RagService:
         self.uploads_index = rebuild_filtered(
             self.uploads_index, self.embeddings, keep=lambda d: True,
         )
-        self.uploads_index.add_documents(docs)
+        # Guard against empty docs (e.g., a DOCX whose paragraphs are all
+        # empty). FAISS.add_documents([]) raises on some versions.
+        if docs:
+            self.uploads_index.add_documents(docs)
         save(self.uploads_index, self._index_path("uploads_index"))
         return [d.metadata["chunk_id"] for d in docs]
 
