@@ -212,6 +212,140 @@ FastAPI's `StaticFiles` mount is at `/static` and points at `frontend_path / "st
 
 **Rationale:** The pre-change code mounted `/static` on `frontend/` (with no actual `static/` subdirectory). The URL path `/static/...` was misleading because there was no matching folder. Moving the assets into `frontend/static/` makes the URL and the directory match. `index.html` stays at `frontend/index.html` because it is the application entry point, not a static asset.
 
+### 1.28 Plugin Activation via Env Flag
+
+**Choice:** `RAG_ENABLED` environment variable (default `false`) controls whether the RAG module is constructed at all.
+
+**Rationale:**
+- Hard-off behavior is provable: when `false`, no `rag/` imports execute in the request hot path and `delete_conversation` has no rag callback wired in.
+- Avoids runtime "is RAG enabled?" branches scattered through the codebase — instead the code is constructed conditionally at startup.
+- A test (`test_no_rag_path_is_byte_identical_to_today`) asserts that calling `ChatService.generate_background` without `retrieval` produces exactly the same `job.chunks` as the iteration-6 version.
+
+**Trade-off:** Per-request toggling of "is RAG even installed" is impossible; once enabled, it's enabled until restart. For a v1 exploration project this is acceptable.
+
+### 1.29 Retrieval-Augmented Chat Without Chain Modification
+
+**Choice:** Retrieval happens in `ChatService.generate_background` as a pre-processing step before the LLM call. The chain implementation (`backend/chat/chain.py`) is **not modified**.
+
+**Rationale:**
+- The chain becomes "pure LLM call" — `RunnableLambda(convert_messages) | llm`. Its job is well-defined and stable.
+- Retrieval results are pushed to `job.chunks` via `job.append_chunk("sources", ...)` before the LLM call, so SSE replays them in order: sources → token → token → ... → done.
+- The plugin-off property becomes literally true: the chain source file is byte-identical to iteration 6.
+- If retrieval happens *inside* the LCEL chain, the retrieved `context` field is consumed by `augment_messages` and discarded. The route handler (which reads from `job.chunks`, not from the chain's intermediate state) never sees it. This was the load-bearing finding during the brainstorming self-review.
+
+**Trade-off:** Retrieval runs synchronously before the LLM call, adding ~50-200 ms to the first-token latency. Acceptable for v1; could move to a streaming side-channel later if needed.
+
+### 1.30 Two-Scope Index Architecture
+
+**Choice:** Two separate FAISS indexes — `library_index/` and `uploads_index/` — merged at query time via a custom `ScopedRetriever`.
+
+**Rationale:**
+- Library changes are admin operations (rare, read-mostly); uploads change every chat session (mutable, per-conversation). Mixing them in one index forces admin rebuilds to walk the user namespace and makes conversation deletion surgically remove chunks from a shared file.
+- Two indexes are easy to reason about and easy to operate on independently.
+- Library index can be reloaded read-only at startup; uploads index supports `add_documents` mid-session.
+- Adding a third scope later ("web cache", "agent memory") is one more FAISS index + one more entry in `ScopedRetriever.retrievers`. No chain changes, no chat-service changes.
+
+**Trade-off:** ~30 lines of glue code for the merge-and-filter step. Acceptable for the clarity gained.
+
+### 1.31 Conversation-Scoped Filter with Explicit Targeting
+
+**Choice:** `ScopedRetriever` takes `list[tuple[BaseRetriever, bool]]` where the bool flags whether to apply the `conversation_id` filter. Library retrievers get `False`; upload retrievers get `True`.
+
+**Rationale:**
+- Explicit > implicit. The earlier design filtered all hits and relied on the magic of "library hits don't have `conversation_id` so they survive". Fragile and hard to reason about.
+- Each tuple's bool is documented at the call site (in `RagService.make_scoped_retriever`), making the security/correctness property reviewable: "library chunks are never filtered out, upload chunks are always filtered to the current conversation".
+
+**Trade-off:** Slightly more verbose than a single `filter_key/filter_value` parameter pair.
+
+### 1.32 Pluggable Embeddings
+
+**Choice:** `EMBEDDING_BACKEND` env var (`sentence-transformers` or `minimax`) selects the embeddings implementation. Default is `sentence-transformers` with model `all-MiniLM-L6-v2`.
+
+**Rationale:**
+- Local sentence-transformers works offline, has no per-call API cost, and is fast (~5 ms per query). Adds ~80 MB pip dep but eliminates a network round-trip per chunk during ingestion.
+- MiniMax alternative (subject to verifying the endpoint exposes `/embeddings`) allows using the same vendor as the chat model. Useful for A/B comparing embedding quality.
+- The factory pattern in `backend/rag/embeddings.py` returns a `langchain_core.embeddings.Embeddings` instance — both backends satisfy the same interface, so the rest of the system doesn't know which is active.
+
+**Trade-off:** Two backends to test. Mitigated by injecting a `FakeEmbeddings` in tests.
+
+### 1.33 Pluggable Vector Store: FAISS Default
+
+**Choice:** `backend/rag/vector_store.py` wraps LangChain's `FAISS` class. Swapping to Chroma means rewriting this file; nothing else moves.
+
+**Rationale:**
+- FAISS via `langchain_community.vectorstores` provides `add_documents`, `save_local`, `load_local`, `as_retriever` out of the box.
+- On-disk persistence matches the project's "no external services" theme (same as the JSON conversation storage).
+- No FAISS server process; index lives in files.
+- LangChain's `FAISS.save_local` writes a sidecar `index.pkl` containing the docstore — this is what enables fast rebuild-on-delete without re-embedding.
+
+**Trade-off:** Pickle sidecar limits index size to ~50k chunks before memory pressure becomes a concern. Documented as future work: replace with a SQLite/DuckDB-backed docstore when needed.
+
+### 1.34 Deletion via Docstore Rebuild
+
+**Choice:** When a conversation is deleted, the uploads index is rebuilt from the surviving docstore entries (no re-embedding).
+
+**Rationale:**
+- LangChain's `FAISS.save_local` writes vectors + docstore together. Rebuild reads the docstore, filters by `conversation_id`, creates a new `FAISS.from_documents(...)`, and atomically rebinds `self.uploads_index = new_index`.
+- Rebuild cost is dominated by walking the docstore dict (~50 ms for 1000 chunks). No API calls, no file re-reading.
+- For 10k chunks: ~400 ms. For 100k chunks: ~4 s. Acceptable for v1.
+- Escape hatch documented: tombstone set + periodic compaction when rebuild cost becomes a bottleneck.
+
+**Trade-off:** Synchronous in the request handler — the user waits for the rebuild before the delete returns. Mitigated by the fast path (sub-100 ms for normal-sized indexes).
+
+### 1.35 Hook Wiring via Callback Parameter
+
+**Choice:** `file_storage.delete_conversation` accepts an optional `on_delete: Callable[[str], None]` parameter. `main.py` wires `rag_service.purge_uploads` as the callback at startup.
+
+**Rationale:**
+- Explicit over implicit. The storage layer declares its extensibility via the `on_delete` parameter on `delete_conversation`; the application layer wires the actual callback at startup (via `functools.partial`), so the storage module itself is never modified.
+- Default `None` keeps old callers unaffected.
+- Exceptions in the callback are caught and logged but don't fail the delete — the JSON state remains consistent.
+- Testable: tests pass a fake callback to verify the wiring without needing a real `RagService`.
+
+**Trade-off:** Tiny signature change to an existing function. Internal API only.
+
+### 1.36 Sources Event via Job.Append Chunk
+
+**Choice:** New SSE event type `sources` fired once before the first token, populated by `job.append_chunk("sources", json.dumps({...}))` in `ChatService.generate_background`.
+
+**Rationale:**
+- Reuses the existing background-task + job.chunks pattern. No new streaming mechanism.
+- Order is preserved by `job.append_chunk`'s append-only semantics: SSE replays sources before tokens.
+- Vanilla chain never emits sources — natural divergence between modes.
+- Frontend toggle is local state; server doesn't know or care.
+
+**Trade-off:** Sources are formatted as a single JSON blob in a chunk string. Alternative would be a structured SSE event with `event: sources\ndata: {...}` headers; chosen approach uses the existing chunk format for simplicity.
+
+### 1.37 Size-Based Upload Routing
+
+**Choice:** Upload is **not** a RAG-only feature. Both columns expose an Upload button beside the Send button. Files are routed to one of two pipelines based on a server-side threshold (`RAG_INLINE_CONTEXT_THRESHOLD_BYTES`, default 8192 bytes), applied to the raw upload size:
+
+- **Small files** (≤ threshold): the upload endpoint reads the file content, returns `{filename, content, mode: "inline"}` to the client. The client includes this content in the next `/api/chat/stream` request via the `uploaded_files` field. `ChatService` injects each file's content as a single system message before the user message. No FAISS, no chunking, no retrieval. The file is also added to a per-conversation pending-files list, so subsequent turns in the same conversation see the same context without re-sending.
+- **Large files** (> threshold): the existing FAISS path — save to `storage/uploads/<conversation_id>/`, embed, index, retrieve per-turn via ScopedRetriever.
+
+**Rationale:**
+- A small `.md` or `.txt` file (a paragraph or two) doesn't justify the embedding + indexing round-trip. Reading the whole file inline is faster, has no embedding cost, and the LLM can see all of it at once.
+- Per-conversation pending-files list keeps the feature stateful: the user uploads once, then can send multiple follow-up turns without re-uploading.
+- The threshold is server-side and authoritative — the upload endpoint reads it and routes to inline vs. FAISS. The threshold value is also exposed via `/api/rag/stats` so the client can observe (not enforce) the same boundary. Routing decisions live in the server's response (`mode: "inline" | "indexed"`); the frontend does not duplicate the comparison.
+- Both columns use the same upload logic. The semantic difference: the vanilla column's `uploaded_files` content is the **only** context it sees (no library, no FAISS), so vanilla stays a "pure LLM grounded on the file" comparison arm. The RAG column sees library + uploads + the new file's content — a fully-grounded answer.
+- Threshold applies to **raw upload size**, not post-extraction text. PDFs and HTML always go through FAISS (raw sizes are typically megabytes). `.md`/`.txt` under 8 KB take the inline path. This matches the user's intuition: "small text file" vs. "anything larger".
+
+**Trade-off:**
+- The pending-files list is in-memory state. A server restart clears it. If the user uploaded a small file and then the server restarts, the file's content is lost. This is acceptable for v1 because small files are small enough that re-uploading is cheap. (Future work: persist pending files to disk or to a separate `storage/inline_uploads/` keyed by conversation_id.)
+- The threshold is a single number. A more sophisticated policy could route based on file type, post-extraction text size, or token count. Single number keeps the v1 simple.
+
+### 1.38 Frontend Side-by-Side Comparison UI
+
+**Choice:** The chat UI is a side-by-side comparison layout: one shared input at the bottom, two message columns above (Vanilla on the left, RAG on the right). The two columns share a base UUID; vanilla maps to `<base>-0`, RAG maps to `<base>-1`. One Send click fires two parallel `/api/chat/stream` POSTs — vanilla with `retrieval: null`, RAG with `retrieval: {library, uploads, top_k}` — and each column streams its SSE response into its own column. The two columns are otherwise independent: separate histories, separate abort controllers, separate cache state.
+
+**Rationale:**
+- Direct visual comparison on the same question is the core evaluation use case. A side-by-side layout answers "did RAG actually improve this answer?" without making the user retype and re-send.
+- The backend already supports per-request `retrieval` toggling (`RetrievalConfig` on `ChatRequest`). The frontend fan-out is a thin client-side loop: two `fetch` calls with the same `message` and different `retrieval` / `conversation_id`. No backend changes required.
+- Conversation IDs `<base>-0` and `<base>-1` keep the existing storage model: the two columns are normal conversations in `conversations.json`, so the sidebar, CRUD, and deletion work without modification.
+- When `RAG_ENABLED=false`, the RAG column is hidden, the vanilla column takes full width, and only one POST fires per Send. The layout degrades cleanly to iteration-6 behavior.
+
+**Trade-off:** The frontend is more complex than a single-pane UI: two parallel SSE readers, two `AbortController`s, per-column resume-from-cache, per-column badge/state. To keep this manageable, the existing `processStreamResponse` is parameterized by a per-column context object (assistant message element, cache keys, abort controller) and invoked twice in parallel from `sendMessage`.
+
 ---
 
 ## 2. System Architecture
@@ -228,6 +362,9 @@ FastAPI's `StaticFiles` mount is at `/static` and points at `frontend_path / "st
                     │              ┌───────────────┐        ┌───────────────┐
                     │              │  chat domain  │        │ storage domain│
                     │              └───────────────┘        └───────────────┘
+                    │              ┌───────────────┐
+                    │              │   rag domain  │
+                    │              └───────────────┘
                     └──────────────────────────────────────────────────────┘
 ```
 
@@ -244,6 +381,15 @@ backend/
 │   ├── chain.py            # LangChain LCEL chain definition
 │   ├── service.py          # ChatService orchestration
 │   └── stream_manager.py   # StreamJob tracking + STREAM_REGISTRY
+├── rag/                    # NEW (optional, gated by RAG_ENABLED)
+│   ├── __init__.py
+│   ├── config.py           # RAG-specific Pydantic settings
+│   ├── service.py          # RagService facade — ingest, purge, reindex, retriever, stats
+│   ├── retriever.py        # ScopedRetriever (merge + explicit metadata filter)
+│   ├── vector_store.py     # FAISS load/save/rebuild helpers
+│   ├── embeddings.py       # Embeddings factory: sentence-transformers or MiniMax
+│   ├── splitter.py         # Text splitter factory + chunk metadata assembly
+│   └── routes.py           # /api/rag/* endpoints (upload, library reindex, stats)
 └── storage/
     └── file_storage.py     # JSON file read/write operations
 ```
@@ -305,6 +451,9 @@ data: {"end": true}\n\n
 | GET | `/api/chat/history/{conversation_id}` | Get conversation history |
 | GET | `/api/chat/conversations` | List all conversations |
 | DELETE | `/api/chat/conversation/{conversation_id}` | Delete conversation + clear stream job |
+| POST | `/api/rag/upload` | Upload a file; small files (≤ `RAG_INLINE_CONTEXT_THRESHOLD_BYTES`) come back inline, large files are FAISS-indexed |
+| POST | `/api/rag/library/reindex` | Rebuild the global library FAISS index from `storage/library/` |
+| GET | `/api/rag/stats` | RAG stats (chunk counts, conversations, threshold) — 503 when `RAG_ENABLED=false` |
 
 ---
 
@@ -949,19 +1098,17 @@ httpx>=0.25.0
 
 ## 12. Future Extension Points
 
-### Adding RAG
-
-1. Create `backend/rag/` domain
-2. Add document loader in `rag/loader.py`
-3. Add vector store in `rag/vectorstore.py`
-4. Integrate into `chat/chain.py` as RAG chain
-5. No changes to `chat/routes.py` — same interface
-
 ### Adding Authentication
 
 1. Create `backend/auth/` domain
 2. Add FastAPI dependency `get_current_user`
 3. Apply via `Depends(get_current_user)` on routes
+
+### Adding Additional RAG Scopes
+
+1. Add a new FAISS index to `backend/rag/service.py` (one more `load_or_init` call)
+2. Add `(index.as_retriever(...), should_filter)` to `make_scoped_retriever`
+3. Add a bool field to `RetrievalConfig`
 
 ### PostgreSQL Migration
 
@@ -975,25 +1122,39 @@ httpx>=0.25.0
 
 | File | Purpose |
 |------|---------|
-| `backend/main.py` | FastAPI app entry, serves frontend, mounts `/static` from `frontend/static/`, includes chat router |
+| `backend/main.py` | FastAPI app entry, serves frontend, mounts `/static` from `frontend/static/`, includes chat router; lifespan builds `RagService` and wires `purge_uploads` + `clear_pending_inline_files` into `delete_conversation` when `RAG_ENABLED=true` |
 | `backend/config.py` | Pydantic Settings from environment variables |
-| `backend/chat/routes.py` | `/api/chat/*` endpoints; `stream_from_active_job` / `stream_from_inactive_job`; `_sse` and `_serialize_chunk` helpers; `consume_with_cleanup` is applied to the resume route's `StreamingResponse`; `stream_chat` calls `file_storage.create_conversation` + `file_storage.append_message` synchronously |
-| `backend/chat/chain.py` | `convert_messages` is module-level: `HumanMessage` for user turns; `AIMessage` for assistant turns (plain string when no `thinking`, content-block list when there is). `create_chain` wires it to `ChatAnthropic` via `RunnableLambda \| llm`. Passes `base_url=settings.anthropic_base_url` directly. |
-| `backend/chat/service.py` | `ChatService.generate_background` reads history from `file_storage` as the single source of truth; trusts it, no dedupe. Checks `job.cancelled` in the loop and before `save_conversation`. |
+| `backend/chat/routes.py` | `/api/chat/*` endpoints; `stream_from_active_job` / `stream_from_inactive_job`; `_sse` and `_serialize_chunk` helpers; `consume_with_cleanup` is applied to the resume route's `StreamingResponse`; `stream_chat` calls `file_storage.create_conversation` + `file_storage.append_message` synchronously; `ChatRequest` gains optional `retrieval: RetrievalConfig` and `uploaded_files: list[UploadedFile]` |
+| `backend/chat/chain.py` | `convert_messages` is module-level: `HumanMessage` for user turns; `AIMessage` for assistant turns (plain string when no `thinking`, content-block list when there is). `create_chain` wires it to `ChatAnthropic` via `RunnableLambda \| llm`. Passes `base_url=settings.anthropic_base_url` directly. Unchanged in this iteration (RAG happens in `service.py`, not the chain). |
+| `backend/chat/service.py` | `ChatService.generate_background` reads history from `file_storage` as the single source of truth; trusts it, no dedupe. Checks `job.cancelled` in the loop and before `save_conversation`. Optional `rag_service` and `_pending_inline_files` dict for retrieval-augmented and inline-upload paths. |
 | `backend/chat/stream_manager.py` | `StreamJob` (with `cancelled` flag and `reset()` method); `STREAM_REGISTRY`; `get_or_create_job` / `get_job` / `clear_job`; `consume_with_cleanup` |
-| `backend/storage/file_storage.py` | Per-process `_write_lock` (threading); `_atomic_write_json` helper (tmp + `os.replace`); corrupt-JSON-aside recovery; the four write functions are wrapped in the lock and use the atomic helper |
-| `frontend/index.html` | Chat UI structure (49 lines): links to `styles.css`, `app.js`; CDN scripts (katex, dompurify, streaming-markdown); modal markup; chat layout |
-| `frontend/static/styles.css` | All UI styling (theme tokens, layout, animations, responsive, modal) |
-| `frontend/static/app.js` | Frontend chat UI logic: SSE stream processing, resume, conversation list, message rendering, history cache-first load, modal flow. Imports `cache` from `./cache.js` for all `localStorage` access. No raw `localStorage` or `JSON.parse` / `JSON.stringify` of cached state. |
-| `frontend/static/cache.js` | The single owner of `localStorage` access: typed accessors for `chunks`, `history`, `consumed`, `streaming`, `currentConversationId`. Encapsulates the five key names and the JSON encoding. |
+| `backend/rag/__init__.py` | Public surface: `RagService`, `ScopedRetriever` |
+| `backend/rag/config.py` | `RagSettings` (independent of `backend/config.py`) reading `RAG_*` env vars |
+| `backend/rag/service.py` | `RagService` facade: `ingest_file`, `purge_uploads`, `reindex_library`, `make_scoped_retriever`, `persist_all`, `stats` |
+| `backend/rag/retriever.py` | `ScopedRetriever` (`BaseRetriever` subclass) merging multiple per-scope retrievers with explicit conversation_id filtering |
+| `backend/rag/vector_store.py` | FAISS load/save/rebuild helpers: `load_or_init`, `save`, `rebuild_filtered` |
+| `backend/rag/embeddings.py` | Embeddings factory: `make_embeddings(backend)` returns a `langchain_core.embeddings.Embeddings` instance |
+| `backend/rag/splitter.py` | `make_splitter(chunk_size, chunk_overlap)` returning a `RecursiveCharacterTextSplitter` |
+| `backend/rag/routes.py` | FastAPI routes: `POST /api/rag/upload` (size-routed), `POST /api/rag/library/reindex`, `GET /api/rag/stats` — each gated by `RAG_ENABLED` (503 otherwise) |
+| `backend/storage/file_storage.py` | Per-process `_write_lock` (threading); `_atomic_write_json` helper (tmp + `os.replace`); corrupt-JSON-aside recovery; the four write functions are wrapped in the lock and use the atomic helper; `delete_conversation` accepts optional `on_delete` callback |
+| `frontend/index.html` | Two-column comparison layout (Vanilla + RAG), shared input, upload + send buttons, CDN scripts (katex, dompurify, streaming-markdown), modal markup |
+| `frontend/static/styles.css` | All UI styling (theme tokens, layout, animations, responsive, modal, two-column) |
+| `frontend/static/app.js` | Per-column SSE stream processing, two-column fan-out, abort + resume per column, upload + sources rendering, modal flow. Imports `cache` from `./cache.js` for all `localStorage` access. No raw `localStorage` or `JSON.parse` / `JSON.stringify` of cached state. |
+| `frontend/static/cache.js` | The single owner of `localStorage` access: typed accessors for `chunks`, `history`, `consumed`, `streaming`, `currentConversationId`, plus `getBaseConversationId` / `setBaseConversationId` for the paired-column base UUID |
 | `pyproject.toml` | Pytest config: `asyncio_mode = "auto"`, `testpaths = ["backend/tests"]` |
-| `backend/tests/conftest.py` | Pytest fixtures: `temp_storage_dir` (uses `monkeypatch` + `tmp_path` to redirect `STORAGE_DIR` / `CONVERSATIONS_FILE`); `mock_chain` |
+| `backend/tests/conftest.py` | Pytest fixtures: `temp_storage_dir` (uses `monkeypatch` + `tmp_path` to redirect `STORAGE_DIR` / `CONVERSATIONS_FILE`); `mock_chain`; RAG fixtures for `FakeEmbeddings` + temp FAISS dirs |
 | `backend/tests/test_chat_routes.py` | `stream_from_inactive_job` / `stream_from_active_job`; pointer / boundary / out-of-range; `job.reset()` |
-| `backend/tests/test_chat_service.py` | `ChatService.generate_background()` with mocked LLM (thinking + tokens, string content, append_chunk, cancellation) |
-| `backend/tests/test_storage.py` | `TestStorage`, `TestConversationList`, `TestDeleteConversation`, `TestAtomicWrite` (3 tests), `TestWriteLock` (2 tests) |
+| `backend/tests/test_chat_service.py` | `ChatService.generate_background()` with mocked LLM (thinking + tokens, string content, append_chunk, cancellation, retrieval pre-processing) |
+| `backend/tests/test_storage.py` | `TestStorage`, `TestConversationList`, `TestDeleteConversation`, `TestAtomicWrite` (3 tests), `TestWriteLock` (2 tests), `TestOnDeleteCallback` |
 | `backend/tests/test_stream_manager.py` | `StreamJob` state transitions; unified chunks list + chunk_queue; 5 `consume_with_cleanup` tests |
 | `backend/tests/test_thinking_routes.py` | HTTP tests for status, resume 404, post starts background task, delete clears job; 2 integration tests for `consume_with_cleanup` (resume route cleans up, initial stream does not) |
 | `backend/tests/test_chain.py` | `convert_messages` shape: user → `HumanMessage`; assistant without `thinking` → plain `AIMessage`; assistant with `thinking` → content-block `AIMessage`; multi-turn scenario; unknown roles dropped |
+| `backend/tests/rag/test_retriever.py` | `ScopedRetriever` merging, metadata filter, per-scope cap (no merged-result cap) |
+| `backend/tests/rag/test_service.py` | `RagService` ingest / purge / reindex using real FAISS in `tmp_path` + `FakeEmbeddings` |
+| `backend/tests/rag/test_embeddings_factory.py` | `make_embeddings` returns the correct LangChain `Embeddings` subclass per backend |
+| `backend/tests/rag/test_splitter.py` | Chunk size, overlap, metadata assembly |
+| `backend/tests/rag/test_chain_integration.py` | `ChatService` with a fake retriever: sources pushed, augmentation correct; byte-identical non-RAG path |
+| `backend/tests/rag/test_routes.py` | Upload + reindex + stats via `TestClient` (incl. size-based routing) |
 
 ---
 
@@ -1002,6 +1163,16 @@ httpx>=0.25.0
 ```env
 ANTHROPIC_BASE_URL=https://api.minimax.chat/v1
 ANTHROPIC_API_KEY=your-api-key-here
+RAG_ENABLED=false
+EMBEDDING_BACKEND=sentence-transformers
+RAG_LIBRARY_DIR=storage/library
+RAG_UPLOADS_DIR=storage/uploads
+RAG_INDEX_DIR=storage/rag
+RAG_CHUNK_SIZE=800
+RAG_CHUNK_OVERLAP=200
+RAG_TOP_K=4
+RAG_INLINE_CONTEXT_THRESHOLD_BYTES=8192
+SENTENCE_TRANSFORMERS_MODEL=all-MiniLM-L6-v2
 ```
 
 ### Runtime Dependencies
@@ -1011,7 +1182,131 @@ fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 langchain>=0.1.0
 langchain-anthropic>=0.1.0
+langchain-community>=0.0.20
 pydantic>=2.0
 pydantic-settings>=2.0
 python-multipart>=0.0.6
+faiss-cpu
+sentence-transformers
+pypdf
 ```
+
+---
+
+## 15. RAG Module
+
+This section consolidates the implementation-level details for the RAG plugin introduced by the architecture decisions in Section 1.28-1.38. Section 1 covers the *why*; this section covers the *what* — module layout, component skeletons, request flow, and operational concerns. The full brainstorming artifact is in `docs/superpowers/specs/2026-06-26-rag-module-design.md`.
+
+### 15.1 Module Layout
+
+```
+backend/rag/
+├── __init__.py          # public surface: RagService, ScopedRetriever
+├── config.py            # RagSettings (RAG_ENABLED, EMBEDDING_BACKEND, paths, chunk params)
+├── service.py           # RagService — ingest, purge, reindex, make_scoped_retriever, stats
+├── retriever.py         # ScopedRetriever (merge + explicit metadata filter)
+├── vector_store.py      # FAISS load/save/rebuild helpers
+├── embeddings.py        # Embeddings factory: sentence-transformers or MiniMax
+├── splitter.py          # Text splitter factory + chunk metadata assembly
+└── routes.py            # /api/rag/* endpoints (upload, library reindex, stats)
+```
+
+The `rag/` domain is independent of `backend/config.py` — `rag/config.py` has its own `RagSettings` so the global config has zero RAG awareness when `RAG_ENABLED=false`.
+
+### 15.2 Component Skeletons
+
+**`ScopedRetriever`** — a `BaseRetriever` subclass holding `retrievers: list[tuple[BaseRetriever, bool]]` and `conversation_id: str`. Per-scope cap is applied by the underlying retrievers via `search_kwargs={"k": k}`; `ScopedRetriever` does **not** cap the merged result (so top-K hits from each scope accumulate). Convention: library chunks have metadata `source="library"` and no `conversation_id` field; upload chunks have both. Library retrievers get `should_filter=False`; upload retrievers get `should_filter=True`.
+
+```python
+class ScopedRetriever(BaseRetriever):
+    retrievers: list[tuple[BaseRetriever, bool]]
+    conversation_id: str
+
+    def _get_relevant_documents(self, query, *, run_manager):
+        hits = []
+        for r, should_filter in self.retrievers:
+            r_hits = r.invoke(query)
+            if should_filter:
+                r_hits = [d for d in r_hits
+                          if d.metadata.get("conversation_id") == self.conversation_id]
+            hits.extend(r_hits)
+        return hits
+```
+
+**`RagService`** — the only module other domains import. Holds the long-lived `library_index`, `uploads_index`, `embeddings`, `splitter`, and the per-conversation uploads directory. Index paths are tagged with the embedding backend name (e.g. `storage/rag/library_index.sentence-transformers/`) so switching `EMBEDDING_BACKEND` produces a fresh path and forces an explicit reindex — preventing the silent-failure mode where a stale index built with a different model is loaded.
+
+`RagService` exposes: `ingest_file(conversation_id, file_path)` (FAISS pipeline, returns chunk IDs), `reindex_library()` (rebuild from `RAG_LIBRARY_DIR`), `purge_uploads(conversation_id)` (delete files + rebuild uploads index without re-embedding), `make_scoped_retriever(conversation_id, top_k)`, `persist_all()`, `stats()`.
+
+**`vector_store.py`** — three helpers:
+- `load_or_init(path, embeddings)` returns a `FAISS.load_local` if present, else creates an empty `FAISS` with a single placeholder doc (avoids the `from_documents([])` error and keeps the next `add_documents` call working).
+- `save(index, path)` writes `index.faiss` + the docstore sidecar.
+- `rebuild_filtered(index, embeddings, keep)` walks `index.docstore._dict`, filters by `keep(doc)`, returns a fresh `FAISS.from_documents(surviving, embeddings)` (or `load_or_init` for the empty case). This is the load-bearing trick that makes conversation deletion O(chunks), not O(re-embedding).
+
+### 15.3 Modified ChatService Flow
+
+`ChatService.__init__` accepts an optional `rag_service: RagService | None` and holds a per-process `dict[str, list[dict]]` of pending inline files keyed by `conversation_id`. `generate_background(message, conversation_id, retrieval=None, uploaded_files=None)` runs two pre-processing blocks before `self.chain.astream(messages)`:
+
+1. **Inline-files block** (when `uploaded_files` is non-empty): merge the new uploads into the pending list for that conversation; emit a `sources` event listing each file's `{filename, scope: "upload", excerpt: first 300 chars}`; insert a system message before the last user message of the form `"Use this uploaded file as context:\n\n[filename]:\n<content>"`.
+2. **RAG block** (when `retrieval is not None and self.rag_service is not None and pending is empty`): build a `ScopedRetriever` via `rag_service.make_scoped_retriever(conversation_id, retrieval.top_k)`; invoke it on the latest user message; if hits are returned, emit a `sources` event and insert a `"Use this retrieved context:\n<chunks>"` system message before the last user message.
+
+The two blocks are **mutually exclusive per turn**: inline files take precedence over FAISS retrieval. If retrieval raises, the LLM call proceeds with the un-augmented messages and the error is logged.
+
+`clear_pending_inline_files(conversation_id)` is wired into `delete_conversation` alongside `rag_service.purge_uploads` (see 15.4).
+
+### 15.4 Startup Wiring
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if RagSettings().enabled:
+        rag = RagService.from_settings()
+        app.state.rag = rag
+        original_delete = file_storage.delete_conversation
+        file_storage.delete_conversation = partial(
+            original_delete, on_delete=rag.purge_uploads
+        )
+        app.include_router(rag_router)
+    yield
+    if hasattr(app.state, "rag"):
+        app.state.rag.persist_all()
+```
+
+Both `rag.purge_uploads` and `chat_service.clear_pending_inline_files` are chained into a single `partial` callback (the storage layer only takes one `on_delete`), so a single `delete_conversation(id)` call cleans up both FAISS uploads and in-memory pending files for that conversation.
+
+### 15.5 Error Handling
+
+| Failure | Behavior |
+|---|---|
+| `RAG_ENABLED=false`, client sends `retrieval` | Server ignores field, runs vanilla. Debug log. |
+| Uploaded file unreadable / too large | 400, file not saved. |
+| Embedding API down | 500, file kept on disk, index untouched. User retries. |
+| FAISS save fails after `add_documents` | 500, critical log. In-memory state consistent, disk stale until next reindex. |
+| Retrieval fails mid-turn | Stream error chunk; LLM call proceeds with un-augmented messages. |
+| `delete_conversation` succeeds, `purge_uploads` fails | JSON state consistent; orphan chunks invisible at query time. Warning logged. |
+| Library reindex encounters unreadable file | File skipped, error in response `errors` list. Run continues. |
+| `/api/rag/*` endpoint hit when `RAG_ENABLED=false` | 503. |
+
+### 15.6 Testing Strategy
+
+The plugin-off property is asserted by `test_no_rag_path_is_byte_identical_to_today`: when `retrieval=None`, `ChatService.generate_background` produces exactly the same `job.chunks` as the iteration-6 version (no `sources` chunk ever appended; LLM called with the original messages).
+
+Layers:
+- **Unit** (`test_retriever.py`, `test_splitter.py`, `test_embeddings_factory.py`): <10 ms each.
+- **Service** (`test_service.py`): real FAISS in `tmp_path` + `FakeEmbeddings`, <500 ms each.
+- **Chain integration** (`test_chain_integration.py`): `ChatService` with a fake retriever, <1 s each.
+- **Route** (`test_routes.py`): `TestClient` against FastAPI app with a test `RagService`, <1 s each.
+
+Frontend verification is manual for v1: page loads with both panels empty, type-and-send fans out to two streams, sources appear per panel, uploads route by size, refresh-during-stream resumes per column, and deletion cleans up both columns and on-disk uploads.
+
+### 15.7 Future Work (post-v1, documented but out of scope)
+
+1. **Tombstone-based delete** — mark chunks deleted in a set, exclude at query time, periodic compaction. Replaces full-rebuild when indexes grow.
+2. **SQLite/DuckDB docstore** — replaces the FAISS pickle sidecar when chunk counts exceed ~50k.
+3. **Cross-encoder re-ranking** — improves retrieval precision.
+4. **Multi-process locking** — `fcntl`/`msvcrt` file lock for FAISS index (and `conversations.json`).
+5. **Background ingestion** — long uploads don't block the request; client polls for completion.
+6. **Additional scopes** — "web cache", "agent memory", "tool results". Pattern: add FAISS index + entry in `ScopedRetriever.retrievers` + bool flag in `RetrievalConfig`.
+7. **Per-conversation FAISS index** — if `uploads` grows large enough that one index becomes a hotspot.
+8. **Auth on `/api/rag/library/reindex`** — when the app leaves local-only.
+9. **Chunk deduplication** — manifest-based skip-if-unchanged during library reindex.
+10. **Persist pending inline files** to disk (e.g., `storage/inline_uploads/`) so a server restart doesn't lose small-upload context.
