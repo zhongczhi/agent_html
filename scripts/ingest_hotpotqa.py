@@ -25,13 +25,19 @@ CACHE_PATH = REPO_ROOT / "scripts" / ".cache" / "hotpot_dev_distractor_v1.json"
 LIBRARY_DIR = REPO_ROOT / "storage" / "library" / "hotpotqa"
 README_PATH = LIBRARY_DIR / "README.md"
 
-# HotpotQA dev-distractor (CC BY-SA 4.0). The URL is the canonical mirror
-# referenced by the official download.sh at maxbartolo/hotpot:
-#   http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json
-# If this becomes unreachable, alternative mirrors include
-# https://hotpotqa.s3.amazonaws.com/... (currently returns 404) and
-# huggingface.co/datasetshotpot_qa (community uploads). Update this constant
-# and the cache SHA prefix will bust all eval caches automatically.
+# HotpotQA dev-distractor (CC BY-SA 4.0). The default URL is the canonical
+# mirror referenced by the official download.sh at maxbartolo/hotpot, but
+# that CMU-hosted mirror has been intermittently unreliable since ~2024.
+#
+# To use a different mirror, pass `--source URL` on the CLI, or set
+# HOTPOTQA_DEV_DISTRACTOR_URL in the environment. To use a file you
+# downloaded yourself, pass `--from-local PATH` instead.
+#
+# Known working alternatives (verify before relying on):
+#   - http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json
+#     (canonical, official download.sh reference; sometimes times out)
+#   - https://huggingface.co/datasets/hotpot_qa (community-uploaded mirror,
+#     raw JSON may be under a sub-path; check the dataset's Files tab)
 HOTPOTQA_URL = "http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json"
 
 README_TEXT = """# HotpotQA Library Data
@@ -49,9 +55,37 @@ If you redistribute these files, retain this README.
 """
 
 
-def download_or_use_cache(force: bool) -> Path:
+def copy_local_to_cache(local: Path) -> Path:
+    """Copy a user-provided local file to CACHE_PATH, ALWAYS overriding any
+    existing cache. Exits 1 if the file is missing or doesn't parse as JSON.
+
+    The user explicitly passed --from-local, so we don't consult the cache
+    or honor --force: the intent is unambiguous.
+    """
+    if not local.exists() or not local.is_file():
+        print(f"--from-local source not found: {local}", file=sys.stderr)
+        sys.exit(1)
+    # Quick sanity check: file should parse as a JSON array of question objects.
+    try:
+        parsed = json.loads(local.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"--from-local source is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(parsed, list) or not parsed:
+        print(
+            "--from-local source must be a non-empty JSON array of "
+            "HotpotQA question objects",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_PATH.write_bytes(local.read_bytes())
+    return CACHE_PATH
+
+
+def download_or_use_cache(force: bool, url: str) -> Path:
     """Download the JSON if absent or `force` is True; cache it at CACHE_PATH.
-    Returns CACHE_PATH on success. Exits 1 with download URL on repeated failure."""
+    Returns CACHE_PATH on success. Exits 1 with diagnostic on repeated failure."""
     if CACHE_PATH.exists() and not force:
         return CACHE_PATH
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -61,7 +95,7 @@ def download_or_use_cache(force: bool) -> Path:
             import urllib.request
 
             req = urllib.request.Request(
-                HOTPOTQA_URL, headers={"User-Agent": "agent_html/iter-9"}
+                url, headers={"User-Agent": "agent_html/iter-9"}
             )
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = resp.read()
@@ -72,7 +106,19 @@ def download_or_use_cache(force: bool) -> Path:
             if attempt == 0:
                 time.sleep(5)
     print(
-        f"Download failed after 2 attempts: {last_err}\nURL: {HOTPOTQA_URL}",
+        "Download failed after 2 attempts.\n"
+        f"  URL : {url}\n"
+        f"  err : {last_err}\n"
+        "\n"
+        "The CMU-hosted canonical mirror has been intermittently unreliable\n"
+        "since ~2024. To work around this:\n"
+        "  1. Download hotpot_dev_distractor_v1.json by any means that\n"
+        "     works for you (curl, browser, huggingface.co/datasets/hotpot_qa,\n"
+        "     a torrent, a teammate who has the file, etc.).\n"
+        "  2. Re-run with: python scripts/ingest_hotpotqa.py "
+        "--from-local /path/to/hotpot_dev_distractor_v1.json\n"
+        f"     (and the file will be copied to {CACHE_PATH})\n"
+        "  3. Or override the mirror with --source URL on each run.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -168,16 +214,44 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Re-download the dataset even if cached",
     )
+    parser.add_argument(
+        "--source",
+        metavar="URL",
+        default=os.environ.get("HOTPOTQA_DEV_DISTRACTOR_URL", HOTPOTQA_URL),
+        help=(
+            "Custom mirror URL. Overrides HOTPOTQA_DEV_DISTRACTOR_URL env var "
+            "and the built-in default."
+        ),
+    )
+    parser.add_argument(
+        "--from-local",
+        metavar="PATH",
+        type=Path,
+        help=(
+            "Skip the network and copy a locally-downloaded "
+            "hotpot_dev_distractor_v1.json from PATH into the cache. "
+            "Use this when the network mirrors are flaky."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.subset is not None and args.subset <= 1:
         parser.error("--subset must be >= 2")
+    if args.from_local and args.source != os.environ.get(
+        "HOTPOTQA_DEV_DISTRACTOR_URL", HOTPOTQA_URL
+    ):
+        # If user passed --from-local, --source is meaningless. argparse
+        # can't easily express mutual exclusion with a default value, so warn.
+        pass  # we just ignore --source when --from-local is set, below.
 
     print(
         "Dataset: HotpotQA dev_distractor v1 "
         "(CC BY-SA 4.0 — https://hotpotqa.github.io/)"
     )
-    json_path = download_or_use_cache(args.force)
+    if args.from_local:
+        json_path = copy_local_to_cache(args.from_local)
+    else:
+        json_path = download_or_use_cache(args.force, args.source)
     log.info("Loaded %d bytes from %s", json_path.stat().st_size, json_path.name)
 
     raw_items = json.loads(json_path.read_text(encoding="utf-8"))
