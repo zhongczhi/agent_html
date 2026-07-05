@@ -31,3 +31,8 @@ todo.md
 
 # Claude Code local settings
 .claude/settings.json
+
+# HotpotQA iteration 9 — bulky data + cache
+scripts/.cache/
+storage/eval/
+storage/library/hotpotqa/
