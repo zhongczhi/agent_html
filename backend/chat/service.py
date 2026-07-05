@@ -1,10 +1,53 @@
 import json
 import logging
+import re
 
 from backend.storage import file_storage
+from backend.chat.chain import RAG_SYSTEM_PROMPT
 from backend.chat.stream_manager import get_or_create_job, get_job
 
 logger = logging.getLogger(__name__)
+
+
+# Tag that brackets retrieved / inline-file context inside a user message.
+# The LLM uses it as the boundary of "grounding material"; the backend's
+# get_history strips it before sending the message to the frontend (the
+# user only sees their original question, not the retrieved chunks).
+_CONTEXT_TAG_RE = re.compile(r"<context>[\s\S]*?</context>\s*")
+
+
+def _embed_context(user_content: str, context_text: str) -> str:
+    """Prepend a <context>...</context> block to a user message.
+
+    The tagged message is BOTH saved to disk AND sent to the LLM — the
+    context is essential grounding material for the model, not
+    presentational scaffolding to be hidden at the chat layer.
+    """
+    return f"<context>\n{context_text}\n</context>\n\n{user_content}"
+
+
+def _strip_context_tags(user_content: str) -> str:
+    """Strip <context>...</context> blocks from a user message before it
+    leaves the backend. Disk keeps the tagged form (so subsequent LLM
+    turns see their context); the wire-out form is clean.
+    """
+    if not user_content:
+        return user_content
+    return _CONTEXT_TAG_RE.sub("", user_content).strip()
+
+
+def _replace_last_user_context(messages: list, context_text: str) -> None:
+    """Find the last user message in the list and prepend a <context>...
+    block to its content. Mutates `messages` in place. If no user message
+    exists (defensive — shouldn't happen since the route appends first),
+    the call is a no-op."""
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            messages[i] = {
+                "role": "user",
+                "content": _embed_context(messages[i]["content"], context_text),
+            }
+            return
 
 
 class ChatService:
@@ -35,11 +78,15 @@ class ChatService:
         Does not yield to caller - runs independently.
 
         retrieval: optional RetrievalConfig. When set AND rag_service is set,
-        the service retrieves chunks via RagService.make_scoped_retriever,
-        pushes a 'sources' SSE chunk, and augments the messages with a
-        system message containing the retrieved context. When retrieval is
-        None or rag_service is None, the chat runs identically to the
-        pre-RAG version (the plugin-off guarantee).
+        the service retrieves chunks via RagService.retrieve_by_scope,
+        pushes a 'sources' SSE chunk (per-scope dict, empty arrays included
+        so the frontend can render an explicit "no matches" state), and
+        embeds the retrieved context into the LAST user message wrapped in
+        <context>...</context>. The chat prompt template prepends the
+        global SYSTEM_PROMPT; per-turn context lives inside the user
+        message where it actually reaches the LLM. When retrieval is None
+        or rag_service is None, the chat runs identically to the pre-RAG
+        version (the plugin-off guarantee).
         """
         job = get_or_create_job(conversation_id, [])
 
@@ -72,41 +119,27 @@ class ChatService:
         # Takes precedence over FAISS retrieval. The user has explicitly
         # attached a file to this turn (or the conversation has pending files);
         # FAISS results are skipped to avoid context bloat and double-grounding.
-        #
-        # Filter out any prior-turn system messages we injected. They were
-        # saved into storage along with the assistant reply (see save block
-        # below) so they re-appear in `messages` next turn; without this
-        # filter, every turn would add another stale system message.
-        messages = [
-            m for m in messages
-            if not (isinstance(m, dict)
-                    and m.get("role") == "system"
-                    and isinstance(m.get("content"), str)
-                    and (m["content"].startswith("Use this uploaded file as context:")
-                         or m["content"].startswith("Use this retrieved context:")))
-        ]
-
+        used_context = False
         pending = self._pending_inline_files.get(conversation_id, [])
         if pending:
             try:
                 sources_event = {
-                    "sources": [
-                        {
-                            "filename": f["filename"],
-                            "excerpt": f["content"][:300],
-                            "scope": "upload",
-                        }
-                        for f in pending
-                    ]
+                    "sources": {
+                        "uploads": [
+                            {
+                                "filename": f["filename"],
+                                "excerpt": f["content"][:300],
+                            }
+                            for f in pending
+                        ]
+                    }
                 }
                 job.append_chunk("sources", json.dumps(sources_event))
                 context_str = "\n\n".join(
                     f"[{f['filename']}]:\n{f['content']}" for f in pending
                 )
-                messages = messages[:-1] + [
-                    {"role": "system", "content": f"Use this uploaded file as context:\n\n{context_str}"},
-                    messages[-1],
-                ]
+                _replace_last_user_context(messages, context_str)
+                used_context = True
             except Exception as e:
                 logger.exception("Inline file injection failed; continuing without context: %s", e)
         # ──────────────────────────────────────────────────────────────
@@ -114,38 +147,54 @@ class ChatService:
         # ── RAG (FAISS) pre-processing block ───────────────────────────
         # Only runs when no inline files were attached. Both paths emit a
         # sources event before tokens; the inline path takes precedence so
-        # we don't double up.
+        # we don't double up. We use retrieve_by_scope (not
+        # make_scoped_retriever) so the sources event preserves per-scope
+        # emptiness — the frontend can then render "library: 0 / uploads: 0"
+        # instead of silently dropping the sources block when nothing matched.
         elif retrieval is not None and self.rag_service is not None:
             try:
-                scoped = self.rag_service.make_scoped_retriever(
-                    conversation_id, retrieval.top_k,
+                hits_by_scope = self.rag_service.retrieve_by_scope(
+                    conversation_id, message, retrieval.top_k,
                 )
-                hits = scoped.invoke(message)
-                if hits:
-                    sources_event = {
-                        "sources": [
+                sources_event = {
+                    "sources": {
+                        scope: [
                             {
                                 "filename": h.metadata.get("filename"),
                                 "excerpt": h.page_content[:300],
-                                "scope": h.metadata.get("source"),
                             }
                             for h in hits
                         ]
+                        for scope, hits in hits_by_scope.items()
                     }
-                    job.append_chunk("sources", json.dumps(sources_event))
+                }
+                job.append_chunk("sources", json.dumps(sources_event))
+                all_hits = [h for hits in hits_by_scope.values() for h in hits]
+                if all_hits:
                     context_str = "\n\n".join(
-                        f"[{h.metadata.get('filename')}]: {h.page_content}" for h in hits
+                        f"[{h.metadata.get('filename')}]: {h.page_content}" for h in all_hits
                     )
-                    messages = messages[:-1] + [
-                        {"role": "system", "content": f"Use this retrieved context:\n{context_str}"},
-                        messages[-1],
-                    ]
+                    _replace_last_user_context(messages, context_str)
+                    used_context = True
             except Exception as e:
                 logger.exception("Retrieval failed; continuing without context: %s", e)
         # ──────────────────────────────────────────────────────────────
 
+        # Prepend the RAG system prompt only on turns that actually used
+        # per-turn context (inline files or RAG retrieval). Vanilla turns
+        # send no system message at all — no RAG-specific instructions
+        # to bias the model when there's no <context> tag in play. The
+        # system message is transient (in-memory for the LLM call only);
+        # storage stays clean with just user + assistant messages.
+        #
+        # `messages` stays as the saved-history list (no system message);
+        # `llm_messages` is the augmented copy that goes to the LLM.
+        llm_messages = messages
+        if used_context:
+            llm_messages = [{"role": "system", "content": RAG_SYSTEM_PROMPT}] + messages
+
         try:
-            async for chunk in self.chain.astream(messages):
+            async for chunk in self.chain.astream(llm_messages):
                 # If the user deleted the conversation mid-stream, stop early and
                 # do NOT call mark_completed or save_conversation — that would
                 # resurrect the deleted conversation in storage.
@@ -155,7 +204,7 @@ class ChatService:
                 content = None
                 if hasattr(chunk, "content"):
                     content = chunk.content
-                elif isinstance(chunk, dict) and "content" in chunk:
+                elif isinstance(chunk, "dict") and "content" in chunk:
                     content = chunk["content"]
                 elif isinstance(chunk, str):
                     content = chunk
@@ -187,12 +236,36 @@ class ChatService:
         # Save to history
         full_content = "".join(c["chunk"] for c in job.chunks if c["type"] == "token")
         full_thinking = "".join(c["chunk"] for c in job.chunks if c["type"] == "thinking")
+        # Sources are persisted alongside the message so they survive a page
+        # reload. The frontend's renderMessagesFromCache reads msg.sources
+        # and re-renders the block. None when RAG was off / inline files
+        # path was used (no sources chunk) — `None` is the canonical
+        # "no sources" value (vs. an empty dict, which means "searched but
+        # found nothing").
+        sources_obj = None
+        sources_chunks = [c["chunk"] for c in job.chunks if c["type"] == "sources"]
+        if sources_chunks:
+            sources_obj = json.loads(sources_chunks[0]).get("sources")
         messages.append({
             "role": "assistant",
             "content": full_content,
-            "thinking": full_thinking
+            "thinking": full_thinking,
+            "sources": sources_obj,
         })
         file_storage.save_conversation(conversation_id, messages)
 
     def get_history(self, conversation_id: str) -> dict | None:
-        return file_storage.get_conversation(conversation_id)
+        """Return the conversation history with <context>...</context>
+        blocks stripped from user messages. Disk retains the tagged form
+        (so subsequent LLM turns see their per-turn grounding); the
+        frontend sees clean user-typed content only."""
+        raw = file_storage.get_conversation(conversation_id)
+        if raw is None:
+            return None
+        cleaned = []
+        for m in raw.get("messages", []):
+            if m.get("role") == "user":
+                cleaned.append({**m, "content": _strip_context_tags(m.get("content", ""))})
+            else:
+                cleaned.append(m)
+        return {**raw, "messages": cleaned}

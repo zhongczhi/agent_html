@@ -51,11 +51,8 @@ def test_sources_chunk_serializes_with_type_field(temp_storage_dir):
     ]
 
     class _Stub:
-        def make_scoped_retriever(self, conv_id, top_k):
-            class _R:
-                def invoke(self, q, **_):
-                    return list(hits)
-            return _R()
+        def retrieve_by_scope(self, conv_id, query, top_k):
+            return {"library": list(hits), "uploads": []}
 
     chain = MagicMock()
     class _It:
@@ -79,7 +76,9 @@ def test_sources_chunk_serializes_with_type_field(temp_storage_dir):
     payload_str = sources_chunks[0]["chunk"]
     parsed = json.loads(payload_str)
     assert "sources" in parsed
-    assert parsed["sources"][0]["filename"] == "intro.md"
+    # Per-scope nested dict format (frontend iterates Object.entries)
+    assert parsed["sources"]["library"][0]["filename"] == "intro.md"
+    assert parsed["sources"]["uploads"] == []
 
     # And the serialized wire form (what the FE actually sees) is:
     wire = _serialize(sources_chunks[0])

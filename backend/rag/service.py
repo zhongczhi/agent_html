@@ -204,6 +204,26 @@ class RagService:
             conversation_id=conversation_id,
         )
 
+    def retrieve_by_scope(self, conversation_id: str, query: str, top_k: int) -> dict[str, list]:
+        """Search each scope independently and return hits grouped by scope.
+
+        Unlike make_scoped_retriever (which merges hits across scopes),
+        this preserves per-scope emptiness so the chat service can emit a
+        sources event even when every scope returned zero hits — letting
+        the frontend render an explicit "library: 0 / uploads: 0" empty
+        state instead of silently dropping the sources block.
+        """
+        library_hits = [
+            d for d in self.library_index.as_retriever(search_kwargs={"k": top_k}).invoke(query)
+            if not d.metadata.get("_placeholder")
+        ]
+        uploads_hits = [
+            d for d in self.uploads_index.as_retriever(search_kwargs={"k": top_k}).invoke(query)
+            if not d.metadata.get("_placeholder")
+            and d.metadata.get("conversation_id") == conversation_id
+        ]
+        return {"library": library_hits, "uploads": uploads_hits}
+
     # ── Misc ─────────────────────────────────────────────────────────
 
     def persist_all(self) -> None:

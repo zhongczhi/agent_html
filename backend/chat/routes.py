@@ -220,7 +220,11 @@ async def get_stream_status(conversation_id: str):
 
 @router.get("/history/{conversation_id}", response_model=ChatHistoryResponse)
 async def get_chat_history(conversation_id: str):
-    history = file_storage.get_conversation(conversation_id)
+    # Route through ChatService.get_history rather than file_storage directly
+    # so per-user <context>...</context> tags get stripped before the
+    # frontend sees them (disk keeps the tagged form for LLM grounding on
+    # subsequent turns).
+    history = get_chat_service().get_history(conversation_id)
     if history is None:
         return ChatHistoryResponse(conversation_id=conversation_id, messages=[])
     return ChatHistoryResponse(**history)

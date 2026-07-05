@@ -200,6 +200,13 @@ function renderMessagesFromCache(col, messages) {
                 smd.parser_end(parser);
                 applyLaTeX(contentDiv);
             }
+            // Re-render the sources block if the persisted message has one.
+            // Older conversations (pre-this-feature) have no sources field —
+            // renderSourcesBlock returns early when sourcesByScope is missing,
+            // so no error.
+            if (msg.sources) {
+                renderSourcesBlock(messageDiv, msg.sources);
+            }
         } else {
             addMessage(col, msg.role, msg.content);
         }
@@ -239,6 +246,13 @@ function renderCachedChunks(col) {
     let assistantMessage = null;
     let rawContent = '';
     let renderer = null, parser = null;
+    // Track sources extracted from the chunks cache so processStreamResponse
+    // can seed its `sources` variable. Without this, a resume that starts
+    // AFTER the sources chunk was already streamed leaves `sources = null`
+    // at data.end, so cache.appendToHistory saves the assistant message
+    // with sources=null. The next loadColumn re-renders without the
+    // sources block (msg.sources is falsy) and the block vanishes.
+    let sources = null;
 
     for (const data of chunksCache) {
         if (data.type === 'user') continue;
@@ -252,6 +266,17 @@ function renderCachedChunks(col) {
                     thinkingElement.textContent += data.chunk;
                     updateThinkingDisplay(assistantMessage);
                 }
+            } else if (data.type === 'sources') {
+                // Mid-stream reload (before data.end cleared the chunks cache):
+                // replay the sources block so it doesn't vanish when the user
+                // reloads the page while a stream is still in flight.
+                try {
+                    const ev = JSON.parse(data.chunk);
+                    sources = ev.sources || {};
+                    renderSourcesBlock(assistantMessage, sources);
+                } catch (e) {
+                    console.warn('Failed to replay sources chunk', e);
+                }
             } else if (data.type === 'token') {
                 rawContent += data.chunk;
                 const contentDiv = assistantMessage.querySelector('.message-content');
@@ -263,7 +288,7 @@ function renderCachedChunks(col) {
         }
     }
     col.el.scrollTop = col.el.scrollHeight;
-    return { assistantMessage, rawContent, renderer, parser };
+    return { assistantMessage, rawContent, renderer, parser, sources };
 }
 
 async function resumeStreamFromPosition(col, consumedCount) {
@@ -271,7 +296,7 @@ async function resumeStreamFromPosition(col, consumedCount) {
 
     const cached = cache.getHistory(convId);
     if (cached) renderMessagesFromCache(col, cached);
-    const { assistantMessage: cachedAssistant, rawContent: cachedRawContent, renderer: cachedRenderer, parser: cachedParser } = renderCachedChunks(col);
+    const { assistantMessage: cachedAssistant, rawContent: cachedRawContent, renderer: cachedRenderer, parser: cachedParser, sources: cachedSources } = renderCachedChunks(col);
 
     cache.setStreaming(convId, true);
     showStreamingBadge(true);
@@ -283,7 +308,7 @@ async function resumeStreamFromPosition(col, consumedCount) {
         if (!response.ok) {
             throw new Error(`Stream request failed: ${response.status}`);
         }
-        await processStreamResponse(col, response, cachedAssistant, cachedRawContent, cachedRenderer, cachedParser);
+        await processStreamResponse(col, response, cachedAssistant, cachedRawContent, cachedRenderer, cachedParser, cachedSources);
     } catch (error) {
         console.error('Stream error:', error);
         return false;
@@ -391,7 +416,7 @@ async function sendToColumn(col, message) {
     }
 }
 
-async function processStreamResponse(col, response, existingMessage = null, existingRawContent = '', existingRenderer = null, existingParser = null) {
+async function processStreamResponse(col, response, existingMessage = null, existingRawContent = '', existingRenderer = null, existingParser = null, existingSources = null) {
     const convId = col.conversationId;
     if (!convId) return;
 
@@ -405,6 +430,14 @@ async function processStreamResponse(col, response, existingMessage = null, exis
     let consumedCount = cache.getConsumed(convId);
     let rawContent = existingRawContent;
     let thinkingContent = thinkingElement ? thinkingElement.textContent : '';
+    // Captured during the sources chunk so we can persist it alongside the
+    // assistant message in localStorage at stream end — without this the
+    // sources block vanishes on the next page reload (cache hit path skips
+    // the backend). Seeded from `existingSources` (extracted by
+    // renderCachedChunks) so a resumed stream that starts AFTER the sources
+    // chunk was already streamed doesn't overwrite the history cache with
+    // sources=null at data.end.
+    let sources = existingSources;
     let sseBuffer = '';
     let renderer = existingRenderer, parser = existingParser;
 
@@ -436,7 +469,8 @@ async function processStreamResponse(col, response, existingMessage = null, exis
                     } else if (data.type === 'sources') {
                         try {
                             const ev = JSON.parse(data.chunk);
-                            renderSourcesBlock(assistantMessage, ev.sources || []);
+                            sources = ev.sources || {};
+                            renderSourcesBlock(assistantMessage, sources);
                         } catch (e) {
                             console.warn('Failed to parse sources chunk', e);
                         }
@@ -483,7 +517,8 @@ async function processStreamResponse(col, response, existingMessage = null, exis
                     cache.appendToHistory(convId, {
                         role: 'assistant',
                         content: rawContent.trim(),
-                        thinking: thinkingContent || ''
+                        thinking: thinkingContent || '',
+                        sources,
                     });
                     cache.clearChunks(convId);
                     return true;
@@ -598,40 +633,73 @@ function addAssistantPlaceholder(col) {
     return messageDiv;
 }
 
-function renderSourcesBlock(assistantMessageEl, sources) {
-    if (!assistantMessageEl || !sources || sources.length === 0) return;
+function renderSourcesBlock(assistantMessageEl, sourcesByScope) {
+    if (!assistantMessageEl) return;
+    if (!sourcesByScope || typeof sourcesByScope !== 'object') return;
     // Show-sources toggle (iter-8 Phase F): if OFF, don't add the block to
     // the DOM at all. Pre-existing blocks (from earlier chunks in this
     // message) are hidden via applySourcesVisibility() instead.
     if (!cache.getShowSources()) return;
-    const existing = assistantMessageEl.parentElement?.querySelector('.sources-block[data-for="assistant"]');
+
+    // Replace any existing block for this message so a re-emitted sources
+    // event (or a re-render after reload) doesn't pile up duplicate blocks.
+    // Scoped to the message element itself — the block lives inside it, so
+    // there's no ambiguity across multi-turn conversations.
+    const existing = assistantMessageEl.querySelector('.sources-block');
     if (existing) existing.remove();
+
+    // Total hits across all scopes for the header count.
+    let totalHits = 0;
+    for (const hits of Object.values(sourcesByScope)) {
+        if (Array.isArray(hits)) totalHits += hits.length;
+    }
 
     const block = document.createElement('div');
     block.className = 'sources-block';
     block.dataset.for = 'assistant';
     const header = document.createElement('div');
     header.className = 'sources-header';
-    header.textContent = `Sources (${sources.length})`;
+    header.textContent = totalHits > 0 ? `Sources (${totalHits})` : 'Sources';
     block.appendChild(header);
-    for (const s of sources) {
-        const row = document.createElement('div');
-        row.className = 'src-row';
-        const scope = document.createElement('span');
-        scope.className = 'src-scope';
-        scope.textContent = `[${s.scope || '?'}]`;
-        row.appendChild(scope);
-        const filename = document.createElement('span');
-        filename.textContent = ` ${s.filename || '?'}`;
-        row.appendChild(filename);
-        if (s.excerpt) {
-            const excerpt = document.createElement('span');
-            excerpt.textContent = ` — ${s.excerpt.slice(0, 200)}${s.excerpt.length > 200 ? '…' : ''}`;
-            row.appendChild(excerpt);
+
+    // Per-scope rendering. The dict key IS the scope (library / uploads),
+    // so each source doesn't carry its own `scope` field. When a scope has
+    // zero hits we render a single "[scope] No matches" row so the user
+    // can see RAG was actually consulted across both scopes — a silently
+    // dropped sources block would hide that fact.
+    for (const [scope, hits] of Object.entries(sourcesByScope)) {
+        if (!Array.isArray(hits) || hits.length === 0) {
+            const emptyRow = document.createElement('div');
+            emptyRow.className = 'src-row empty';
+            emptyRow.textContent = `[${scope}] No matches`;
+            block.appendChild(emptyRow);
+            continue;
         }
-        block.appendChild(row);
+        for (const s of hits) {
+            const row = document.createElement('div');
+            row.className = 'src-row';
+            const scopeTag = document.createElement('span');
+            scopeTag.className = 'src-scope';
+            scopeTag.textContent = `[${scope}]`;
+            row.appendChild(scopeTag);
+            const filename = document.createElement('span');
+            filename.textContent = ` ${s.filename || '?'}`;
+            row.appendChild(filename);
+            if (s.excerpt) {
+                const excerpt = document.createElement('span');
+                excerpt.textContent = ` — ${s.excerpt.slice(0, 200)}${s.excerpt.length > 200 ? '…' : ''}`;
+                row.appendChild(excerpt);
+            }
+            block.appendChild(row);
+        }
     }
-    assistantMessageEl.parentElement?.insertBefore(block, assistantMessageEl);
+
+    // Append inside the assistant message element (after the .message-body
+    // which is its first child). Block-level child stacks below the body in
+    // the bubble's normal block flow, so it appears at the bottom of the
+    // response content. The wrapper's flex row no longer squashes it since
+    // it's a grandchild of the wrapper, not a direct child.
+    assistantMessageEl.appendChild(block);
 }
 
 function updateThinkingDisplay(messageElement) {
@@ -789,6 +857,15 @@ function addPairToList(pair) {
 }
 
 function renderSidebarHeader() {
+    // Library tab has no global conversation actions — Upload/Reindex live
+    // inside the library view's own header. Hide the sidebar-header strip
+    // entirely so its New Chat / batch-delete controls don't leak across tabs.
+    if (cache.getCurrentSidebarTab() === 'library') {
+        sidebarHeader.hidden = true;
+        sidebarHeader.innerHTML = '';
+        return;
+    }
+    sidebarHeader.hidden = false;
     sidebarHeader.innerHTML = '';
     if (selectionMode) {
         const wrap = document.createElement('div');
@@ -1194,6 +1271,7 @@ function applyActiveTab() {
     if (isLib && selectionMode) {
         exitSelectionMode();
     }
+    renderSidebarHeader();
     if (isLib) {
         renderLibraryView();
     } else {
@@ -1357,12 +1435,6 @@ async function handleLibraryDelete(filename) {
         return;
     }
     await renderLibraryView();
-}
-
-function formatBytes(n) {
-    if (n < 1024) return `${n} B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function formatRelativeTime(unixSeconds) {

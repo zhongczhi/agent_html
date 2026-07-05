@@ -69,6 +69,9 @@
             min-height: 70px;
             box-sizing: border-box;
         }
+        .sidebar-header[hidden] {
+            display: none;
+        }
         .new-chat-btn {
             background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
             color: var(--bg-primary);
@@ -286,6 +289,10 @@
             color: var(--accent, #7aa2f7);
             font-weight: 600;
             margin-right: 6px;
+        }
+        .sources-block .src-row.empty {
+            color: var(--text-muted, #888);
+            font-style: italic;
         }
         .upload-status {
             font-size: 12px;
@@ -904,6 +911,9 @@
     overflow-y: auto;
     padding: 0.75rem;
     gap: 0.5rem;
+}
+.library-view[hidden] {
+    display: none;
 }
 
 .library-header {
