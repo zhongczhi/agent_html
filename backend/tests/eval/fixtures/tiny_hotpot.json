@@ -1,0 +1,33 @@
+[
+  {
+    "_id": "aaa111",
+    "question": "Q1?",
+    "answer": "A1",
+    "type": "bridge",
+    "level": "easy",
+    "supporting_facts": [["Title A", 0], ["Title A", 1]],
+    "context": [
+      ["Title A", ["s0", "s1"]],
+      ["Title B", ["t0", "t1"]],
+      ["Title C", ["u0"]]
+    ]
+  },
+  {
+    "_id": "bbb222",
+    "question": "Q2?",
+    "answer": "A2",
+    "type": "comparison",
+    "level": "medium",
+    "supporting_facts": [["Title X", 0]],
+    "context": [["Title X", ["x0"]], ["Title Y", ["y0", "y1"]]]
+  },
+  {
+    "_id": "ccc333",
+    "question": "Q3?",
+    "answer": "yes",
+    "type": "comparison",
+    "level": "hard",
+    "supporting_facts": [["Title M", 0], ["Title N", 0]],
+    "context": [["Title M", ["m0"]], ["Title N", ["n0"]], ["Title O", ["o0"]]]
+  }
+]
