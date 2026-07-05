@@ -1,8 +1,8 @@
 """Run the HotpotQA retrieval evaluation pipeline. CLI only.
 
-Strictly isolated from chat: this script and backend/eval/* import nothing
-from backend/chat/. The isolation is verified by a grep guard in task 7 of
-the implementation plan.
+Isolated from chat: this script and the backend/eval package import
+nothing from the chat domain. The isolation is verified by a grep guard
+(task 7 of the implementation plan).
 """
 from __future__ import annotations
 
