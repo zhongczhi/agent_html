@@ -38,7 +38,8 @@ README_PATH = LIBRARY_DIR / "README.md"
 #     (canonical, official download.sh reference; sometimes times out)
 #   - https://huggingface.co/datasets/hotpot_qa (community-uploaded mirror,
 #     raw JSON may be under a sub-path; check the dataset's Files tab)
-HOTPOTQA_URL = "http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json"
+HOTPOTQA_URL = "https://web.archive.org/web/20250512032701id_/http://curtis.ml.cmu.edu/datasets/\
+hotpot/hotpot_dev_distractor_v1.json"
 
 README_TEXT = """# HotpotQA Library Data
 
@@ -85,21 +86,29 @@ def copy_local_to_cache(local: Path) -> Path:
 
 def download_or_use_cache(force: bool, url: str) -> Path:
     """Download the JSON if absent or `force` is True; cache it at CACHE_PATH.
-    Returns CACHE_PATH on success. Exits 1 with diagnostic on repeated failure."""
+    Returns CACHE_PATH on success. Exits 1 with diagnostic on repeated failure.
+
+    Uses `requests` (not urllib) on purpose: the Wayback Machine's cert chain
+    fails strict RFC 5280 verification under Python's default ssl context
+    ("Basic Constraints of CA cert not marked critical"). Chrome and
+    requests tolerate it; urllib does not. requests's certifi bundle is
+    more permissive on this specific legacy chain.
+    """
     if CACHE_PATH.exists() and not force:
         return CACHE_PATH
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     last_err: Exception | None = None
     for attempt in (0, 1):
         try:
-            import urllib.request
+            import requests
 
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "agent_html/iter-9"}
+            resp = requests.get(
+                url,
+                headers={"User-Agent": "agent_html/iter-9"},
+                timeout=60,
             )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = resp.read()
-            CACHE_PATH.write_bytes(data)
+            resp.raise_for_status()
+            CACHE_PATH.write_bytes(resp.content)
             return CACHE_PATH
         except Exception as e:
             last_err = e
