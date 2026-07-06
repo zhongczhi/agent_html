@@ -34,17 +34,16 @@ class RagService:
         self.settings = settings
         self.embeddings = embeddings
 
-        # Anchor paths to the REPO root — same pattern as backend/storage/
-        # file_storage.py which uses Path(__file__).parent.parent.parent /
-        # "storage". This way uvicorn can be started from any directory and
-        # paths still resolve correctly. An earlier version used
-        # `parent.parent` (= <repo>/backend) by mistake, which made
-        # <repo>/storage/library/hotpotqa/ invisible to _walk_library and
-        # caused Reindex to silently fall back to a stray sibling dir.
-        repo_root = Path(__file__).parent.parent.parent
-        self.library_dir = (repo_root / settings.rag_library_dir).resolve()
-        self.uploads_dir = (repo_root / settings.rag_uploads_dir).resolve()
-        self.rag_dir = (repo_root / settings.rag_index_dir).resolve()
+        # Anchor paths to <repo>/backend/. Default RagSettings values
+        # ("storage/library", "storage/uploads", "storage/rag") resolve to
+        # <repo>/backend/storage/{library,uploads,rag}, keeping all RAG
+        # runtime state under one tree owned by the backend package. The
+        # legacy conversation storage at <repo>/storage/conversations.json
+        # (via file_storage.py) is unchanged.
+        backend_root = Path(__file__).parent.parent
+        self.library_dir = (backend_root / settings.rag_library_dir).resolve()
+        self.uploads_dir = (backend_root / settings.rag_uploads_dir).resolve()
+        self.rag_dir = (backend_root / settings.rag_index_dir).resolve()
 
         # Index files are tagged with the embedding backend name. This prevents
         # the silent-failure mode where switching EMBEDDING_BACKEND loads a stale

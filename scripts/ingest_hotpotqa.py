@@ -21,8 +21,13 @@ from pathlib import Path
 log = logging.getLogger("ingest_hotpotqa")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Library lives under <repo>/backend/storage/library/ so it sits where the
+# RagService looks (RagService resolves RagSettings.rag_library_dir relative
+# to backend/). The hotpotqa/ subfolder keeps multiple ingest sources
+# isolated from direct uploads to the library.
+BACKEND_ROOT = REPO_ROOT / "backend"
 CACHE_PATH = REPO_ROOT / "scripts" / ".cache" / "hotpot_dev_distractor_v1.json"
-LIBRARY_DIR = REPO_ROOT / "storage" / "library" / "hotpotqa"
+LIBRARY_DIR = BACKEND_ROOT / "storage" / "library" / "hotpotqa"
 README_PATH = LIBRARY_DIR / "README.md"
 
 # HotpotQA dev-distractor (CC BY-SA 4.0). The default URL is the canonical

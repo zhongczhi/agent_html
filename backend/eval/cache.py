@@ -15,7 +15,9 @@ from backend.rag.vector_store import load_or_init, save
 log = logging.getLogger(__name__)
 
 # Default cache root. Tests monkeypatch this attribute to a tmp dir.
-EVAL_CACHE_ROOT = Path("storage/eval/hotpotqa/cache")
+# Resolved relative to <repo>/backend/ so it sits under the same tree as
+# the RAG library / uploads / index dirs (see backend/rag/service.py).
+EVAL_CACHE_ROOT = Path(__file__).parent.parent / "storage" / "eval" / "hotpotqa" / "cache"
 
 
 def _build_index(item: HotpotQaItem, embeddings: Embeddings) -> FAISS:

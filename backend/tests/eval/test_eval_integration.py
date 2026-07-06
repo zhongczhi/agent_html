@@ -9,7 +9,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "eval_hotpotqa.py"
 FIXTURE = ROOT / "backend" / "tests" / "eval" / "fixtures" / "integration_hotpot.json"
-CACHE_ROOT = ROOT / "storage" / "eval" / "hotpotqa" / "cache"
+CACHE_ROOT = ROOT / "backend" / "storage" / "eval" / "hotpotqa" / "cache"
 
 
 @pytest.fixture(autouse=True)

@@ -25,7 +25,9 @@ htmlcov/
 # Storage (runtime data)
 storage/conversations.json
 backend/storage/rag/
-storage/rag/
+backend/storage/library/
+backend/storage/uploads/
+backend/storage/eval/
 
 # Todo
 todo.md
@@ -35,5 +37,3 @@ todo.md
 
 # HotpotQA iteration 9 — bulky data + cache
 scripts/.cache/
-storage/eval/
-storage/library/hotpotqa/
