@@ -16,6 +16,25 @@ import { cache } from './cache.js';
 // (User feedback: "one conversation in the conversation list, in which
 // there will be two panels".)
 
+function bucketLabel(iso, now = new Date()) {
+    if (!iso) return 'OLDER';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return 'OLDER';
+    const dayStart = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+    const days = Math.round((dayStart(now) - dayStart(d)) / 86_400_000);
+    if (days === 0) return 'TODAY';
+    if (days === 1) return 'YESTERDAY';
+    if (days > 1 && days <= 7) {
+        return d.toLocaleDateString(undefined, { weekday: 'long' }).toUpperCase();
+    }
+    if (d.getFullYear() === now.getFullYear()) {
+        return d.toLocaleDateString(undefined, { month: 'long', day: 'numeric' })
+                 .toUpperCase();
+    }
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })
+            .toUpperCase();
+}
+
 // DOM elements ---------------------------------------------------------------
 const sidebar = document.getElementById('sidebar');
 const sidebarHeader = document.getElementById('sidebarHeader');
