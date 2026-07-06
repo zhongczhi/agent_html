@@ -809,12 +809,22 @@ async function loadPairsList() {
             }
         }
 
-        // 3. Render pair list, sorted by updated_at desc
+        // 3. Render pair list, sorted by updated_at desc, grouped by time bucket
         const sortedPairs = Object.values(pairs).sort(
             (a, b) => (b.updated_at || '').localeCompare(a.updated_at || '')
         );
-        for (const p of sortedPairs) {
-            addPairToList(p);
+        let currentLabel = null;
+        for (const pair of sortedPairs) {
+            const label = bucketLabel(pair.updated_at);
+            if (label !== currentLabel) {
+                currentLabel = label;
+                const hdr = document.createElement('div');
+                hdr.className = 'time-group-header';
+                hdr.textContent = label;
+                hdr.setAttribute('aria-hidden', 'true');
+                conversationList.appendChild(hdr);
+            }
+            addPairToList(pair);
         }
     } catch (error) {
         console.error('Failed to load pairs:', error);
