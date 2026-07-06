@@ -941,12 +941,22 @@
     background: var(--bg-hover, #2a2a2a);
 }
 
-.library-error {
+.library-message {
     width: 100%;
-    color: #ff6b6b;
     font-size: 0.8rem;
     margin-top: 0.25rem;
     min-height: 1em;
+}
+
+.library-message-error {
+    color: #ff6b6b;
+}
+
+.library-message-info {
+    /* Bright enough to read on the dark sidebar without competing with
+     * the file-list rows. Hue chosen to sit next to the existing
+     * --accent without clashing. */
+    color: #6bcf80;
 }
 
 .library-empty {

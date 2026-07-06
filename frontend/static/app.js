@@ -1317,7 +1317,7 @@ async function renderLibraryView() {
     header.appendChild(reindexBtn);
 
     const errorMsg = document.createElement('div');
-    errorMsg.className = 'library-error';
+    errorMsg.className = 'library-message';
     errorMsg.id = 'libraryErrorMsg';
     header.appendChild(errorMsg);
 
@@ -1371,8 +1371,20 @@ async function renderLibraryView() {
 }
 
 function setLibraryError(msg) {
+    // Backward-compat wrapper used by upload/delete handlers. New code
+    // should prefer setLibraryMessage(..., 'error' | 'info') so success
+    // state gets a distinct color.
+    setLibraryMessage(msg, 'error');
+}
+
+function setLibraryMessage(msg, kind) {
     const el = document.getElementById('libraryErrorMsg');
-    if (el) el.textContent = msg || '';
+    if (!el) return;
+    el.textContent = msg || '';
+    // Modifiers drive color via CSS (.library-message-info vs -error).
+    // Default class keeps element collapsed with min-height so the header
+    // doesn't reflow when message appears/disappears.
+    el.className = 'library-message' + (kind === 'info' ? ' library-message-info' : ' library-message-error');
 }
 
 async function handleLibraryUpload(event) {
@@ -1398,16 +1410,25 @@ async function handleLibraryUpload(event) {
 }
 
 async function handleLibraryReindex() {
-    setLibraryError('');
+    // Show in-flight state immediately so a long reindex isn't mistaken
+    // for a dead button (the old handler was silent and re-rendered the
+    // same view, which read as "nothing happened").
+    setLibraryMessage('Reindexing…', 'info');
     try {
         const resp = await fetch('/api/rag/library/reindex', { method: 'POST' });
+        const body = await resp.json().catch(() => ({}));
         if (!resp.ok) {
-            const detail = (await resp.json()).detail || resp.statusText;
-            setLibraryError(`Reindex failed: ${detail}`);
+            setLibraryMessage(`Reindex failed: ${body.detail || resp.statusText}`, 'error');
             return;
         }
+        const files = body.files_processed ?? 0;
+        const chunks = body.chunks_added ?? 0;
+        const errors = body.errors?.length ?? 0;
+        const summary = `Reindexed ${chunks} chunk${chunks === 1 ? '' : 's'} from ${files} file${files === 1 ? '' : 's'}`;
+        const tail = errors > 0 ? ` (${errors} error${errors === 1 ? '' : 's'})` : '';
+        setLibraryMessage(summary + tail, errors > 0 ? 'error' : 'info');
     } catch (e) {
-        setLibraryError(`Reindex failed: ${e.message}`);
+        setLibraryMessage(`Reindex failed: ${e.message}`, 'error');
         return;
     }
     await renderLibraryView();

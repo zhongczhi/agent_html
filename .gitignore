@@ -25,6 +25,7 @@ htmlcov/
 # Storage (runtime data)
 storage/conversations.json
 backend/storage/rag/
+storage/rag/
 
 # Todo
 todo.md
