@@ -35,6 +35,56 @@ function bucketLabel(iso, now = new Date()) {
             .toUpperCase();
 }
 
+function setupSidebarResizer() {
+    const sidebar = document.getElementById('sidebar');
+    const handle = document.getElementById('sidebarResizer');
+    if (!sidebar || !handle) return;
+
+    const sync = () => {
+        if (sidebar.classList.contains('collapsed')) {
+            handle.setAttribute('hidden', '');
+        } else {
+            handle.removeAttribute('hidden');
+        }
+    };
+    sync();
+    new MutationObserver(sync).observe(sidebar, {
+        attributes: true,
+        attributeFilter: ['class'],
+    });
+
+    let startX = 0;
+    let startWidth = 0;
+    let dragging = false;
+
+    handle.addEventListener('pointerdown', (e) => {
+        startX = e.clientX;
+        startWidth = sidebar.getBoundingClientRect().width;
+        dragging = true;
+        handle.setPointerCapture(e.pointerId);
+        handle.classList.add('dragging');
+        document.body.classList.add('sidebar-dragging');
+    });
+
+    handle.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const next = Math.min(600, Math.max(200, startWidth + (e.clientX - startX)));
+        sidebar.style.width = `${next}px`;
+    });
+
+    function endDrag(e) {
+        if (!dragging) return;
+        dragging = false;
+        handle.classList.remove('dragging');
+        document.body.classList.remove('sidebar-dragging');
+        try { handle.releasePointerCapture(e.pointerId); } catch (_) {}
+    }
+    handle.addEventListener('pointerup', endDrag);
+    handle.addEventListener('pointercancel', endDrag);
+}
+
+setupSidebarResizer();
+
 // DOM elements ---------------------------------------------------------------
 const sidebar = document.getElementById('sidebar');
 const sidebarHeader = document.getElementById('sidebarHeader');
