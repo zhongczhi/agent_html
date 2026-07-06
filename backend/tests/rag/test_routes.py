@@ -341,3 +341,61 @@ def test_stats_includes_library_files_count(rag_client, tmp_path):
     assert resp.status_code == 200
     body = resp.json()
     assert body["library_files"] == 2
+
+
+# ── iter-9: recursive list + subpath delete via REST ─────────────────────────
+
+
+def test_library_files_endpoint_is_recursive(rag_client, tmp_path):
+    """Regression: GET /api/rag/library/files used list_library_files()
+    which used iterdir() and hid subdirs. After iter-9 the endpoint must
+    return relative paths for files at any depth."""
+    client, _ = rag_client
+    lib = tmp_path / "library"
+    (lib / "top.md").write_text("top-level", encoding="utf-8")
+    sub = lib / "hotpotqa"
+    sub.mkdir(exist_ok=True)
+    (sub / "qa1.md").write_text("nested", encoding="utf-8")
+
+    # Force a fresh service from the populated dir
+    rag_client[1].library_dir = lib  # type: ignore[attr-defined]
+
+    resp = client.get("/api/rag/library/files")
+    assert resp.status_code == 200
+    names = {f["filename"] for f in resp.json()["files"]}
+    assert "top.md" in names
+    assert "hotpotqa/qa1.md" in names
+
+
+def test_library_file_delete_accepts_subpath_filename(rag_client, tmp_path):
+    """Regression: DELETE /api/rag/library/file/{filename} used to reject
+    names with '/'. Iter-9 allows subpaths so users can remove files
+    visible in the recursive listing."""
+    client, _ = rag_client
+    lib = tmp_path / "library"
+    sub = lib / "hotpotqa"
+    sub.mkdir(parents=True, exist_ok=True)
+    target = sub / "qa42.md"
+    target.write_text("to be removed", encoding="utf-8")
+    rag_client[1].library_dir = lib  # type: ignore[attr-defined]
+
+    resp = client.delete("/api/rag/library/file/hotpotqa/qa42.md")
+    assert resp.status_code == 200
+    assert not target.exists()
+
+
+def test_library_file_delete_rejects_traversal_via_subpath(rag_client, tmp_path):
+    """A traversal-shaped filename must be rejected with 400, never 5xx.
+    Note: literal `..` in the URL is normalized by Starlette (route returns
+    404 for `/api/rag/library/file/../escape.md` before reaching our handler),
+    so we URL-encode the slash. `_safe_library_path` still sees the literal
+    `..` and raises ValueError → the route translates to 400."""
+    client, _ = rag_client
+    lib = tmp_path / "library"
+    lib.mkdir(exist_ok=True)
+    rag_client[1].library_dir = lib  # type: ignore[attr-defined]
+
+    # `..%2Fescape.md` decodes to `../escape.md`, passes through as a single
+    # path segment under `{filename:path}`, then trips _safe_library_path.
+    resp = client.delete("/api/rag/library/file/..%2Fescape.md")
+    assert resp.status_code == 400

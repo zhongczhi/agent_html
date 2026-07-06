@@ -82,15 +82,19 @@ def library_upload(file: UploadFile = File(...)):
     return {"filename": file.filename, "size": path.stat().st_size, "saved": True}
 
 
-@router.delete("/library/file/{filename}")
+@router.delete("/library/file/{filename:path}")
 def library_file_delete(filename: str):
     svc = _service_or_503()
-    # Path-traversal and dotfile guards — filenames are taken straight from
-    # the URL path; user-controlled filenames must be strictly validated.
-    if "/" in filename or "\\" in filename or filename.startswith("."):
-        raise HTTPException(status_code=400, detail="Invalid filename")
+    # Iter-9: filenames may now contain '/' (subpaths like
+    # `hotpotqa/<id>.md`). Traversal is blocked at the service layer by
+    # _safe_library_path, which raises ValueError for escape attempts.
+    # We translate that to 400 here so the route doesn't 500.
     _check_extension(filename)
-    if not svc.delete_library_file(filename):
+    try:
+        deleted = svc.delete_library_file(filename)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not deleted:
         raise HTTPException(status_code=404, detail="Not found")
     return {"deleted": True, "filename": filename}
 

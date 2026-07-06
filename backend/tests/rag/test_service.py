@@ -168,3 +168,87 @@ def test_reindex_library_handles_mixed_formats(tmp_path: Path):
         assert "conversation_id" not in d.metadata
         # All chunks from this run have the new chunk_id formula.
         assert d.metadata["chunk_id"] == _chunk_id(d.metadata["filename"], d.page_content)
+
+
+# ── iter-9: recursive listing + safe subpath filename resolution ────────────
+
+
+def test_list_library_files_is_recursive_and_returns_relative_paths(tmp_path: Path):
+    """Regression: list_library_files used iterdir() (top-level only) which
+    hid files in subdirs like `library/hotpotqa/`. After the iter-9 fix
+    it must walk every depth and return paths relative to library_dir."""
+    lib = tmp_path / "library"
+    lib.mkdir()
+    (lib / "top.md").write_text("top-level file", encoding="utf-8")
+    sub = lib / "hotpotqa"
+    sub.mkdir()
+    (sub / "qa1.md").write_text("question 1", encoding="utf-8")
+    (sub / "deep" / "nested.md").mkdir(parents=True)
+    sub2 = lib / "datasets" / "v2"
+    sub2.mkdir(parents=True)
+    (sub2 / "doc.md").write_text("deeply nested", encoding="utf-8")
+    # A non-allowlisted file should still be skipped.
+    (lib / "ignored.bin").write_bytes(b"\x00\x01")
+
+    svc = _service(tmp_path)
+    # Override library_dir because _service() builds it under tmp_path/lib
+    # from a relative Path in RagSettings, which differs from tmp_path / "library"
+    # since the settings string is relative to backend_root. We rebuilt it
+    # above directly under tmp_path; point the service there.
+
+    svc.library_dir = lib
+
+    files = svc.list_library_files()
+    names = {f["filename"] for f in files}
+
+    assert "top.md" in names
+    assert "hotpotqa/qa1.md" in names
+    # Path.resolve normalizes case + separators; just confirm the depth-walk
+    # found anything below the top level.
+    assert any("/" in n for n in names), f"expected subpath, got {names!r}"
+    assert "ignored.bin" not in names  # extension-filter still applied
+
+
+def test_safe_library_path_rejects_traversal(tmp_path: Path):
+    """`_safe_library_path` is the single guard against path traversal when
+    filenames contain '/'. Each entry here has to stay inside library_dir."""
+    from backend.rag.service import _safe_library_path
+    lib = tmp_path / "library"
+    lib.mkdir()
+
+    # OK: simple filename, simple subpath, multi-level subpath
+    assert _safe_library_path(lib, "a.md") == lib / "a.md"
+    assert _safe_library_path(lib, "hotpotqa/qa1.md") == lib / "hotpotqa" / "qa1.md"
+    assert _safe_library_path(lib, "deep/nested/file.md") == lib / "deep" / "nested" / "file.md"
+
+    # Bad: traversal attempts — should each raise ValueError
+    for bad in ("../escape.md", "hotpotqa/../escape.md", "..", ".", "/etc/passwd", "C:/Windows/foo"):
+        with pytest.raises(ValueError):
+            _safe_library_path(lib, bad)
+
+
+def test_delete_library_file_accepts_subpath_filename(tmp_path: Path):
+    """Regression: delete should work for files in subdirs, matching the
+    recursive list_library_files(). Traversal attempts blocked."""
+    from backend.rag.service import _safe_library_path
+    lib = tmp_path / "library"
+    lib.mkdir()
+    sub = lib / "hotpotqa"
+    sub.mkdir()
+    target = sub / "qa99.md"
+    target.write_text("to be deleted", encoding="utf-8")
+
+    svc = _service(tmp_path)
+    svc.library_dir = lib
+
+    # Service-level delete via subpath
+    assert svc.delete_library_file("hotpotqa/qa99.md") is True
+    assert not target.exists()
+
+    # But traversal-shaped names raise ValueError even if such a file
+    # accidentally exists outside the tree.
+    outside = tmp_path / "outside.md"
+    outside.write_text("do not touch me", encoding="utf-8")
+    with pytest.raises(ValueError):
+        svc.delete_library_file("../outside.md")
+    assert outside.exists()  # untouched

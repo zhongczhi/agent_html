@@ -29,6 +29,33 @@ def _walk_library(library_dir: Path) -> list[Path]:
     )
 
 
+def _safe_library_path(library_dir: Path, filename: str) -> Path:
+    """Resolve library_dir/filename and confirm it stays inside library_dir.
+
+    Used by save/delete to accept subpath filenames (e.g. `hotpotqa/<id>.md`)
+    while still blocking path-traversal attempts like `../foo` or `/etc/passwd`.
+    Raises ValueError with a diagnostic for any escape.
+    """
+    if not filename or filename in ("", ".", ".."):
+        raise ValueError(f"Invalid filename: {filename!r}")
+    # Reject leading separators and Windows drive letters up front — the
+    # relative_to check below would also catch them, but failing fast gives
+    # a clearer error.
+    if filename[0] in ("/", "\\") or (len(filename) >= 2 and filename[1] == ":"):
+        raise ValueError(f"Invalid filename: {filename!r}")
+    # Reject any `..` path component explicitly (relative_to would also
+    # catch escape, but a clean ValueError here is friendlier).
+    parts = filename.replace("\\", "/").split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise ValueError(f"Invalid filename (path component escape): {filename!r}")
+    target = (library_dir / filename).resolve()
+    try:
+        target.relative_to(library_dir.resolve())
+    except ValueError:
+        raise ValueError(f"Invalid filename (escapes library_dir): {filename!r}")
+    return target
+
+
 class RagService:
     def __init__(self, settings: RagSettings, embeddings: Embeddings):
         self.settings = settings
@@ -137,17 +164,20 @@ class RagService:
     # ── Library management (iter-8 Phase D) ──────────────────────────
 
     def list_library_files(self) -> list[dict]:
-        """Return metadata for every allowlisted file in library_dir,
-        sorted alphabetically. Used by the library sidebar tab."""
+        """Return metadata for every allowlisted file in library_dir at any
+        depth, sorted by path relative to library_dir. Used by the library
+        sidebar tab. Iter-9: was iterdir() (top-level only) — invisible to
+        anything stashed in a subdir like `library/hotpotqa/`.
+        """
         if not self.library_dir.exists():
             return []
         files: list[dict] = []
-        for p in self.library_dir.iterdir():
+        for p in sorted(self.library_dir.rglob("*")):
             if not p.is_file() or p.suffix.lower() not in ALLOWED_EXTENSIONS:
                 continue
             stat = p.stat()
             files.append({
-                "filename": p.name,
+                "filename": p.relative_to(self.library_dir).as_posix(),
                 "size": stat.st_size,
                 "modified_at": stat.st_mtime,
             })
@@ -158,10 +188,12 @@ class RagService:
         reindex so the file is queryable immediately. Caller must validate
         filename + extension (routes do this)."""
         self.library_dir.mkdir(parents=True, exist_ok=True)
-        dest = self.library_dir / filename
+        dest = _safe_library_path(self.library_dir, filename)
+        # `mkstemp` requires a single-component prefix on Windows; use the
+        # basename so subdir writes don't error on a '/' in `prefix`.
         tmp_fd, tmp_path = tempfile.mkstemp(
             dir=str(self.library_dir),
-            prefix=f".{filename}.",
+            prefix=f".{dest.name}.",
             suffix=".tmp",
         )
         try:
@@ -186,7 +218,10 @@ class RagService:
     def delete_library_file(self, filename: str) -> bool:
         """Delete library_dir/<filename> and auto-reindex. Returns True if
         the file existed."""
-        target = self.library_dir / filename
+        try:
+            target = _safe_library_path(self.library_dir, filename)
+        except ValueError:
+            raise
         if not target.exists() or not target.is_file():
             return False
         target.unlink()
