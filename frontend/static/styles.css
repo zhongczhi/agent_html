@@ -45,6 +45,8 @@
         }
         .sidebar {
             width: 280px;
+            min-width: 200px;
+            max-width: 600px;
             background: var(--bg-secondary);
             border-right: 1px solid var(--border-color);
             display: flex;
@@ -55,6 +57,31 @@
         }
         .sidebar.collapsed {
             margin-left: -280px;
+        }
+        .sidebar-resizer {
+            position: absolute;
+            right: -2px;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            cursor: col-resize;
+            z-index: 11;
+            border-radius: 2px;
+            transition: background 0.15s ease;
+        }
+        .sidebar-resizer:hover,
+        .sidebar-resizer.dragging {
+            background: linear-gradient(90deg,
+                transparent 0%,
+                var(--accent-cyan) 50%,
+                transparent 100%);
+        }
+        .sidebar.collapsed .sidebar-resizer {
+            display: none;
+        }
+        body.sidebar-dragging {
+            cursor: col-resize;
+            user-select: none;
         }
         .sidebar-header {
             padding: 16px;
