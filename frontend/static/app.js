@@ -705,10 +705,6 @@ function addAssistantPlaceholder(col) {
 function renderSourcesBlock(assistantMessageEl, sourcesByScope) {
     if (!assistantMessageEl) return;
     if (!sourcesByScope || typeof sourcesByScope !== 'object') return;
-    // Show-sources toggle (iter-8 Phase F): if OFF, don't add the block to
-    // the DOM at all. Pre-existing blocks (from earlier chunks in this
-    // message) are hidden via applySourcesVisibility() instead.
-    if (!cache.getShowSources()) return;
 
     // Replace any existing block for this message so a re-emitted sources
     // event (or a re-render after reload) doesn't pile up duplicate blocks.
@@ -769,6 +765,15 @@ function renderSourcesBlock(assistantMessageEl, sourcesByScope) {
     // response content. The wrapper's flex row no longer squashes it since
     // it's a grandchild of the wrapper, not a direct child.
     assistantMessageEl.appendChild(block);
+
+    // Show-sources toggle (iter-8 Phase F): always render the block so it
+    // exists in the DOM, then honor the current toggle by hiding it when
+    // OFF. Without this, a block created while the toggle is OFF would never
+    // appear after the user flips it back ON — applySourcesVisibility can
+    // only toggle visibility of existing elements.
+    if (!cache.getShowSources()) {
+        block.style.display = 'none';
+    }
 }
 
 function updateThinkingDisplay(messageElement) {
@@ -884,7 +889,12 @@ async function loadPairsList() {
 function addPairToList(pair) {
     const div = document.createElement('div');
     let classes = 'conversation-item';
-    if (pair.pair_id === activePairId) classes += ' active';
+    // Active highlight (current chat) is suppressed in batch-delete
+    // mode: the checkbox on each row is the only selection marker,
+    // so layering the cyan-purple gradient on top would mix two
+    // meanings of "selected". Re-applied on exit because exit
+    // re-runs addPairToList through loadPairsList.
+    if (!selectionMode && pair.pair_id === activePairId) classes += ' active';
     if (selectionMode && selectedPairIds.has(pair.pair_id)) classes += ' selected';
     div.className = classes;
     div.dataset.id = pair.pair_id;
@@ -1065,6 +1075,17 @@ async function switchToPair(pairId) {
     activePairId = pairId;
     cache.setBaseConversationId(pairId);
 
+    // Toggle the sidebar's .active class BEFORE the streaming
+    // reconciliation: when the target pair's stream is still active,
+    // checkStreamStatus awaits resumeStreamFromPosition, which only
+    // returns at data.end — so a post-await toggle would lag the
+    // messages-area switch by the stream's remaining duration. The
+    // subsequent loadPairsList re-renders and re-applies the active
+    // class via addPairToList's activePairId check.
+    document.querySelectorAll('.conversation-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.id === pairId);
+    });
+
     // For each sub-conv locally flagged as streaming, probe the backend
     // and reconcile in a single round-trip. checkStreamStatus will:
     //   - resume the stream if the backend still has it active
@@ -1078,9 +1099,6 @@ async function switchToPair(pairId) {
             .map(c => checkStreamStatus(c))
     );
 
-    document.querySelectorAll('.conversation-item').forEach(el => {
-        el.classList.toggle('active', el.dataset.id === pairId);
-    });
     // Re-render the sidebar so the badge reflects the reconciled state.
     await loadPairsList();
 
