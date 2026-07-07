@@ -1,6 +1,10 @@
 import pytest
 
-from backend.eval.metrics import paragraph_recall_at_k, supporting_fact_metrics
+from backend.eval.metrics import (
+    answer_coverage_at_k,
+    paragraph_recall_at_k,
+    supporting_fact_metrics,
+)
 
 
 def test_paragraph_recall_at_k_empty_gold_vacuous():
@@ -51,3 +55,48 @@ def test_sf_metrics_em_one_iff_exact_set_match():
     assert supporting_fact_metrics(["b", "a"], {"a", "b"})[3] == 1.0
     # Extra retrieved -> em=0
     assert supporting_fact_metrics(["a", "b", "c"], {"a", "b"})[3] == 0.0
+
+
+def test_answer_coverage_empty_gold_vacuous():
+    # Vacuous: an empty gold answer is treated as "already covered" so
+    # we don't divide by zero and so degenerate items don't tank the mean.
+    assert answer_coverage_at_k([], "") == 1.0
+    assert answer_coverage_at_k(["anything"], "") == 1.0
+
+
+def test_answer_coverage_empty_retrieved_zero():
+    assert answer_coverage_at_k([], "yes") == 0.0
+
+
+def test_answer_coverage_exact_match():
+    assert answer_coverage_at_k(["The answer is yes."], "yes") == 1.0
+
+
+def test_answer_coverage_case_insensitive():
+    assert answer_coverage_at_k(["...YES..."], "yes") == 1.0
+
+
+def test_answer_coverage_punctuation_stripped():
+    # Gold has a comma; doc doesn't — should still match.
+    assert answer_coverage_at_k(["Born in 1968"], "1968,") == 1.0
+
+
+def test_answer_coverage_no_match():
+    assert answer_coverage_at_k(["foo bar baz"], "qux") == 0.0
+
+
+def test_answer_coverage_across_multiple_docs():
+    # Gold answer is a multi-word phrase that spans two retrieved paragraphs.
+    assert answer_coverage_at_k(
+        ["The composer was", "born in 1968 in Berlin."],
+        "1968 in Berlin",
+    ) == 1.0
+
+
+def test_answer_coverage_multiline_inside_one_doc():
+    # Paragraphs retrieved from FAISS may contain embedded newlines from
+    # the original Wikipedia source.
+    assert answer_coverage_at_k(
+        ["line one\nline two contains YES in it\nline three"],
+        "yes",
+    ) == 1.0
