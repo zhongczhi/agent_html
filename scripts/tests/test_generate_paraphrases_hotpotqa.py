@@ -126,31 +126,49 @@ def test_three_calls_per_question_made_concurrently(dataset_path, output_path):
 
 
 def test_validation_gate_retries_leaked_paraphrase(dataset_path, output_path):
-    """First attempt leaks the answer; second attempt is clean -> accepted."""
+    """First attempt leaks the answer; retry is clean -> accepted.
 
-    async def leaking_then_clean(*args, **kwargs):
+    Mock uses per-style counters so that for each style, the FIRST call leaks
+    and the SECOND call (the retry) is clean. q1 (gold="John Smith") has all
+    3 first-passes leak -> 3 retries, all clean -> all 3 styles accepted.
+    q2 (gold="yes") - the leaked text mentions "John Smith" but not "yes",
+    so q2's first-pass passes validation, no retry needed.
+    Total API calls: 6 (q1: 3 first + 3 retry) + 3 (q2: 3 first, no retry) = 9.
+    """
+    attempt_per_style = {"lexical": 0, "structural": 0, "casual": 0}
+
+    async def first_leak_retry_clean(*args, **kwargs):
         system = kwargs.get("system", "")
-        call_count = getattr(leaking_then_clean, "_n", 0)
-        leaking_then_clean._n = call_count + 1
-        # Even-numbered calls leak; odd-numbered are clean.
-        if call_count % 2 == 0:
-            if "lexical" in system.lower():
+        if "lexical" in system.lower():
+            style = "lexical"
+        elif "structural" in system.lower():
+            style = "structural"
+        elif "casual" in system.lower():
+            style = "casual"
+        else:
+            raise AssertionError(f"unexpected system prompt: {system!r}")
+        attempt_per_style[style] += 1
+        n = attempt_per_style[style]
+        if n % 2 == 1:
+            # First attempt for this style: leak.
+            if style == "lexical":
                 return _mock_text_response("When was John Smith born?")
-            if "structural" in system.lower():
+            if style == "structural":
                 return _mock_text_response("John Smith was born in which year?")
-            if "casual" in system.lower():
+            if style == "casual":
                 return _mock_text_response("when was John Smith born?")
         else:
-            if "lexical" in system.lower():
+            # Retry for this style: clean.
+            if style == "lexical":
                 return _mock_text_response("Which writer was born in 1968?")
-            if "structural" in system.lower():
+            if style == "structural":
                 return _mock_text_response("The composer was born in which year?")
-            if "casual" in system.lower():
+            if style == "casual":
                 return _mock_text_response("when was the composer born?")
-        raise AssertionError(f"unexpected system prompt: {system!r}")
+        raise AssertionError("unreachable")
 
     mock_client = MagicMock()
-    mock_client.messages.create = AsyncMock(side_effect=leaking_then_clean)
+    mock_client.messages.create = AsyncMock(side_effect=first_leak_retry_clean)
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
@@ -162,13 +180,16 @@ def test_validation_gate_retries_leaked_paraphrase(dataset_path, output_path):
         ])
 
     assert rc == 0
-    # 2 questions × 3 styles × 2 attempts = 12 calls (all leak first, all retry).
-    assert mock_client.messages.create.call_count == 12
+    # q1: 3 first + 3 retry = 6 calls. q2: 3 first (no retry) = 3 calls. Total: 9.
+    assert mock_client.messages.create.call_count == 9
 
     items = load_paraphrases(output_path)
     assert "q1" in items
     # q1 has all 3 styles accepted after retry.
     assert set(items["q1"]["paraphrases"].keys()) == {"lexical", "structural", "casual"}
+    # q2 also has all 3 styles (its gold "yes" is not in the leaked text).
+    assert "q2" in items
+    assert set(items["q2"]["paraphrases"].keys()) == {"lexical", "structural", "casual"}
 
 
 def test_validation_gate_skips_double_failure(dataset_path, output_path):
