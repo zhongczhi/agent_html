@@ -99,6 +99,44 @@ class TestConversationList:
         assert result[0]["title"] == "A" * 50 + "..."
         assert len(result[0]["title"]) == 53  # 50 + "..."
 
+    def test_get_conversation_list_title_strips_context_tag_prefix(self, temp_storage_dir):
+        """When the first user message is wrapped in a <context>...</context>
+        block (left over from an inline-file upload or RAG retrieval), the
+        conversation-list title must show only the user's typed text.
+        Without stripping, the title leaks `<context>[filename.md]: user text`.
+        """
+        file_storage, _ = temp_storage_dir
+
+        # On-disk form ChatService.generate_background saves for a turn that
+        # attached an inline file or used RAG retrieval.
+        tagged = (
+            "<context>\n[5ae824295542997ec272772f.md]: some file content\n"
+            "</context>\n\nabout the topic"
+        )
+        file_storage.save_conversation("c1", [{"role": "user", "content": tagged}])
+
+        result = file_storage.get_conversation_list()
+        assert len(result) == 1
+        title = result[0]["title"]
+        assert "<context>" not in title
+        assert "</context>" not in title
+        assert "[5ae824295542997ec272772f.md]" not in title
+        # The actual user query survives in the truncated window.
+        assert "about the topic" in title
+
+    def test_get_conversation_list_title_falls_back_when_only_context(self, temp_storage_dir):
+        """If the first user message contains ONLY a context block with no
+        user content (defensive — shouldn't happen, but cheap to handle),
+        the title falls back to 'New conversation' instead of leaking the
+        empty stripped form or the raw `<context>` chunk."""
+        file_storage, _ = temp_storage_dir
+
+        tagged = "<context>\n[doc.md]: fact\n</context>"
+        file_storage.save_conversation("c2", [{"role": "user", "content": tagged}])
+
+        result = file_storage.get_conversation_list()
+        assert result[0]["title"] == "New conversation"
+
 
 class TestDeleteConversation:
     def test_delete_conversation(self, temp_storage_dir):

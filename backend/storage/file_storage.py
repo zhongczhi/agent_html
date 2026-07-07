@@ -1,12 +1,21 @@
 import json
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+# Same pattern as chat.service._CONTEXT_TAG_RE — kept local because
+# service.py imports from this module, so the reverse direction would be
+# circular. The <context>...</context> wrapper is appended to a user
+# message before it is saved to disk (for LLM grounding on subsequent
+# turns), so any user-facing rendering of "first message → title" must
+# strip it first to avoid leaking "<context>[filename.md]: ".
+_CONTEXT_TAG_RE = re.compile(r"<context>[\s\S]*?</context>\s*")
 
 STORAGE_DIR = Path(__file__).parent.parent.parent / "storage"
 CONVERSATIONS_FILE = STORAGE_DIR / "conversations.json"
@@ -131,6 +140,10 @@ def get_conversation_list() -> List[Dict[str, Any]]:
     for conv_id, conv_data in conversations.items():
         messages = conv_data.get("messages", [])
         first_msg = messages[0]["content"] if messages else ""
+        # Strip any <context>...</context> wrapper that ChatService
+        # prepends for LLM grounding, so the sidebar title shows the
+        # user's typed text instead of "<context>[filename.md]: …".
+        first_msg = _CONTEXT_TAG_RE.sub("", first_msg).strip()
         title = first_msg[:50] + "..." if len(first_msg) > 50 else first_msg
 
         result.append({
