@@ -603,6 +603,92 @@ Styles live in `frontend/static/styles.css`; app logic in `frontend/static/app.j
 
 ---
 
+## 16. HotpotQA Library Data + Retrieval Eval Pipeline (Iteration 9)
+
+A real evaluation dataset (`hotpot_dev_distractor_v1.json`, CC BY-SA 4.0) is ingested into the chat library and a separate, retrieval-only evaluation pipeline measures how well retrieval actually works. The chat core is unchanged; the eval pipeline sits orthogonally next to chat and is forbidden from importing anything under `backend/chat/`.
+
+### FR-30: HotpotQA Library Ingestion
+
+| ID | Requirement |
+|----|-------------|
+| FR-30.1 | `scripts/ingest_hotpotqa.py` is a CLI that downloads `hotpot_dev_distractor_v1.json` from `https://hotpotqa.github.io/` (CC BY-SA 4.0) and caches the file at `scripts/.cache/hotpot_dev_distractor_v1.json`. SHA-256 of the file is the `dataset_sha` cache key referenced by FR-31.7. |
+| FR-30.2 | The script writes one `.md` file per question into `storage/library/hotpotqa/<qid>.md` where `<qid>` is the hotpot `_id` slugified to `[a-zA-Z0-9_-]+` (non-conforming characters replaced with `_`). |
+| FR-30.3 | Each file's body has YAML-style frontmatter with the four fields: `question_id`, `question_type` (`"bridge"` \| `"comparison"`), `question_level` (`"easy"` \| `"medium"` \| `"hard"`), and `source: hotpotqa`. |
+| FR-30.4 | Each paragraph from the question's `context` becomes an H1 section (`# Title`) followed by the joined paragraph text (sentences joined with a single space, no period added). The number of H1 sections in the file equals the number of non-empty paragraphs in `context`. |
+| FR-30.5 | The library file body **never** contains the question text, the gold `answer`, or any gold `supporting_facts` — those fields stay in the JSON only. |
+| FR-30.6 | The CLI exposes a `--subset N` flag and a `--full` flag in a mutually-exclusive group; `--full` is the default. `--subset 0` and `--subset 1` are rejected with a usage error (not silently noop). |
+| FR-30.7 | The `--subset N` option produces a stratified sample by `(type, level)` bucket (6 buckets). For each bucket, sample `min(ceil(N / 6), len(bucket))` items deterministically via `random.Random(42)`. Bucket cap prevents over-sampling when N is large. |
+| FR-30.8 | The CLI exposes a `--force` flag that re-downloads the dataset even if the cached copy exists. |
+| FR-30.9 | The CLI is idempotent: re-running on an unchanged dataset is a no-op for files whose content matches what would be written. Per-question file writes are atomic via `tmp + os.replace`. A half-written file from a crashed prior run is replaced on the next attempt. |
+| FR-30.10 | The CLI emits the dataset attribution (`Dataset: HotpotQA dev_distractor v1 (CC BY-SA 4.0 — https://hotpotqa.github.io/)`) to stdout once at the start of a run. |
+| FR-30.11 | The CLI writes `storage/library/hotpotqa/README.md` on first run (or whenever missing), containing the dataset name, source URL, and a one-line license notice. |
+| FR-30.12 | Network errors during download trigger one retry after a 5-second wait; the second failure exits non-zero with a download URL printed. |
+| FR-30.13 | Per-question schema errors (missing `_id`, `context`, etc.) are logged as WARNING and the question is skipped; the final summary lists skipped IDs. Whole-file `JSONDecodeError` exits non-zero with a "fix the file or re-download" hint. |
+
+### FR-31: Eval Pipeline (CLI Only)
+
+| ID | Requirement |
+|----|-------------|
+| FR-31.1 | `scripts/eval_hotpotqa.py` is a standalone CLI. It does **not** register any HTTP route. It does **not** import anything from `backend/chat/`. |
+| FR-31.2 | The CLI exposes a `--subset N | --full` mutually-exclusive group; `--full` is the default. The semantics match FR-30.7. |
+| FR-31.3 | The CLI exposes a `--k N` flag for retrieval depth. Default is 4 (matches the FR-25 `top_k` default). |
+| FR-31.4 | The CLI exposes a `--no-cache` flag that forces rebuild of every per-question FAISS index. |
+| FR-31.5 | The CLI exposes a `--fixture PATH` flag for tests; the dataset path is taken from `--fixture` first, otherwise from `scripts/.cache/hotpot_dev_distractor_v1.json`, otherwise the CLI exits with download instructions. |
+| FR-31.6 | For each question in the chosen subset, the script builds a transient FAISS index from the question's 10 distractor paragraphs as Documents (one paragraph per Document). The chunking pipeline used by chat (`MarkdownTextSplitter`) is NOT used here — paragraph granularity is preserved verbatim to keep the metric stable across reindex-config changes. |
+| FR-31.7 | Each per-question index is persisted at `storage/eval/hotpotqa/cache/{dataset_sha[:16]}/{qid}/` (containing FAISS's `index.faiss` and `index.pkl`). The path directory `dataset_sha[:16]` is the cache-invalidation prefix: any change to the dataset JSON destroys all cached indices atomically. |
+| FR-31.8 | On each cache lookup: if `--no-cache` is set OR the cache directory doesn't exist, build + save and report `hit=False`; otherwise load and report `hit=True`. If loading raises (corrupted cache), `shutil.rmtree` the cache dir, rebuild + save, log WARNING, report `hit=False`. |
+| FR-31.9 | `backend/eval/hotpotqa.py` exposes `gold_paragraph_titles(item)` returning the set of distinct paragraph titles appearing in the item's `supporting_facts`. Titles are deduplicated (the same title at multiple sentence indices contributes once). |
+| FR-31.10 | `backend/eval/metrics.py` exposes `paragraph_recall_at_k(retrieved_titles, gold_titles) -> float`. Returns 1.0 vacuously when `gold_titles` is empty. Otherwise returns `min(hits, len(gold_titles)) / len(gold_titles)` where `hits` is the number of `retrieved_titles` entries (with duplicates counted) that are in `gold_titles`. |
+| FR-31.11 | `backend/eval/metrics.py` exposes `supporting_fact_metrics(retrieved_titles, gold_titles) -> tuple[precision, recall, f1, em]` with the standard set-comparison formulas. Edge cases: empty gold + empty retrieved → all four are 1.0; empty gold + non-empty retrieved → `(0, 1, 0, 0)`; non-empty gold + empty retrieved → all four are 0; non-empty gold + non-empty retrieved → standard formulas. |
+| FR-31.12 | The terminal output reports the 5 metrics from FR-31.10–31.11 plus `paragraph_recall@{args.k}` averaged over the successfully-evaluated subset, the count of successfully evaluated questions (out of attempted), the cache hit / build split, the error count, and elapsed seconds. Attribution header (`Dataset: HotpotQA ... CC BY-SA 4.0 ...`) is printed once before the metric block. |
+| FR-31.13 | The CLI exits 0 when the run completes (per-question errors during retrieval are logged at WARNING and counted toward the `errors` field; they do not affect exit code). The CLI exits 1 only on setup failure (dataset missing, dataset `JSONDecodeError`, embedding model load failure). |
+| FR-31.14 | Partial-result runs (some questions errored, some succeeded) are valid: the metric block shows both `successfully evaluated` and `attempted`, and exits 0. |
+
+### FR-32: Isolation Guarantees
+
+| ID | Requirement |
+|----|-------------|
+| FR-32.1 | `scripts/eval_hotpotqa.py` imports nothing from `backend/chat/` (verified by `grep -r "backend.chat" scripts/eval_hotpotqa.py backend/eval/` returning no results). |
+| FR-32.2 | The eval pipeline may import: `backend.rag.embeddings` (sentence-transformers factory), `backend.rag.vector_store` (`load_or_init` / `save`), and `backend.eval.*`. These are pure primitives. |
+| FR-32.3 | The eval pipeline never reads the `storage/library/` directory; it does not depend on the global library FAISS index existing. |
+| FR-32.4 | The ingest pipeline never touches the FAISS indexes. Library reindex remains the existing `POST /api/rag/library/reindex` flow. |
+
+### FR-33: HotpotQA Attribution
+
+| ID | Requirement |
+|----|-------------|
+| FR-33.1 | A `storage/library/hotpotqa/README.md` file documents the dataset name, source URL, and CC BY-SA 4.0 license. Created by the ingest script when absent. |
+| FR-33.2 | The eval script prints a one-line attribution header to stdout before the metric block. |
+
+### FR-34: Paraphrase Robustness Eval (Iteration 10 predecessor)
+
+| ID | Requirement |
+|----|-------------|
+| FR-34.1 | `scripts/generate_paraphrases_hotpotqa.py` is a CLI that produces 3 styled paraphrases (`lexical`, `structural`, `casual`) per HotpotQA question via 3 concurrent LLM calls. Output is persisted to `backend/storage/eval/hotpotqa/paraphrases/{dataset_sha}.json` keyed by qid. |
+| FR-34.2 | Each paraphrase is validated against a token-overlap gate (`backend.eval.paraphrases.validate_paraphrase`): ≥80% overlap of gold-answer tokens in the paraphrase → reject. Empty paraphrase or empty gold answer → reject. |
+| FR-34.3 | Per-style generation flow: first attempt → validate → on rejection, one retry → validate → on second rejection, that style is omitted from the output entry for that qid. Other styles are kept. |
+| FR-34.4 | Generation is idempotent: qids already in the output JSON are skipped unless `--force` is passed. |
+| FR-34.5 | `scripts/eval_hotpotqa.py --paraphrase-set PATH` extends the eval to compute per-variant metrics: original question + each available paraphrase. Output reports `answer_coverage@k`, `paragraph_recall@k`, `sf_recall@k` per variant, plus aggregate `mean_ans_cov@k` and `robustness@4` (fraction of qids whose all 4 variants succeed). |
+| FR-34.6 | The generator imports from `backend.eval.*` and `anthropic`. It does NOT import from `backend.chat.*` (same isolation rule as FR-32). |
+
+### NFR-12: No chat coupling
+
+The eval pipeline (`scripts/eval_hotpotqa.py` + `backend/eval/`) imports nothing from `backend/chat/`. A grep check is added to the manual smoke test (`grep -r "backend\\.chat" backend/eval/`).
+
+### NFR-13: Cache safety
+
+The per-question cache directory is wiped before rebuild when loading fails. The disk format follows FAISS's native `save_local` / `load_local` round-trip. A corrupt cache never blocks the run — the rebuild path is exercised automatically.
+
+### NFR-14: Deterministic subset sampling
+
+`random.Random(42)` is the only source of randomness in the sampling path. Two runs with `--subset N` (and the same dataset version) produce the same set of qids and the same evaluation order.
+
+### NFR-15: No new dependencies
+
+No additions to `requirements.txt`. `sentence-transformers`, `FAISS` (via `langchain_community`), `langchain_core`, `anthropic`, and stdlib `json` / `hashlib` / `argparse` / `asyncio` are sufficient.
+
+---
+
 ## Out of Scope (Future)
 
 - Authentication / API key management

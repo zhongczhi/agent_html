@@ -1310,3 +1310,124 @@ Frontend verification is manual for v1: page loads with both panels empty, type-
 8. **Auth on `/api/rag/library/reindex`** — when the app leaves local-only.
 9. **Chunk deduplication** — manifest-based skip-if-unchanged during library reindex.
 10. **Persist pending inline files** to disk (e.g., `storage/inline_uploads/`) so a server restart doesn't lose small-upload context.
+
+---
+
+## 16. HotpotQA Library Ingest + Retrieval Eval Pipeline (Iteration 9)
+
+The eval pipeline sits orthogonally next to chat. Chat core, the chat-time library reindex path, the chat-time RAG chain, and the frontend are unchanged. Two CLI scripts (`scripts/ingest_hotpotqa.py`, `scripts/eval_hotpotqa.py`) share a small pure-Python package at `backend/eval/`. The chat-time library uses HotpotQA files as if they were user-uploaded documents; the eval pipeline reads the dataset JSON directly and builds its own transient per-question FAISS indices.
+
+### 16.1 Architecture Decisions
+
+**16.1.1 One Markdown File Per Question (Not Per Paragraph)**: Library ingest writes one `.md` per question with each paragraph as an H1 section in the same file. The existing `MarkdownTextSplitter` (in `backend/rag/splitter.py`) splits at H1 boundaries during library reindex, so each H1 section becomes one chunk automatically with `header_path` set to the paragraph title. ~7,405 files instead of ~74k — git, IDEs, and `find` stay snappy. Trade-off: slight index inflation from duplicate paragraph text (~5–15% estimated) due to shared Wikipedia paragraphs across questions.
+
+**16.1.2 Frontmatter-Only Metadata (No Gold Leakage)**: Each library file's frontmatter contains `question_id`, `question_type`, `question_level`, `source` — never `question`, `answer`, or `supporting_facts`. If the question text or gold answer landed in a chunk, a chat-time retrieval against that chunk would let the model see the ground-truth answer in its own context — a trivial form of contamination. Chat UX doesn't need the question or answer in the library; it needs the paragraphs.
+
+**16.1.3 Separate CLI Scripts (No Shared Library Code Beyond Pure Primitives)**: Two scripts share: the downloaded JSON at `scripts/.cache/hotpot_dev_distractor_v1.json`, and a small set of helpers in `backend/eval/` (`hotpotqa.py`, `metrics.py`, `cache.py`). The eval pipeline is forbidden from importing anything under `backend/chat/`. The import surface it may use: `backend.rag.embeddings` (the sentence-transformers factory), `backend.rag.vector_store` (`load_or_init` / `save`), and `backend.eval.*`. A grep guard verifies this at review time.
+
+**16.1.4 Paragraph-Level Document in the Eval Index (Not MarkdownTextSplitter)**: `backend/eval/cache.py::_build_index` constructs `Document(page_content=paragraph_text, metadata={...})` for each paragraph in `item.context` — no splitter is invoked. The chat pipeline's `MarkdownTextSplitter` will produce paragraph-level chunks for these files only if each H1 section is short enough relative to `rag_chunk_size`; decoupling the eval's retrieval granularity from the chat pipeline's chunking decisions keeps the metric stable across reindex-config changes.
+
+**16.1.5 SHA-Keyed On-Disk Cache for Per-Question Indices**: `backend/eval/cache.py::load_or_build` keys the cache directory by `dataset_sha[:16]` (sha256 of the dataset JSON). Each question gets its own subdirectory `cache/{dataset_sha[:16]}/{qid}/` containing FAISS's native `index.faiss` + `index.pkl`. Re-downloading the JSON (e.g., if HotpotQA updates the dataset) busts all caches atomically.
+
+**16.1.6 Dataset Auto-Download + .cache Stash**: `scripts/ingest_hotpotqa.py` is the canonical way to acquire the dataset. It downloads once, stashes at `scripts/.cache/hotpot_dev_distractor_v1.json`. `scripts/eval_hotpotqa.py` reads from the stash (or from `--fixture PATH` for tests).
+
+**16.1.7 CC BY-SA 4.0 Attribution in Two Places**: Attribution lives at the file level (`storage/library/hotpotqa/README.md` — written by ingest) and at the run level (eval script prints attribution to stdout before the metric block). The CC BY-SA 4.0 license is a requirement of using the dataset.
+
+**16.1.8 Stratified Sample With Deterministic Seed**: `--subset N` samples `min(ceil(N / 6), len(bucket))` items from each of the 6 `(type, level)` buckets using `random.Random(42)`. The sampled set is concatenated and shuffled with the same RNG.
+
+**16.1.9 Exit Codes: Partial Errors Are Non-Fatal**: `--subset N` or `--full` runs always exit 0 unless setup fails. Per-question retrieval errors are logged at WARNING and counted in the `errors` field.
+
+**16.1.10 Paraphrase Generator Concurrency**: `scripts/generate_paraphrases_hotpotqa.py` runs 3 concurrent LLM calls per question (one per style) via `asyncio.gather`. Each style's task fires its first attempt, validates, and conditionally retries. The 3 tasks run concurrently so wall-clock per question ≈ 2× a single API call's latency (first + possible retry) rather than 3×.
+
+### 16.2 Module Layout
+
+```
+backend/eval/
+├── __init__.py
+├── hotpotqa.py         # HotpotQaItem dataclass, load(), dataset_sha(), gold_paragraph_titles(), sample()
+├── metrics.py          # paragraph_recall_at_k(), supporting_fact_metrics(), answer_coverage_at_k()
+├── cache.py            # load_or_build(), EVAL_CACHE_ROOT, _build_index()
+└── paraphrases.py      # validate_paraphrase(), load_paraphrases(), lookup(), required_styles()
+
+backend/tests/eval/
+├── __init__.py
+├── fixtures/
+│   ├── tiny_hotpot.json           # 3-question fixture for hotpotqa.py tests
+│   └── integration_hotpot.json    # 5-question fixture for the eval_integration test
+├── test_metrics.py     # pure-function unit tests
+├── test_hotpotqa.py    # loader + sha + gold_paragraph_titles + sample
+├── test_cache.py       # per-question FAISS cache + corruption recovery
+├── test_paraphrases.py # validate / load / lookup / required_styles
+├── test_eval_integration.py   # subprocess-driven end-to-end with synthetic JSON
+└── test_answer_coverage.py    # answer_coverage_at_k pure-function tests
+
+scripts/
+├── ingest_hotpotqa.py        # CLI: download + write library files
+├── eval_hotpotqa.py          # CLI: run the eval pipeline
+└── generate_paraphrases_hotpotqa.py  # CLI: produce 3 styled paraphrases per question
+
+storage/library/hotpotqa/
+└── README.md           # generated by ingest; one-line license notice
+
+storage/eval/hotpotqa/
+├── cache/{dataset_sha[:16]}/{qid}/  # FAISS indices (gitignored)
+└── paraphrases/{dataset_sha}.json   # paraphrase entries keyed by qid (gitignored)
+
+scripts/.cache/
+└── hotpot_dev_distractor_v1.json  # generated by ingest; gitignored
+```
+
+### 16.3 Configuration
+
+No new env vars. No new config fields. Reuses existing `EMBEDDING_BACKEND` and the sentence-transformers model wired up in `backend/rag/embeddings.py`. The paraphrase generator uses `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` (default `minimax-3`).
+
+### 16.4 Error Handling
+
+| Stage | Failure | Behavior |
+|---|---|---|
+| Ingest: download | Network error | One retry after 5s; second failure exits 1 with download URL. |
+| Ingest: per-question write | Permission error / disk full | Log path, continue with remaining. Exit non-zero if any file failed. |
+| Ingest: whole-file `JSONDecodeError` | JSON corrupt | Exit 1 with "fix the file or re-download" hint. |
+| Ingest: per-question schema error | Missing fields | Log WARNING with qid, skip, continue. Final summary lists skipped IDs. |
+| Eval: dataset missing | Path doesn't exist | Print expected path + download instructions, exit 1. |
+| Eval: dataset corrupt (`JSONDecodeError`) | Parse fails | Print exception tail, exit 1. |
+| Eval: embedding model load | sentence-transformers not installed | Fail fast with `pip install -r requirements.txt` hint, exit 1. |
+| Eval: per-question cache corrupted | `load_local` raises | `shutil.rmtree(cache_path, ignore_errors=True)`, rebuild, WARNING log, continue. |
+| Eval: per-question retrieval | Embedding call raises (transient) | Log WARNING, count as errored, skip rest of run unaffected. |
+| Paraphrase: validation gate reject | Token overlap ≥80% | One retry; on second rejection that style is omitted. Other styles kept. |
+| Paraphrase: API rate limit (429) | MiniMax endpoint throttling | Backoff + retry handled by Anthropic client. Run continues. |
+
+### 16.5 Testing Strategy
+
+Layers:
+- **Metrics unit** (`test_metrics.py`, `test_answer_coverage.py`) — pure tests, no fixtures, <5 ms each.
+- **Paraphrase unit** (`test_paraphrases.py`) — pure validate/load/lookup tests, <5 ms each.
+- **Loader unit** (`test_hotpotqa.py`) — uses `tiny_hotpot.json`, <50 ms each.
+- **Cache unit** (`test_cache.py`) — uses `FakeEmbeddings` and tmp dir, <500 ms each.
+- **Generator integration** (`scripts/tests/test_generate_paraphrases_hotpotqa.py`) — mocks `AsyncAnthropic`, verifies concurrency, retry, idempotence, schema. <1 s each.
+- **Eval integration** (`test_eval_integration.py`) — invokes `scripts/eval_hotpotqa.py` via subprocess with synthetic JSON. Asserts exit 0, all metric labels, cache hit/build split. <5 s.
+
+Manual smoke test (full scale):
+```bash
+python scripts/ingest_hotpotqa.py --full   # ~minutes
+python scripts/eval_hotpotqa.py --full --k 4   # minutes cold, seconds warm
+python scripts/generate_paraphrases_hotpotqa.py --subset 100   # ~minutes
+python scripts/eval_hotpotqa.py --subset 100 --paraphrase-set <JSON> --k 4
+```
+
+### 16.6 Future Work (post-iter-9, documented but out of scope)
+
+1. **LLM-based answer evaluation** (`answer_em`, `answer_f1`) — would require calling `minimax-3` per question, doubling eval cost and adding API-key dependencies at eval-time.
+2. **`/api/eval/` route** — CLI only by design; UI integration deferred.
+3. **JSON output (`--json-out`)** — easy add later if downstream tooling wants to consume eval results.
+4. **Per-type / per-level breakdown in default output** — already implemented for paraphrase-eval pipeline (per `(type, level)` bucket); base eval output still uses aggregate only.
+5. **HotpotQA `fullwiki` setting** — requires a separate 5M+ Wikipedia paragraph corpus ingestion pipeline.
+6. **Multi-process or distributed evaluation.**
+7. **Incremental cache invalidation beyond dataset SHA change.**
+8. **CI hookup for the eval script.**
+9. **Embedding-recipe sweeps** (automatically try multiple `EMBEDDING_BACKEND` values).
+10. **Cross-encoder re-ranking on top of FAISS results.**
+11. **Sentence-level supporting-fact metrics** (would require LLM-based extraction).
+12. **Surface-attribution in the library sidebar UI** when files with `source=hotpotqa` are present (would require frontend changes).
+13. **Multi-pass retrieval** (Hop 2 using Hop-1 results to refine the query) — interesting follow-up for true multi-hop performance, but requires the fullwiki pipeline.
+14. **Smarter validation gate** for paraphrase generation (entity-aware prompt, non-zero retry temperature, larger retry budget) — see iteration 10.
