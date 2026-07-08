@@ -57,6 +57,18 @@ def output_path(tmp_path):
     return tmp_path / "paraphrases.json"
 
 
+@pytest.fixture(autouse=True)
+def _patch_pacing(monkeypatch):
+    """Disable 5-second API pacing for unit tests so they stay fast.
+
+    The generator's `_generate_one_style` does `await asyncio.sleep(PACING_SECONDS)`
+    before each API call. With PACING_SECONDS=5, a single 2-question × 3-style
+    test would take 30+ seconds. We monkeypatch to 0 here so tests run in
+    milliseconds. Production behavior (5s pacing) is verified manually.
+    """
+    monkeypatch.setattr(gen, "PACING_SECONDS", 0)
+
+
 def _mock_text_response(text: str) -> MagicMock:
     """Build a fake Anthropic Messages API response with one text block."""
     block = MagicMock()
@@ -193,7 +205,15 @@ def test_validation_gate_retries_leaked_paraphrase(dataset_path, output_path):
 
 
 def test_validation_gate_skips_double_failure(dataset_path, output_path):
-    """Both attempts leak -> that style is omitted from output, others kept."""
+    """All 3 attempts leak for a style -> that style is omitted from output.
+
+    With the iter-10 3-attempt budget, every style gets 3 chances before
+    being skipped. q1 (gold="John Smith") leaks all 9 attempts (3 styles × 3
+    attempts) -> no entry. q2 (gold="yes") - the leaked text mentions "John
+    Smith" but not "yes", so q2's first-pass passes validation, no retry
+    needed (3 attempts per style, only 1 fires).
+    Total API calls: 9 (q1) + 3 (q2) = 12.
+    """
 
     async def always_leak(*args, **kwargs):
         # Always mention the gold answer.
@@ -212,11 +232,77 @@ def test_validation_gate_skips_double_failure(dataset_path, output_path):
         ])
 
     assert rc == 0
+    # q1: 3 styles × 3 attempts = 9 calls. q2: 3 first attempts (clean) = 3 calls.
+    assert mock_client.messages.create.call_count == 12
     items = load_paraphrases(output_path)
-    # q1 (gold='John Smith') -> all 3 styles leak -> no entry.
+    # q1 (gold='John Smith') -> all 9 attempts leak -> no entry.
     assert "q1" not in items
     # q2 (gold='yes') -> 'yes' doesn't appear in any of the leaked outputs
     # because the leaked text says "John Smith" but not "yes" -> all 3 accepted.
+    assert "q2" in items
+    assert set(items["q2"]["paraphrases"].keys()) == {"lexical", "structural", "casual"}
+
+
+def test_three_attempt_budget_accepts_on_third_try(dataset_path, output_path):
+    """First 2 attempts leak; 3rd attempt is clean -> accepted.
+
+    Uses per-style attempt counters. Attempts 1 and 2 leak for each style;
+    attempt 3 is clean. q1 should have all 3 styles accepted (after 9 calls).
+    q2's gold "yes" doesn't appear in the leaked text, so q2's first-pass
+    passes (no retry needed) → 3 calls.
+    Total API calls: 9 (q1) + 3 (q2) = 12.
+    """
+    attempt_per_style = {"lexical": 0, "structural": 0, "casual": 0}
+
+    async def leak_twice_clean_third(*args, **kwargs):
+        system = kwargs.get("system", "")
+        if "lexical" in system.lower():
+            style = "lexical"
+        elif "structural" in system.lower():
+            style = "structural"
+        elif "casual" in system.lower():
+            style = "casual"
+        else:
+            raise AssertionError(f"unexpected system prompt: {system!r}")
+        attempt_per_style[style] += 1
+        n = attempt_per_style[style]
+        if n <= 2:  # first 2 attempts leak
+            if style == "lexical":
+                return _mock_text_response("When was John Smith born?")
+            if style == "structural":
+                return _mock_text_response("John Smith was born in which year?")
+            if style == "casual":
+                return _mock_text_response("when was John Smith born?")
+        else:  # 3rd attempt clean
+            if style == "lexical":
+                return _mock_text_response("Which writer was born in 1968?")
+            if style == "structural":
+                return _mock_text_response("The composer was born in which year?")
+            if style == "casual":
+                return _mock_text_response("when was the composer born?")
+        raise AssertionError("unreachable")
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=leak_twice_clean_third)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(gen, "AsyncAnthropic", return_value=mock_client):
+        rc = gen.main([
+            "--fixture", str(dataset_path),
+            "--output", str(output_path),
+            "--model", "test-model",
+        ])
+
+    assert rc == 0
+    # q1: 3 attempts × 3 styles = 9. q2: 3 first attempts = 3. Total = 12.
+    assert mock_client.messages.create.call_count == 12
+
+    items = load_paraphrases(output_path)
+    assert "q1" in items
+    # All 3 styles accepted on the 3rd attempt.
+    assert set(items["q1"]["paraphrases"].keys()) == {"lexical", "structural", "casual"}
+    # q2 also accepted (clean first-pass).
     assert "q2" in items
     assert set(items["q2"]["paraphrases"].keys()) == {"lexical", "structural", "casual"}
 

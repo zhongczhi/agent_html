@@ -41,33 +41,42 @@ DEFAULT_DATASET = REPO_ROOT / "scripts" / ".cache" / "hotpot_dev_distractor_v1.j
 PARAPHRASES_DIR = REPO_ROOT / "backend" / "storage" / "eval" / "hotpotqa" / "paraphrases"
 
 # Style-specific system prompts. Each steers the LLM toward a distinct
-# surface variation of the original question. Each prompt also names the
-# style (lexical / structural / casual) so the style is detectable from
-# the system prompt text alone (useful for downstream auditing and for
-# tests that route mock responses by style).
+# surface variation of the original question. The "HARD RULE" block is
+# front-loaded so the model attends to it before style-specific instructions
+# (FR-35.1). Each prompt also names the style (lexical / structural / casual)
+# so the style is detectable from the system prompt text alone (useful for
+# downstream auditing and for tests that route mock responses by style).
 STYLE_PROMPTS: dict[str, str] = {
     "lexical": (
-        "You are a lexical paraphraser. You paraphrase questions. "
-        "Output ONLY the paraphrase, no preamble. "
-        "Keep the exact sentence structure of the original but substitute "
-        "synonyms and minor word choices (e.g. 'In which year' -> 'What year'). "
-        "Do NOT include the answer in your paraphrase. Output one sentence."
+        "You are a lexical paraphraser.\n\n"
+        "HARD RULE: Do NOT include the answer to the question in your "
+        "paraphrase. The answer is supplied below. If your paraphrase "
+        "contains the answer, it is invalid and will be rejected.\n\n"
+        "Task: paraphrase the question using synonym swaps only "
+        "(e.g., 'In which year' -> 'What year'). Keep the exact "
+        "sentence structure.\n\n"
+        "Output: ONLY the paraphrase, one sentence, no preamble."
     ),
     "structural": (
-        "You are a structural paraphraser. You paraphrase questions. "
-        "Output ONLY the paraphrase, no preamble. "
-        "Keep all the original entities and facts but reorder the clauses "
-        "(e.g. active -> passive, 'X was born in Y' -> 'In which year was X "
-        "born, given that Y is associated with X?'). Do NOT include the answer "
-        "in your paraphrase. Output one sentence."
+        "You are a structural paraphraser.\n\n"
+        "HARD RULE: Do NOT include the answer to the question in your "
+        "paraphrase. The answer is supplied below. If your paraphrase "
+        "contains the answer, it is invalid and will be rejected.\n\n"
+        "Task: paraphrase the question by reordering clauses "
+        "(e.g., active -> passive, 'X was born in Y' -> 'In which year "
+        "was X born, given that Y is associated with X?'). Keep all "
+        "the original entities and facts.\n\n"
+        "Output: ONLY the paraphrase, one sentence, no preamble."
     ),
     "casual": (
-        "You are a casual paraphraser. You paraphrase questions. "
-        "Output ONLY the paraphrase, no preamble. "
-        "Make the question informal and conversational, as if a real user "
-        "typed it quickly in a chat: use contractions, drop articles where "
-        "natural, allow lowercase. Do NOT include the answer in your "
-        "paraphrase. Output one sentence."
+        "You are a casual paraphraser.\n\n"
+        "HARD RULE: Do NOT include the answer to the question in your "
+        "paraphrase. The answer is supplied below. If your paraphrase "
+        "contains the answer, it is invalid and will be rejected.\n\n"
+        "Task: paraphrase the question in an informal, conversational "
+        "tone as if a real user typed it quickly in a chat: use "
+        "contractions, drop articles where natural, allow lowercase.\n\n"
+        "Output: ONLY the paraphrase, one sentence, no preamble."
     ),
 }
 
@@ -81,10 +90,31 @@ def _user_prompt(question: str, gold_answer: str) -> str:
     # avoid — but the validation gate then rejects anything that leaks.
     # Without this, the model has no signal that "Paris" is the answer to
     # avoid using in "When was X born?" paraphrases.
+    # FR-35.4: gold answer is the FIRST line after a HARD RULE label, so the
+    # model sees "what to avoid" before "what to paraphrase".
     return (
-        f"Original question: {question}\n"
-        f"Do NOT include this answer in your paraphrase: {gold_answer}"
+        f"Question to paraphrase: {question}\n"
+        f"Answer to AVOID in your paraphrase (HARD RULE): {gold_answer}\n"
+        f"Output ONLY the paraphrase, one sentence."
     )
+
+
+# FR-36 + FR-38: temperature schedule + 5s pacing between API calls.
+PACING_SECONDS = 5
+
+
+def _retry_temperature_for(attempt: int) -> float:
+    """Return the temperature for a given attempt number (1, 2, or 3).
+
+    FR-36: attempt 1 = 0.3 (low variance, fast), attempt 2 = 0.7 (medium
+    variance, real escape from attempt 1's local minimum), attempt 3 = 1.0
+    (high variance, last shot before skip).
+    """
+    if attempt == 1:
+        return 0.3
+    if attempt == 2:
+        return 0.7
+    return 1.0  # attempt == 3
 
 
 async def _generate_one_style(
@@ -93,12 +123,21 @@ async def _generate_one_style(
     style: str,
     question: str,
     gold_answer: str,
+    attempt: int,
 ) -> str:
-    """One Anthropic call returning the paraphrase text for one style."""
+    """One Anthropic call returning the paraphrase text for one style.
+
+    `attempt` is 1-indexed (1 = first attempt, 2 = first retry, 3 = second
+    retry). Temperature is determined by `_retry_temperature_for(attempt)`.
+
+    FR-38.1: sleep `PACING_SECONDS` before each call so concurrent calls
+    within a question are spaced 5s apart, reducing rate-limit (429) hits.
+    """
+    await asyncio.sleep(PACING_SECONDS)
     response = await client.messages.create(
         model=model,
         max_tokens=200,
-        temperature=0,
+        temperature=_retry_temperature_for(attempt),
         system=STYLE_PROMPTS[style],
         messages=[
             {"role": "user", "content": _user_prompt(question, gold_answer)},
@@ -114,33 +153,35 @@ async def _generate_for_question(
     question: str,
     gold_answer: str,
 ) -> dict[str, str]:
-    """Generate all 3 styles in parallel; validate; retry failures once.
+    """Generate all 3 styles in parallel; validate; retry up to 3 attempts.
 
-    Each style runs as its own task: first-pass call, validate, and (if the
-    first-pass leaked the answer) a single retry. The 3 tasks are gathered
-    together so the 3 first-pass calls fire concurrently — keeping the
-    wall-clock cost per question to roughly 2x a single call's latency.
+    Each style runs as its own task. Attempt 1 fires concurrently for all 3
+    styles via asyncio.gather. Each task then validates and conditionally
+    fires retry attempts 2 and 3 with progressively higher temperatures.
+    The 3 tasks run concurrently throughout, so wall-clock per question is
+    roughly 3× a single attempt's latency (worst case: all 3 attempts leak).
 
     Returns {style: text} for styles that passed validation (possibly fewer
-    than 3 if some failed twice).
+    than 3 if all attempts leaked for that style).
     """
     styles = required_styles()
 
     async def gen_with_retry(style: str) -> tuple[str, str | None]:
-        text1 = await _generate_one_style(
-            client, model, style, question, gold_answer
-        )
-        if validate_paraphrase(text1, gold_answer):
-            log.info("qid=? style=%s validated on first attempt", style)
-            return style, text1
-        log.warning("qid=? style=%s leaked answer; retrying", style)
-        text2 = await _generate_one_style(
-            client, model, style, question, gold_answer
-        )
-        if validate_paraphrase(text2, gold_answer):
-            log.info("qid=? style=%s retry succeeded", style)
-            return style, text2
-        log.warning("qid=? style=%s failed validation twice; skipping", style)
+        for attempt in (1, 2, 3):
+            text = await _generate_one_style(
+                client, model, style, question, gold_answer, attempt,
+            )
+            if validate_paraphrase(text, gold_answer):
+                log.info(
+                    "qid=? style=%s attempt=%d temp=%.1f accepted",
+                    style, attempt, _retry_temperature_for(attempt),
+                )
+                return style, text
+            log.warning(
+                "qid=? style=%s attempt=%d temp=%.1f leaked; %s",
+                style, attempt, _retry_temperature_for(attempt),
+                "retrying" if attempt < 3 else "skipping",
+            )
         return style, None
 
     results = await asyncio.gather(*[gen_with_retry(s) for s in styles])
@@ -245,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         # Preserve existing entries (unless --force) and add new ones.
         merged = dict(existing) if not args.force else {}
         async with AsyncAnthropic(api_key=api_key) as client:
-            for item in items_all:
+            for idx, item in enumerate(items_all):
                 if item.id in merged and not args.force:
                     log.info("Skipping qid=%s (already in JSON)", item.id)
                     continue
@@ -264,6 +305,9 @@ def main(argv: list[str] | None = None) -> int:
                         len(paraphrases),
                         len(required_styles()),
                     )
+                # FR-38.2: pace 5s between questions (skip after the last).
+                if idx < len(items_all) - 1:
+                    await asyncio.sleep(PACING_SECONDS)
         return merged
 
     all_items = asyncio.run(run())
