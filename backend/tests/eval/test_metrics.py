@@ -2,6 +2,8 @@ import pytest
 
 from backend.eval.metrics import (
     answer_coverage_at_k,
+    answer_f1,
+    exact_match,
     paragraph_recall_at_k,
     supporting_fact_metrics,
 )
@@ -100,3 +102,81 @@ def test_answer_coverage_multiline_inside_one_doc():
         ["line one\nline two contains YES in it\nline three"],
         "yes",
     ) == 1.0
+
+
+# ---- answer_f1 + exact_match (FR-40) ---------------------------------------
+
+def test_answer_f1_exact_match():
+    assert answer_f1("The Godfather", "The Godfather") == 1.0
+
+
+def test_answer_f1_case_insensitive():
+    assert answer_f1("the godfather", "The Godfather") == 1.0
+
+
+def test_answer_f1_strips_punctuation():
+    assert answer_f1("The Godfather.", "The Godfather") == 1.0
+
+
+def test_answer_f1_strips_articles():
+    # 'The' is removed from both sides; 'cat' vs 'cat' matches.
+    assert answer_f1("a cat", "cat") == 1.0
+
+
+def test_answer_f1_partial_overlap():
+    # pred="The Godfather Part II" -> tokens ['godfather', 'part', 'ii'] (3)
+    # gold="The Godfather"          -> tokens ['godfather'] (1)
+    # common = {'godfather': min(1,1)=1}; num_same=1
+    # precision = 1/3, recall = 1/1 = 1.0, F1 = 2*(1/3)*1 / (1/3+1) = 0.5
+    assert answer_f1("The Godfather Part II", "The Godfather") == pytest.approx(0.5)
+
+
+def test_answer_f1_empty_predicted():
+    assert answer_f1("", "yes") == 0.0
+
+
+def test_answer_f1_empty_gold():
+    assert answer_f1("anything", "") == 0.0
+
+
+def test_answer_f1_no_overlap():
+    assert answer_f1("apple", "banana") == 0.0
+
+
+def test_answer_f1_handles_duplicates():
+    # pred="yes yes yes" -> ['yes','yes','yes'] (3)
+    # gold="yes"          -> ['yes'] (1)
+    # common = Counter({'yes': 1}); num_same=1
+    # precision = 1/3, recall = 1/1, F1 = 2*(1/3)*1 / (1/3+1) = 0.5
+    assert answer_f1("yes yes yes", "yes") == pytest.approx(0.5)
+
+
+def test_exact_match_identical_tokens():
+    assert exact_match("The Godfather", "The Godfather") is True
+
+
+def test_exact_match_after_normalization():
+    # 'the' stripped on both sides -> ['godfather'] vs ['godfather'] -> equal
+    assert exact_match("the godfather", "The Godfather") is True
+
+
+def test_exact_match_strips_articles_asymmetrically():
+    # pred="The cat" -> ['cat']; gold="cat" -> ['cat'] -> equal
+    assert exact_match("The cat", "cat") is True
+
+
+def test_exact_match_partial():
+    assert exact_match("The Godfather II", "The Godfather") is False
+
+
+def test_exact_match_empty_predicted():
+    assert exact_match("", "yes") is False
+
+
+def test_exact_match_empty_gold():
+    assert exact_match("anything", "") is False
+
+
+def test_exact_match_different_after_normalization():
+    # 'a cat' -> ['cat']; 'a dog' -> ['dog'] -> different
+    assert exact_match("a cat", "a dog") is False

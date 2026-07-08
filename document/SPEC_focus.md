@@ -1,90 +1,110 @@
-# Chatbot Project — Iteration 10 Spec (Paraphrase Validation Gate Fix)
+# Chatbot Project — Iteration 11 Spec (End-to-End QA Accuracy Eval)
 
 > **Working document for the current iteration.** Will be merged into [SPEC.md](SPEC.md) on completion.
-> Bug-fix iteration: make the paraphrase generator's validation-gate success rate near 100%.
+> Adds an end-to-end QA accuracy eval that measures what users actually care about: does the LLM produce an answer matching the gold answer when given retrieved context?
 
 ## Overview
 
-Iteration 9 shipped the paraphrase-eval pipeline (`scripts/generate_paraphrases_hotpotqa.py` + `scripts/eval_hotpotqa.py --paraphrase-set`). The 1000-question run reported a 35% zero-coverage rate (116/334 questions got zero paraphrases), with retry success of 9.4%. The root cause is a two-part failure:
+Iteration 10 fixed the paraphrase generator's validation-gate coverage problem (35% → 0% zero-coverage). But every metric in iter-9 and iter-10 measures **retrieval** (does the gold answer *appear* in top-k?), not **answer quality** (does the user get the right *answer*?).
 
-1. **Prompt structure**: the "do NOT include the answer" rule was buried in long system prompts and the tail of the user prompt. The model loses track of it on entity-as-answer questions.
-2. **`temperature=0`** at both first attempt and retry: when the first attempt leaks the answer, the retry produces the *exact same output* (deterministic). The retry counter increments but nothing actually changes.
+A retriever with high recall can still produce a low-quality answer if:
+- The retrieved context is noisy (low precision → LLM distracted by irrelevant chunks)
+- The LLM hallucinates even when gold context is present
+- The LLM extracts the wrong span from a long paragraph
 
-Iteration 10 fixes the generator so the validation-gate success rate is near 100%, without changing the validation gate itself (the gate is correctly enforcing a real constraint; the issue is the model not satisfying it).
+Iteration 11 closes this gap with an end-to-end QA eval: for each HotpotQA question, retrieve top-k (same FAISS pipeline), feed the context to the LLM in the same prompt format the chat chain uses, extract the answer from the response, and score against the gold answer using HotpotQA's official answer-F1 metric.
 
-## Problem
+The eval runs **two modes per question**:
+1. **With context**: retrieved top-k embedded in `<context>...</context>` block (real chat behavior)
+2. **Without context**: vanilla LLM call (no retrieval)
 
-For question "Who is John Smith?" with gold answer "John Smith":
-- The LLM produces "Tell me about John Smith" or "When was John Smith born?" — both are valid, fluent paraphrases.
-- The 80% token-overlap gate fires because "John Smith" appears in both the question and the paraphrase.
-- The LLM has no way to know "John Smith" is the gold answer to avoid, *unless* the prompt is structured clearly enough that the model actually obeys the instruction.
-- At `temperature=0`, retries produce identical output → retry success 9.4%.
+The delta between modes measures how much retrieval actually helps. If without-context ≥ with-context, our retrieval is hurting.
 
 ## Functional Requirements
 
-### FR-35: Generator Prompt Hardening
+### FR-40: HotpotQA Standard Answer F1
 
 | ID | Requirement |
 |----|-------------|
-| FR-35.1 | Each style's system prompt is restructured so the "do NOT include the answer" rule appears as the **first** sentence and is labeled as a "HARD RULE". The style-specific task instructions follow. |
-| FR-35.2 | The system prompt begins with the line `You are a {style} paraphraser.` followed by an empty line and a "HARD RULE" block. |
-| FR-35.3 | Each style's system prompt is shorter than the iter-9 version (target ≤ 200 chars); longer prompts dilute the rule's salience. |
-| FR-35.4 | The user prompt keeps the gold-answer mention (so the model knows what to avoid) but formats it as the **first** line, before the paraphrasing task. |
+| FR-40.1 | `backend.eval.metrics.answer_f1(predicted: str, gold: str) -> float` computes the SQuAD-style token-F1 that HotpotQA's official eval script uses: lowercase, strip punctuation, remove articles (`a`, `an`, `the`), tokenize on whitespace, compute precision/recall/F1 over token sets. Returns 0.0 for empty predicted or gold. |
+| FR-40.2 | `backend.eval.metrics.exact_match(predicted: str, gold: str) -> bool` returns True iff `answer_f1 == 1.0` (token sets are identical after normalization). Returns False for empty predicted or gold. |
+| FR-40.3 | Both functions are pure: no I/O, no LLM, no Anthropic imports. |
 
-### FR-36: Temperature Schedule
-
-| ID | Requirement |
-|----|-------------|
-| FR-36.1 | First attempt: `temperature=0.3` (low variance, mostly deterministic; faster than 0 because retries have variance to escape). |
-| FR-36.2 | First retry: `temperature=0.7` (medium variance; gives the model real variance to produce different output than the first attempt). |
-| FR-36.3 | Second retry (only if the first retry also leaked): `temperature=1.0` (high variance; one last attempt before skipping). |
-| FR-36.4 | Each retry attempt independently validates. If a retry succeeds, the success is logged. If all 3 attempts leak, the style is omitted (same as iter-9 skip-on-double-fail behavior, just with 3 attempts instead of 2). |
-
-### FR-37: Retry Budget
+### FR-41: QA Judge Module
 
 | ID | Requirement |
 |----|-------------|
-| FR-37.1 | Each style gets up to **3 attempts total** (1 first + 2 retries) before being skipped. |
-| FR-37.2 | The retry counts and outcomes are logged at INFO with `qid`, `style`, `attempt`, `temperature`, `accepted` fields. |
+| FR-41.1 | New module `backend.eval.qa_judge` exposes `build_qa_prompt(question: str, context_chunks: list[Document] | None) -> list[dict]`. With context: returns `[system_msg (RAG), user_msg (<context>...</context> + question)]`. Without context: returns `[user_msg (question only)]`. The system message is the same `RAG_SYSTEM_PROMPT` used by `backend.chat.chain`. |
+| FR-41.2 | `qa_judge.ask_llm(client, model, prompt, max_tokens=200) -> str` calls the LLM once with `temperature=0`, extracts the text content (skipping thinking blocks), and returns the cleaned answer string. |
+| FR-41.3 | `qa_judge.ask_llm` takes an `AsyncAnthropic` client (matches the paraphrase generator's pattern) and is fully async. |
 
-### FR-38: Concurrency Pacing (Rate-Limit Friendly)
-
-| ID | Requirement |
-|----|-------------|
-| FR-38.1 | Between consecutive API calls within a single question's `gen_with_retry` flow, the implementation waits 5 seconds. This applies to *both* the first-attempt trio (so the 3 concurrent calls fire 5s apart) and subsequent retries within the same question. |
-| FR-38.2 | Cross-question pacing: when moving from question N to question N+1, the implementation waits 5 seconds before starting question N+1's first-attempt trio. |
-| FR-38.3 | Total wall-clock for the 1000-question eval generation scales accordingly: ~30 minutes (iter-9) → ~60 minutes (iter-10) for 334 effective questions. Acceptable: rate-limit hits drop from ~30% to ~5%. |
-
-### FR-39: Backward Compatibility
+### FR-42: End-to-End Eval CLI
 
 | ID | Requirement |
 |----|-------------|
-| FR-39.1 | The validation gate (`backend.eval.paraphrases.validate_paraphrase`) is unchanged. The 80% threshold stays. |
-| FR-39.2 | The output JSON schema (`{dataset_sha, schema_version, items: {qid: {paraphrases: {style: text}}}}`) is unchanged. |
-| FR-39.3 | The eval pipeline (`scripts/eval_hotpotqa.py --paraphrase-set`) needs no changes — it consumes the same JSON shape. |
-| FR-39.4 | Existing paraphrases JSON at `backend/storage/eval/hotpotqa/paraphrases/{dataset_sha}.json` is invalidated on the next generation run; users should run with `--force` to regenerate. |
+| FR-42.1 | `scripts/eval_qa_hotpotqa.py` is a standalone CLI. It does **not** register any HTTP route. It does **not** import from `backend.chat.*` (same isolation rule as FR-32 for the retrieval eval). |
+| FR-42.2 | The CLI exposes `--subset N | --full` mutually-exclusive group; `--full` is the default. Semantics match FR-31.2. |
+| FR-42.3 | The CLI exposes `--k N` for retrieval depth. Default is 4 (matches FR-31.3). |
+| FR-42.4 | The CLI exposes `--no-cache` flag (matches FR-31.4). |
+| FR-42.5 | The CLI exposes `--fixture PATH` flag (matches FR-31.5). |
+| FR-42.6 | The CLI exposes `--paraphrase-set PATH` flag. If absent, eval runs in original-only mode (one question variant per item). If present, eval runs original + each available paraphrase style. |
+| FR-42.7 | The CLI exposes `--compare-baseline` flag. When set, each question is evaluated twice: with retrieved context AND without context. When absent, only with-context mode runs. |
+| FR-42.8 | The CLI exposes `--llm-model NAME` flag. Default: `minimax-3` (override with `--llm-model` or `$ANTHROPIC_MODEL`). |
+| FR-42.9 | The CLI reuses the existing per-question FAISS cache from `backend.eval.cache`. Cache key is `(dataset_sha, qid)` — same as the retrieval eval. |
+| FR-42.10 | The CLI applies 1-second pacing between consecutive LLM calls within a question's flow (with-context + optional without-context + optional paraphrase variants). |
+| FR-42.11 | The CLI exits 0 on completion. Per-question LLM errors are logged at WARNING and counted toward an `errors` field; they do not affect exit code. The CLI exits 1 only on setup failure (dataset missing, JSONDecodeError, embedding model load, missing API key). |
+
+### FR-43: Output Format
+
+| ID | Requirement |
+|----|-------------|
+| FR-43.1 | The CLI prints a header line: `HotpotQA End-to-End QA Eval — subset={...}, k={...}, dataset_sha={...}`. |
+| FR-43.2 | The CLI prints `with_context:` section with `answer_f1` and `answer_em` averages. |
+| FR-43.3 | If `--compare-baseline` is set, the CLI prints `without_context:` section with the same two metrics, then `delta (retrieval helps):` showing the signed difference for each. |
+| FR-43.4 | If `--paraphrase-set` is given, the CLI prints `-- by variant --` section showing `n`, `f1`, `em` for `original`, `lexical`, `structural`, `casual`. |
+| FR-43.5 | The CLI prints a footer with: total LLM calls, cache hits / builds, errors, elapsed seconds. |
+| FR-43.6 | The CLI prints `Dataset: HotpotQA dev_distractor v1 (CC BY-SA 4.0 — https://hotpotqa.github.io/)` attribution once before the metric block. |
+
+### FR-44: Backward Compatibility
+
+| ID | Requirement |
+|----|-------------|
+| FR-44.1 | `backend.eval.metrics.answer_coverage_at_k` is unchanged. `paragraph_recall_at_k` and `supporting_fact_metrics` are unchanged. |
+| FR-44.2 | `scripts/eval_hotpotqa.py` (the retrieval-only eval) is unchanged. It continues to work standalone with `--paraphrase-set`. |
+| FR-44.3 | The eval CLI imports from `backend.eval.*` (new) + `anthropic` (new). It does NOT import from `backend.chat.*` (preserves FR-32 isolation). |
 
 ## Non-Functional Requirements
 
-### NFR-16: Success rate target
+### NFR-19: Cost ceiling
 
-After the fix, the 1000-question stratified sample should produce:
-- ≥ 95% of questions have all 3 styles accepted (up from 60.8%)
-- ≥ 99% of questions have at least 1 style accepted (up from 65.3%)
-- API calls per question: up to 9 in worst case (3 styles × 3 attempts). Typical: 3-4 (one attempt succeeds per style).
+The `--subset 100` run with `--compare-baseline --paraphrase-set` issues at most 800 LLM calls (100 questions × 4 variants × 2 modes). At `minimax-3` pricing with `thinking.enabled` budget=10000, expect $5-10.
 
-### NFR-17: Rate-limit reduction
+The `--subset 1000 --compare-baseline` run (no paraphrases) issues ~2000 LLM calls. Expect $15-25.
 
-With the 5-second pacing, the rate-limit (429) hit rate should drop below 5% (from ~30% in iter-9). Wall-clock for the 334-question effective sample should stay under 60 minutes.
+### NFR-20: Latency target
 
-### NFR-18: Test isolation
+Per-question end-to-end latency: < 8 seconds (LLM call dominates; FAISS retrieval is ~50ms; answer extraction is negligible). With 1-second pacing, wall-clock for `--subset 1000` is ~17 minutes per mode (35 min with `--compare-baseline`).
 
-The generator tests in `scripts/tests/test_generate_paraphrases_hotpotqa.py` continue to use mocked `AsyncAnthropic` — no real API calls. Mock side-effects must reflect the new retry budget: a question whose all 3 styles leak at attempts 1-2 still gets attempts 3.
+### NFR-21: Reproducibility
+
+LLM calls use `temperature=0` for determinism. Cache hits for FAISS indices make retrieval deterministic. MiniMax endpoint is not 100% reproducible (network jitter, server-side variance) but `temperature=0` provides best-effort determinism for answer text.
+
+### NFR-22: Test isolation
+
+All new code in `backend.eval.metrics`, `backend.eval.qa_judge`, and `scripts.eval_qa_hotpotqa` is testable without real LLM calls:
+- Metrics tests use string inputs.
+- `qa_judge.build_qa_prompt` is pure (no I/O).
+- `qa_judge.ask_llm` is tested via `AsyncMock` for `AsyncAnthropic`.
+- The CLI tests use subprocess + a small fixture JSON + mocked LLM via env-var stub.
 
 ## Out of Scope (deferred to future iterations)
 
-- Switching to a different validation gate strategy (entity-aware regex, sub-token matching, etc.). The 80% token-overlap gate stays.
-- Switching to a different paraphrase model. `minimax-3` stays.
-- Switching to a different embedding model. `all-MiniLM-L6-v2` stays (that change is in step 3 of the user's 3-step plan).
-- Async batching across multiple questions. Iter-10 stays per-question parallelism.
-- Adaptive temperature (raising temperature only when the previous attempt leaked the answer with high confidence). All 3 attempts get a fixed temperature for predictability.
+- **Cross-encoder reranking** before LLM call (the iter-10 retrieval-only eval would benefit from this; the QA eval would inherit the gain).
+- **Larger embedding model** (`all-mpnet-base-v2`) — same rationale.
+- **Hybrid BM25 + dense** — same rationale.
+- **Thinking budget tuning** — we use the same 10000 as chat. A lower budget (e.g., 2000) would speed up eval 5× but might change answer quality.
+- **Multi-shot prompting** — HotpotQA is zero-shot in our setup; few-shot is a known win for QA but adds prompt complexity.
+- **Sentence-level supporting-fact scoring** at the QA level (would require the LLM to emit supporting-fact lists, not just answers).
+- **Calibration metrics** (does the LLM's confidence match its correctness?) — orthogonal to this eval.
+- **Per-(type, level) breakdown** for the QA eval — the sample-size for `comparison/hard` in our 334-question subset is small; deferring until full 7405-question run.
+- **RAGAS-style metrics** (faithfulness, answer relevance) — these need a separate reference answer or LLM-as-judge pipeline; out of scope.
