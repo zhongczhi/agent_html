@@ -285,7 +285,20 @@ def main(argv: list[str] | None = None) -> int:
                                 )
 
                     for q_text, vname in variants:
-                        retrieved_docs = index.similarity_search(q_text, k=args.k)
+                        # When the pipeline preset configures a reranker,
+                        # retrieve more candidates and rerank to top_k.
+                        # Otherwise a plain top_k retrieval is enough.
+                        if pipeline_cfg is not None and pipeline_cfg.reranker is not None:
+                            from backend.rag.pipeline import build_reranker
+                            reranker = build_reranker(pipeline_cfg)
+                            candidates = index.similarity_search(
+                                q_text, k=pipeline_cfg.rerank_top_k,
+                            )
+                            retrieved_docs = reranker.rerank(
+                                q_text, candidates, top_k=pipeline_cfg.top_k,
+                            )
+                        else:
+                            retrieved_docs = index.similarity_search(q_text, k=args.k)
                         # with-context mode
                         per_q.append(await _evaluate_one(
                             client, args.llm_model, item, retrieved_docs,
