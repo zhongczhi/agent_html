@@ -47,6 +47,7 @@ async def _evaluate_one(
     question_text: str,
     variant_name: str,
     mode: str,
+    prompt_template: str = "default",
 ) -> dict:
     """One LLM call + scoring (FR-42).
 
@@ -64,12 +65,21 @@ async def _evaluate_one(
         2*P*R / (P+R) but with len(pred) clamped so long wrappers don't
         dilute the score. Implementation: token-level overlap divided by
         the max of (len(pred), len(gold)).
+
+    prompt_template: 'default' uses qa_judge.build_qa_prompt; 'extract_span'
+    uses a custom builder that asks the LLM to extract verbatim spans.
     """
     await asyncio.sleep(PACING_SECONDS)
-    if mode == "with_context":
-        prompt = build_qa_prompt(question_text, retrieved_docs)
+    # Build prompt according to the template.
+    if prompt_template == "extract_span":
+        from backend.rag.pipeline import ExtractSpanPromptBuilder
+        builder = ExtractSpanPromptBuilder()
+        prompt = builder.build(question_text, retrieved_docs if mode == "with_context" else None)
     else:
-        prompt = build_qa_prompt(question_text, None)
+        if mode == "with_context":
+            prompt = build_qa_prompt(question_text, retrieved_docs)
+        else:
+            prompt = build_qa_prompt(question_text, None)
     answer = await ask_llm(client, model, prompt)
     f1 = metrics.answer_f1(answer, item.answer)
     em = metrics.exact_match(answer, item.answer)
@@ -134,7 +144,31 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("ANTHROPIC_MODEL", "minimax-3"),
         help="LLM model name (default: minimax-3)",
     )
+    parser.add_argument(
+        "--pipeline",
+        default=None,
+        help=(
+            "Pipeline preset name (see backend.rag.pipeline.PRESETS). "
+            "If given, overrides --k and uses the preset's embedding model "
+            "and prompt template. Run with no value to see available presets."
+        ),
+    )
+    parser.add_argument(
+        "--list-pipelines",
+        action="store_true",
+        help="Print available pipeline presets and exit.",
+    )
     args = parser.parse_args(argv)
+
+    # Handle --list-pipelines early.
+    if args.list_pipelines:
+        from backend.rag.pipeline import list_presets
+        print("Available pipeline presets:")
+        for name in list_presets():
+            from backend.rag.pipeline import PRESETS
+            cfg = PRESETS[name]
+            print(f"  {name:<24} embed={cfg.embedding_model:<24} rerank={cfg.reranker or 'none':<14} prompt={cfg.prompt_template}")
+        return 0
 
     if args.subset is not None and args.subset <= 1:
         parser.error("--subset must be >= 2")
@@ -186,8 +220,42 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Paraphrase set is corrupt: {e}", file=sys.stderr)
             return 1
 
+    # Resolve pipeline preset (if any) and use it to drive embedding + prompt.
+    pipeline_cfg = None
+    prompt_template = "default"
+    if args.pipeline:
+        from backend.rag.pipeline import PRESETS
+        if args.pipeline not in PRESETS:
+            print(
+                f"Unknown pipeline: {args.pipeline!r}. "
+                f"Available: {sorted(PRESETS.keys())}. "
+                f"Use --list-pipelines to see details.",
+                file=sys.stderr,
+            )
+            return 1
+        pipeline_cfg = PRESETS[args.pipeline]
+        prompt_template = pipeline_cfg.prompt_template
+        log.info(
+            "Using pipeline preset: %s (embed=%s, rerank=%s, prompt=%s, top_k=%d)",
+            pipeline_cfg.name,
+            pipeline_cfg.embedding_model,
+            pipeline_cfg.reranker or "none",
+            pipeline_cfg.prompt_template,
+            pipeline_cfg.top_k,
+        )
+        # Override --k with the preset's top_k so all parts of the pipeline agree.
+        args.k = pipeline_cfg.top_k
+
     settings = RagSettings()
-    embeddings = make_embeddings(settings.rag_embedding_backend)
+    # When a pipeline preset is active, override the embedding model with the
+    # preset's choice. Otherwise use the env-driven default.
+    if pipeline_cfg is not None and pipeline_cfg.embedding_backend == "sentence-transformers":
+        embeddings = make_embeddings(
+            pipeline_cfg.embedding_backend,
+            model_name=pipeline_cfg.embedding_model,
+        )
+    else:
+        embeddings = make_embeddings(settings.rag_embedding_backend)
 
     per_q: list[dict] = []
     cache_hits = cache_builds = errors = 0
@@ -222,12 +290,14 @@ def main(argv: list[str] | None = None) -> int:
                         per_q.append(await _evaluate_one(
                             client, args.llm_model, item, retrieved_docs,
                             q_text, vname, "with_context",
+                            prompt_template=prompt_template,
                         ))
                         if args.compare_baseline:
                             # without-context baseline
                             per_q.append(await _evaluate_one(
                                 client, args.llm_model, item, None,
                                 q_text, vname, "without_context",
+                                prompt_template=prompt_template,
                             ))
                 except Exception as e:
                     log.warning("qid=%s error: %s", item.id, e)
