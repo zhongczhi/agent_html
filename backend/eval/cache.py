@@ -1,6 +1,7 @@
 """SHA-keyed per-question FAISS cache for the eval pipeline."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 from pathlib import Path
@@ -46,21 +47,61 @@ def _build_index(item: HotpotQaItem, embeddings: Embeddings) -> FAISS:
     return FAISS.from_documents(docs, embeddings)
 
 
+def embedding_tag(embeddings: Embeddings) -> str:
+    """Best-effort stable identifier for an embedding model.
+
+    Some embedders (HuggingFace sentence-transformers) carry a `model_name`
+    attribute; others expose `model`; the rest fall back to the dimension
+    of a single probe query. If even that fails, the class name is used.
+
+    The output is intended to be a stable string that distinguishes between
+    models that produce different vector spaces (and therefore must not
+    share a FAISS index). It is not a cryptographic fingerprint.
+    """
+    # 1. HuggingFace-style model_name attribute (the common case).
+    for attr in ("model_name", "model"):
+        if hasattr(embeddings, attr):
+            value = getattr(embeddings, attr)
+            if isinstance(value, str) and value:
+                return value.replace("/", "_").replace("\\", "_")
+    # 2. Probe the embedder's output dimension. This distinguishes models
+    # with different vector sizes (MiniLM 384 vs mpnet 768) but not two
+    # models that happen to produce the same size.
+    try:
+        vec = embeddings.embed_query("embedding-tag-probe")
+        return f"dim{len(vec)}"
+    except Exception:
+        pass
+    # 3. Class name fallback. Two unrelated embedders that share a class
+    # name (e.g., FakeEmbeddings in tests) will collide here — the test
+    # suite uses no_cache=True to avoid the issue.
+    return type(embeddings).__name__
+
+
 def load_or_build(
     item: HotpotQaItem,
     dataset_sha: str,
     embeddings: Embeddings,
     no_cache: bool = False,
+    embedding_tag_override: str | None = None,
 ) -> tuple[FAISS, bool]:
     """Returns (index, was_hit). `was_hit` is True if loaded from disk.
 
+    Cache layout: EVAL_CACHE_ROOT / {dataset_sha}_{embedding_tag} / item.id /
+    The embedding_tag distinguishes indices built with different models so
+    a switch from MiniLM to mpnet does not silently reuse a stale 384-dim
+    FAISS index. Pass `embedding_tag_override` to force a specific tag
+    (e.g., 'mpnet' or 'fake64'); otherwise `embedding_tag(embeddings)` is
+    called to derive one.
+
     - If `no_cache`, always build. Cache is overwritten on disk.
-    - Otherwise: cache_path = EVAL_CACHE_ROOT / dataset_sha / item.id /
+    - Otherwise: cache_path = EVAL_CACHE_ROOT / dataset_sha_tag / item.id /
       - if missing, build + save, was_hit=False.
       - if present, attempt load_or_init; on any failure, rmtree + build + save
         + WARNING log, was_hit=False.
     """
-    cache_dir = EVAL_CACHE_ROOT / dataset_sha / item.id
+    tag = embedding_tag_override or embedding_tag(embeddings)
+    cache_dir = EVAL_CACHE_ROOT / f"{dataset_sha}_{tag}" / item.id
     if no_cache or not cache_dir.exists():
         index = _build_index(item, embeddings)
         save(index, cache_dir)
