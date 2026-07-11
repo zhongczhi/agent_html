@@ -21,11 +21,14 @@ log = logging.getLogger(__name__)
 EVAL_CACHE_ROOT = Path(__file__).parent.parent / "storage" / "eval" / "hotpotqa" / "cache"
 
 
-def _build_index(item: HotpotQaItem, embeddings: Embeddings) -> FAISS:
-    """Construct a FAISS index over `item.context` as paragraph Documents.
-    Skips paragraphs whose joined sentence text is empty. Does NOT use
-    MarkdownTextSplitter — preserves paragraph granularity so the metric
-    is stable across any chat-side chunking-config change."""
+def _build_corpus(item: HotpotQaItem) -> list[Document]:
+    """Build the list of paragraph Documents for `item.context`.
+
+    Used by both _build_index and the hybrid retriever (which needs the
+    raw corpus to build its BM25 index). Skips paragraphs whose joined
+    sentence text is empty. Order is preserved between the FAISS index and
+    the BM25 corpus (both built from this same list).
+    """
     docs: list[Document] = []
     for idx, (title, sentences) in enumerate(item.context):
         text = " ".join(sentences).strip()
@@ -44,7 +47,15 @@ def _build_index(item: HotpotQaItem, embeddings: Embeddings) -> FAISS:
                 },
             )
         )
-    return FAISS.from_documents(docs, embeddings)
+    return docs
+
+
+def _build_index(item: HotpotQaItem, embeddings: Embeddings) -> FAISS:
+    """Construct a FAISS index over `item.context` as paragraph Documents.
+    Skips paragraphs whose joined sentence text is empty. Does NOT use
+    MarkdownTextSplitter — preserves paragraph granularity so the metric
+    is stable across any chat-side chunking-config change."""
+    return FAISS.from_documents(_build_corpus(item), embeddings)
 
 
 def embedding_tag(embeddings: Embeddings) -> str:
@@ -84,8 +95,13 @@ def load_or_build(
     embeddings: Embeddings,
     no_cache: bool = False,
     embedding_tag_override: str | None = None,
-) -> tuple[FAISS, bool]:
+    with_corpus: bool = False,
+) -> tuple[FAISS, bool] | tuple[FAISS, bool, list[Document]]:
     """Returns (index, was_hit). `was_hit` is True if loaded from disk.
+
+    If `with_corpus=True`, also returns the raw paragraph corpus (list of
+    Documents in the same order the FAISS index was built). Hybrid
+    retrievers need this to build their BM25 index.
 
     Cache layout: EVAL_CACHE_ROOT / {dataset_sha}_{embedding_tag} / item.id /
     The embedding_tag distinguishes indices built with different models so
@@ -105,13 +121,19 @@ def load_or_build(
     if no_cache or not cache_dir.exists():
         index = _build_index(item, embeddings)
         save(index, cache_dir)
+        if with_corpus:
+            return index, False, _build_corpus(item)
         return index, False
     try:
         index = load_or_init(cache_dir, embeddings)
+        if with_corpus:
+            return index, True, _build_corpus(item)
         return index, True
     except Exception as e:
         log.warning("cache corrupt for %s (%s); rebuilding", item.id, e)
         shutil.rmtree(cache_dir, ignore_errors=True)
         index = _build_index(item, embeddings)
         save(index, cache_dir)
+        if with_corpus:
+            return index, False, _build_corpus(item)
         return index, False

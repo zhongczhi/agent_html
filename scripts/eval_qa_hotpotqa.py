@@ -266,9 +266,22 @@ def main(argv: list[str] | None = None) -> int:
         async with AsyncAnthropic(api_key=api_key) as client:
             for item in items:
                 try:
-                    index, hit = ev_cache.load_or_build(
-                        item, d_sha, embeddings, no_cache=args.no_cache
+                    # Hybrid retrievers also need the raw corpus (to build
+                    # the BM25 index). For dense-only, we skip it for speed.
+                    needs_corpus = (
+                        pipeline_cfg is not None
+                        and pipeline_cfg.retriever == "hybrid"
                     )
+                    if needs_corpus:
+                        index, hit, corpus = ev_cache.load_or_build(
+                            item, d_sha, embeddings,
+                            no_cache=args.no_cache, with_corpus=True,
+                        )
+                    else:
+                        index, hit = ev_cache.load_or_build(
+                            item, d_sha, embeddings, no_cache=args.no_cache
+                        )
+                        corpus = None
                     if hit:
                         cache_hits += 1
                     else:
@@ -284,11 +297,26 @@ def main(argv: list[str] | None = None) -> int:
                                     (para_entry["paraphrases"][style], style)
                                 )
 
+                    # If the pipeline is hybrid, build the hybrid retriever
+                    # once per question (it holds the BM25 index in memory).
+                    hybrid_retriever = None
+                    if pipeline_cfg is not None and pipeline_cfg.retriever == "hybrid":
+                        from backend.rag.pipeline import (
+                            BM25Retriever, DenseRetriever, HybridRetriever,
+                        )
+                        hybrid_retriever = HybridRetriever(
+                            dense_retriever=DenseRetriever(index),
+                            bm25_retriever=BM25Retriever(corpus),
+                        )
+
                     for q_text, vname in variants:
                         # When the pipeline preset configures a reranker,
                         # retrieve more candidates and rerank to top_k.
                         # Otherwise a plain top_k retrieval is enough.
-                        if pipeline_cfg is not None and pipeline_cfg.reranker is not None:
+                        # Hybrid path uses the prebuilt HybridRetriever.
+                        if hybrid_retriever is not None:
+                            retrieved_docs = hybrid_retriever.retrieve(q_text, k=pipeline_cfg.top_k)
+                        elif pipeline_cfg is not None and pipeline_cfg.reranker is not None:
                             from backend.rag.pipeline import build_reranker
                             reranker = build_reranker(pipeline_cfg)
                             candidates = index.similarity_search(

@@ -111,6 +111,93 @@ class DenseRetriever:
         return self._vs.similarity_search(query, k=k)
 
 
+class BM25Retriever:
+    """Sparse keyword retriever over a corpus of Documents.
+
+    Wraps rank_bm25.BM25Okapi. The corpus is tokenized once at construction
+    (lowercase, alphanumeric-only). At query time, the query is tokenized
+    the same way and scored against every doc.
+
+    Pure-Python, deterministic, no model download. Slower than FAISS for
+    large corpora but adequate for per-question eval workloads (10 docs each).
+    """
+
+    def __init__(self, docs: list[Document]):
+        import re
+
+        from rank_bm25 import BM25Okapi
+
+        self._docs = list(docs)
+        # Tokenize: lowercase, strip non-word chars (except spaces), split.
+        # We keep numbers and punctuation-free tokens.
+        self._tokenize = lambda s: [
+            t for t in re.findall(r"[a-z0-9]+", s.lower()) if t
+        ]
+        if self._docs:
+            tokenized_corpus = [self._tokenize(d.page_content) for d in self._docs]
+            # BM25Okapi raises on empty docs (rare but possible if a paragraph
+            # is just punctuation). Replace empty token lists with a placeholder.
+            self._bm25 = BM25Okapi(
+                [toks if toks else ["_empty_"] for toks in tokenized_corpus]
+            )
+        else:
+            self._bm25 = None
+
+    def retrieve(self, query: str, k: int) -> list[Document]:
+        if not self._docs or self._bm25 is None:
+            return []
+        q_tokens = self._tokenize(query) or ["_empty_"]
+        scores = self._bm25.get_scores(q_tokens)
+        # Top-k by score (descending). We keep all docs by score; the
+        # >0 filter used to drop zero-scored docs but with very small
+        # corpora BM25 returns 0 for every term (each term appears in
+        # every doc, IDF -> 0). For our 10-paragraph eval workload this
+        # rarely matters, but the filter is too aggressive for tiny cases.
+        ranked_indices = sorted(range(len(scores)), key=lambda i: -scores[i])
+        return [self._docs[i] for i in ranked_indices[:k]]
+
+
+class HybridRetriever:
+    """Reciprocal Rank Fusion (RRF) of dense + BM25 retrieval.
+
+    For each query, get top-K from both retrievers, then fuse ranks with
+    RRF: score(d) = sum(1 / (rrf_k + rank_in_list)). RRF doesn't require
+    learning weights and is robust to score-scale differences between
+    the two retrievers. The dense_retriever is expected to be a
+    `DenseRetriever`; the bm25_retriever a `BM25Retriever`.
+
+    Returns the top `k` documents by fused RRF score.
+    """
+
+    def __init__(self, dense_retriever: DenseRetriever, bm25_retriever: BM25Retriever, rrf_k: int = 60):
+        self._dense = dense_retriever
+        self._bm25 = bm25_retriever
+        self._rrf_k = rrf_k
+
+    def retrieve(self, query: str, k: int) -> list[Document]:
+        # Pull more candidates than k from each retriever so fusion has
+        # room to express itself. We use 4k as the candidate depth — the
+        # RRF paper recommends ~3-5x the desired depth.
+        cand_k = max(k * 4, 20)
+        dense_hits = self._dense.retrieve(query, k=cand_k)
+        bm25_hits = self._bm25.retrieve(query, k=cand_k)
+
+        scores: dict[int, float] = {}
+        docs_by_id: dict[int, Document] = {}
+
+        for rank, doc in enumerate(dense_hits):
+            doc_id = id(doc)
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (self._rrf_k + rank + 1)
+            docs_by_id[doc_id] = doc
+        for rank, doc in enumerate(bm25_hits):
+            doc_id = id(doc)
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (self._rrf_k + rank + 1)
+            docs_by_id[doc_id] = doc
+
+        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        return [docs_by_id[doc_id] for doc_id, _ in ranked[:k]]
+
+
 class NoOpReranker:
     """Returns the first `top_k` candidates unchanged."""
 
@@ -219,9 +306,25 @@ def build_embedder(backend: str, model_name: str) -> Embeddings:
     return make_embeddings(backend, model_name=model_name)
 
 
-def build_retriever(config: PipelineConfig, vectorstore) -> Retriever:
+def build_retriever(config: PipelineConfig, vectorstore, corpus: list[Document] | None = None) -> Retriever:
+    """Dispatch on config.retriever.
+
+    For 'dense' and 'hybrid', `vectorstore` is the FAISS vectorstore built
+    over the corpus. For 'hybrid', `corpus` is also required (must be the
+    list of Documents that built the FAISS index, in the same order).
+    """
     if config.retriever == "dense":
         return DenseRetriever(vectorstore)
+    if config.retriever == "hybrid":
+        if corpus is None:
+            raise ValueError(
+                "Hybrid retriever requires the raw corpus (list of Documents) "
+                "to build the BM25 index. Pass corpus=... to build_pipeline."
+            )
+        return HybridRetriever(
+            dense_retriever=DenseRetriever(vectorstore),
+            bm25_retriever=BM25Retriever(corpus),
+        )
     raise ValueError(f"Unknown retriever: {config.retriever!r}")
 
 
@@ -302,6 +405,7 @@ def build_pipeline(
     config: PipelineConfig,
     vectorstore,
     llm_client,
+    corpus: list[Document] | None = None,
 ) -> RagPipeline:
     """Top-level factory. The user-visible one-switch API.
 
@@ -309,10 +413,14 @@ def build_pipeline(
         config = PRESETS["naive_dense"]
         pipeline = build_pipeline(config, vectorstore=my_faiss, llm_client=client)
         answer = await pipeline.run("What year was X born?")
+
+    For hybrid presets (`hybrid_bm25_dense`), `corpus` must be the list of
+    Documents that built the FAISS index, in the same order. For dense
+    presets, corpus is ignored.
     """
     return RagPipeline(
         config=config,
-        retriever=build_retriever(config, vectorstore),
+        retriever=build_retriever(config, vectorstore, corpus=corpus),
         reranker=build_reranker(config),
         prompt_builder=build_prompt_builder(config),
         llm=build_llm(config, llm_client),
@@ -367,6 +475,20 @@ PRESETS: dict[str, PipelineConfig] = {
         reranker=None,
         top_k=4,
         prompt_template="extract_span",
+        llm_model="minimax-3",
+    ),
+    # Hybrid BM25 + dense via Reciprocal Rank Fusion. Different lever than
+    # embedding-model size: BM25 catches exact entity-name matches the
+    # embedding model glosses over, dense catches paraphrase matches BM25
+    # misses. RRF combines without learning weights.
+    "hybrid_bm25_dense": PipelineConfig(
+        name="hybrid_bm25_dense",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="hybrid",
+        reranker=None,
+        top_k=4,
+        prompt_template="default",
         llm_model="minimax-3",
     ),
 }

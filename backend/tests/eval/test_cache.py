@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from langchain_community.embeddings.fake import FakeEmbeddings
+from langchain_core.documents import Document
 
 from backend.eval.cache import EVAL_CACHE_ROOT, _build_index, embedding_tag, load_or_build
 from backend.eval.hotpotqa import load as load_items
@@ -114,3 +115,39 @@ def test_embedding_tag_differs_for_different_sizes():
     a = _embedding_factory(size=64)
     b = _embedding_factory(size=128)
     assert embedding_tag(a) != embedding_tag(b)
+
+
+def test_load_or_build_with_corpus_returns_corpus(tmp_cache_root):
+    """with_corpus=True returns a (index, hit, corpus) tuple where corpus is
+    the list of paragraph Documents."""
+    items = load_items(FIXTURE)
+    emb = _embedding_factory()
+    result = load_or_build(items[0], "deadbeef00000000", emb, with_corpus=True)
+    assert len(result) == 3
+    index, hit, corpus = result
+    assert hit is False
+    assert isinstance(index, object)  # FAISS
+    assert len(corpus) == 3
+    assert all(isinstance(d, Document) for d in corpus)
+    # Order matches the FAISS index — first paragraph is "Title A".
+    assert "Title A" in corpus[0].page_content or "s0" in corpus[0].page_content
+
+
+def test_load_or_build_with_corpus_cached_path(tmp_cache_root):
+    """Second call with with_corpus=True should still be a cache hit."""
+    items = load_items(FIXTURE)
+    emb = _embedding_factory()
+    load_or_build(items[0], "deadbeef00000000", emb, with_corpus=True)
+    _, hit, corpus = load_or_build(items[0], "deadbeef00000000", emb, with_corpus=True)
+    assert hit is True
+    assert len(corpus) == 3
+
+
+def test_load_or_build_default_returns_two_tuple(tmp_cache_root):
+    """Without with_corpus, returns (index, hit) — backward compatible."""
+    items = load_items(FIXTURE)
+    emb = _embedding_factory()
+    result = load_or_build(items[0], "deadbeef00000000", emb)
+    assert len(result) == 2
+    index, hit = result
+    assert hit is False

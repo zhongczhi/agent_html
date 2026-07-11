@@ -6,10 +6,12 @@ from langchain_core.documents import Document
 
 from backend.rag.pipeline import (
     AnthropicLLM,
+    BM25Retriever,
     CrossEncoderReranker,
     DefaultPromptBuilder,
     DenseRetriever,
     ExtractSpanPromptBuilder,
+    HybridRetriever,
     NoOpReranker,
     PRESETS,
     PipelineConfig,
@@ -333,3 +335,178 @@ def test_build_pipeline_with_reranker():
     pipeline = build_pipeline(cfg, vectorstore=vs, llm_client=fake_client)
     assert pipeline._reranker is not None
     assert isinstance(pipeline._reranker, CrossEncoderReranker)
+
+
+# ---- BM25Retriever -------------------------------------------------------
+
+def test_bm25_retriever_finds_exact_match():
+    """A query that exactly matches one document returns that doc first."""
+    docs = [
+        Document(page_content="the quick brown fox jumps"),
+        Document(page_content="a stitch in time saves nine"),
+        Document(page_content="the cat sat on the mat"),
+    ]
+    r = BM25Retriever(docs)
+    out = r.retrieve("cat mat", k=3)
+    assert out[0].page_content == "the cat sat on the mat"
+
+
+def test_bm25_retriever_handles_empty_corpus():
+    r = BM25Retriever([])
+    assert r.retrieve("anything", k=5) == []
+
+
+def test_bm25_retriever_handles_query_with_no_matches():
+    """Query words not in any doc returns docs by corpus order (BM25 ranks
+    by score; with no matches all scores are 0, so docs are returned in
+    insertion order). This is intentional — the retriever always returns
+    up to k docs, leaving the caller's downstream filtering (e.g., RRF
+    fusion) to handle relevance."""
+    docs = [
+        Document(page_content="alpha bravo charlie"),
+        Document(page_content="delta echo foxtrot"),
+    ]
+    r = BM25Retriever(docs)
+    out = r.retrieve("xyzzy plover", k=2)
+    # All scores are 0 -> docs returned in original order.
+    assert len(out) == 2
+    assert out[0].page_content == docs[0].page_content
+
+
+def test_bm25_retriever_respects_top_k():
+    docs = [
+        Document(page_content=f"document {i}: common word") for i in range(10)
+    ]
+    r = BM25Retriever(docs)
+    out = r.retrieve("common word", k=3)
+    assert len(out) == 3
+
+
+def test_bm25_retriever_handles_punctuation_in_docs():
+    """Non-word chars in doc text should be stripped during tokenization."""
+    docs = [Document(page_content="Foo, bar! baz? qux...")]
+    r = BM25Retriever(docs)
+    out = r.retrieve("foo bar", k=1)
+    assert len(out) == 1
+
+
+# ---- HybridRetriever (RRF) -----------------------------------------------
+
+class _RecordingDenseRetriever:
+    """A fake dense retriever that returns docs in a fixed order."""
+
+    def __init__(self, docs):
+        self._docs = list(docs)
+
+    def retrieve(self, query, k):
+        return self._docs[:k]
+
+
+def _mk_docs():
+    """Five documents with distinct lexical + semantic profiles."""
+    return [
+        Document(page_content="apple banana cherry", metadata={"id": "A"}),
+        Document(page_content="apple date elderberry", metadata={"id": "B"}),
+        Document(page_content="fig grape honeydew", metadata={"id": "C"}),
+        Document(page_content="apple kiwi lemon", metadata={"id": "D"}),
+        Document(page_content="mango nectarine orange", metadata={"id": "E"}),
+    ]
+
+
+def test_hybrid_returns_top_k():
+    docs = _mk_docs()
+    dense = _RecordingDenseRetriever([docs[2], docs[0], docs[4], docs[1], docs[3]])
+    bm25 = BM25Retriever(docs)
+    h = HybridRetriever(dense_retriever=dense, bm25_retriever=bm25, rrf_k=60)
+    out = h.retrieve("apple banana", k=3)
+    assert len(out) == 3
+
+
+def test_hybrid_favors_docs_in_both_lists():
+    """A doc ranked highly by BOTH dense and BM25 should rank highest in fusion."""
+    docs = _mk_docs()
+    # Dense: A, B, C, D, E. BM25: A, B, C, D, E (same order for "apple banana").
+    dense = _RecordingDenseRetriever([docs[0], docs[1], docs[2], docs[3], docs[4]])
+    bm25 = BM25Retriever(docs)
+    h = HybridRetriever(dense_retriever=dense, bm25_retriever=bm25, rrf_k=60)
+    out = h.retrieve("apple banana", k=1)
+    # Both lists put A first -> RRF puts A first.
+    assert out[0].metadata["id"] == "A"
+
+
+def test_hybrid_rrf_breaks_tie_when_only_one_list_ranks_high():
+    """If BM25 ranks X at #1 but dense doesn't have X in top-3, X still gets
+    fused in via BM25's contribution. The doc at dense #1 still wins overall."""
+    docs = _mk_docs()
+    # Dense ranks C, D, B (no A, no E).
+    dense = _RecordingDenseRetriever([docs[2], docs[3], docs[1]])
+    # BM25 ranks A, B, C.
+    bm25 = BM25Retriever(docs)
+    h = HybridRetriever(dense_retriever=dense, bm25_retriever=bm25, rrf_k=60)
+    out = h.retrieve("apple banana", k=3)
+    # B should be in both lists -> high score. C is top in dense, but
+    # only mid in BM25. A is top in BM25, but absent from dense top-3.
+    # Without testing exact ordering, assert that B appears (it's in both).
+    ids = [d.metadata["id"] for d in out]
+    assert "B" in ids
+
+
+def test_hybrid_handles_empty_corpus():
+    h = HybridRetriever(
+        dense_retriever=_RecordingDenseRetriever([]),
+        bm25_retriever=BM25Retriever([]),
+    )
+    assert h.retrieve("anything", k=3) == []
+
+
+# ---- Factory: build_retriever (hybrid dispatch) -------------------------
+
+def test_build_retriever_hybrid_requires_corpus():
+    cfg = PRESETS["hybrid_bm25_dense"]
+    vs = FakeVectorStore([Document(page_content="d")])
+    # Without corpus -> raises.
+    with pytest.raises(ValueError, match="corpus"):
+        build_retriever(cfg, vs)
+
+
+def test_build_retriever_hybrid_with_corpus():
+    cfg = PRESETS["hybrid_bm25_dense"]
+    vs = FakeVectorStore([Document(page_content="d")])
+    docs = [Document(page_content="d1"), Document(page_content="d2")]
+    r = build_retriever(cfg, vs, corpus=docs)
+    assert isinstance(r, HybridRetriever)
+
+
+# ---- Presets (hybrid) ---------------------------------------------------
+
+def test_hybrid_preset_uses_mini_lm():
+    """The hybrid preset uses MiniLM (cheap) — embedding size is not the lever."""
+    cfg = PRESETS["hybrid_bm25_dense"]
+    assert cfg.embedding_model == "all-MiniLM-L6-v2"
+    assert cfg.retriever == "hybrid"
+    assert cfg.reranker is None
+
+
+def test_list_presets_includes_hybrid():
+    names = list_presets()
+    assert "hybrid_bm25_dense" in names
+
+
+# ---- build_pipeline with hybrid -----------------------------------------
+
+def test_build_pipeline_with_hybrid():
+    cfg = PRESETS["hybrid_bm25_dense"]
+    fake_client = MagicMock()
+    vs = FakeVectorStore([Document(page_content="d1"), Document(page_content="d2")])
+    corpus = [Document(page_content="d1"), Document(page_content="d2")]
+
+    pipeline = build_pipeline(cfg, vectorstore=vs, llm_client=fake_client, corpus=corpus)
+    assert isinstance(pipeline._retriever, HybridRetriever)
+
+
+def test_build_pipeline_hybrid_without_corpus_raises():
+    cfg = PRESETS["hybrid_bm25_dense"]
+    fake_client = MagicMock()
+    vs = FakeVectorStore([Document(page_content="d")])
+    with pytest.raises(ValueError, match="corpus"):
+        build_pipeline(cfg, vectorstore=vs, llm_client=fake_client)

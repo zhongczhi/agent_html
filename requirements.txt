@@ -11,6 +11,7 @@ sentence-transformers>=2.0.0
 pypdf>=3.0.0
 python-docx>=1.0.0
 beautifulsoup4>=4.12.0
+rank-bm25>=0.2.0  # used by backend.rag.pipeline (hybrid BM25+dense preset)
 pydantic>=2.0
 pydantic-settings>=2.0
 python-multipart>=0.0.6
