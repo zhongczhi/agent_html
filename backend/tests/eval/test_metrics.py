@@ -4,6 +4,7 @@ from backend.eval.metrics import (
     answer_coverage_at_k,
     answer_f1,
     exact_match,
+    gold_paragraph_in_top_k,
     paragraph_recall_at_k,
     supporting_fact_metrics,
 )
@@ -102,6 +103,31 @@ def test_answer_coverage_multiline_inside_one_doc():
         ["line one\nline two contains YES in it\nline three"],
         "yes",
     ) == 1.0
+
+
+def test_gold_paragraph_in_top_k_empty_gold_vacuous():
+    # Vacuous: no gold means no miss possible.
+    assert gold_paragraph_in_top_k([], set()) is True
+    assert gold_paragraph_in_top_k(["a", "b"], set()) is True
+
+
+def test_gold_paragraph_in_top_k_empty_retrieved_false():
+    assert gold_paragraph_in_top_k([], {"a"}) is False
+
+
+def test_gold_paragraph_in_top_k_hit():
+    assert gold_paragraph_in_top_k(["a", "b"], {"a"}) is True
+    # Hit even if it's not the first one.
+    assert gold_paragraph_in_top_k(["x", "y", "a"], {"a"}) is True
+
+
+def test_gold_paragraph_in_top_k_miss():
+    assert gold_paragraph_in_top_k(["x", "y"], {"a"}) is False
+
+
+def test_gold_paragraph_in_top_k_subset_partial_hit():
+    # Multi-fact HotpotQA items often have 2+ gold titles; one in top-k is enough.
+    assert gold_paragraph_in_top_k(["a", "x"], {"a", "b"}) is True
 
 
 # ---- answer_f1 + exact_match (FR-40) ---------------------------------------

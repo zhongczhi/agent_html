@@ -48,6 +48,7 @@ async def _evaluate_one(
     variant_name: str,
     mode: str,
     prompt_template: str = "default",
+    gold_in_top_k: bool | None = None,
 ) -> dict:
     """One LLM call + scoring (FR-42).
 
@@ -65,6 +66,12 @@ async def _evaluate_one(
         2*P*R / (P+R) but with len(pred) clamped so long wrappers don't
         dilute the score. Implementation: token-level overlap divided by
         the max of (len(pred), len(gold)).
+
+    gold_in_top_k: True iff at least one gold paragraph title appeared in
+        the retrieved top-k. Used to localize the failure mode of failed
+        questions: gold_in_top_k=1 + contains_gold=0 = extraction miss;
+        gold_in_top_k=0 + contains_gold=0 = retrieval miss. None for
+        without-context runs (retrieval doesn't apply).
 
     prompt_template: 'default' uses qa_judge.build_qa_prompt; 'extract_span'
     uses a custom builder that asks the LLM to extract verbatim spans.
@@ -93,6 +100,7 @@ async def _evaluate_one(
         "answer_f1": f1,
         "answer_em": 1.0 if em else 0.0,
         "contains_gold": contains,
+        "gold_in_top_k": gold_in_top_k,
     }
 
 
@@ -327,18 +335,25 @@ def main(argv: list[str] | None = None) -> int:
                             )
                         else:
                             retrieved_docs = index.similarity_search(q_text, k=args.k)
+                        # Localize failure modes: was the gold paragraph in the
+                        # retrieved set, even if the LLM still missed the answer?
+                        gold_titles = hotpot.gold_paragraph_titles(item)
+                        retrieved_titles = [d.metadata.get("title", "") for d in retrieved_docs]
+                        gold_hit = metrics.gold_paragraph_in_top_k(retrieved_titles, gold_titles)
                         # with-context mode
                         per_q.append(await _evaluate_one(
                             client, args.llm_model, item, retrieved_docs,
                             q_text, vname, "with_context",
                             prompt_template=prompt_template,
+                            gold_in_top_k=gold_hit,
                         ))
                         if args.compare_baseline:
-                            # without-context baseline
+                            # without-context baseline (retrieval doesn't apply)
                             per_q.append(await _evaluate_one(
                                 client, args.llm_model, item, None,
                                 q_text, vname, "without_context",
                                 prompt_template=prompt_template,
+                                gold_in_top_k=None,
                             ))
                 except Exception as e:
                     log.warning("qid=%s error: %s", item.id, e)
@@ -370,6 +385,47 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"    answer_em   : {fmt(avg(lambda r: r['mode'] == 'with_context', 'answer_em'))}  (n={with_n})"
         )
+
+        # Failure-mode breakdown: distinguishes retrieval misses from
+        # extraction misses for failed questions (contains_gold=0).
+        # See FR for explanation of the lever this informs.
+        def _count(predicate) -> int:
+            return sum(1 for r in per_q if predicate(r))
+
+        succ = _count(lambda r: r["mode"] == "with_context" and r["contains_gold"] >= 1.0)
+        ext_miss = _count(
+            lambda r: r["mode"] == "with_context"
+            and r["contains_gold"] < 1.0
+            and r["gold_in_top_k"] is True
+        )
+        ret_miss = _count(
+            lambda r: r["mode"] == "with_context"
+            and r["contains_gold"] < 1.0
+            and r["gold_in_top_k"] is False
+        )
+        unk = _count(
+            lambda r: r["mode"] == "with_context"
+            and r["contains_gold"] < 1.0
+            and r["gold_in_top_k"] is None
+        )
+        if with_n > 0:
+            print("  failure-mode breakdown (with_context):")
+            print(
+                f"    success         : {succ:>4}  ({fmt(succ / with_n)})"
+            )
+            print(
+                f"    extraction miss : {ext_miss:>4}  "
+                f"({fmt(ext_miss / with_n)}) — gold in top-k, LLM missed"
+            )
+            print(
+                f"    retrieval miss  : {ret_miss:>4}  "
+                f"({fmt(ret_miss / with_n)}) — gold NOT in top-k"
+            )
+            if unk:
+                print(
+                    f"    unknown         : {unk:>4}  "
+                    f"({fmt(unk / with_n)}) — gold_in_top_k not recorded"
+                )
 
         if args.compare_baseline:
             without_n = sum(1 for r in per_q if r["mode"] == "without_context")

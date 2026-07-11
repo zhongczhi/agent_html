@@ -477,6 +477,33 @@ PRESETS: dict[str, PipelineConfig] = {
         prompt_template="extract_span",
         llm_model="minimax-3",
     ),
+    # Combined: bigger context (top_k=8) + verbatim-span extraction. This
+    # composes the two extraction-side wins from iter-14: more paragraphs
+    # in context covers the long tail of gold-paragraphs-outside-top-4,
+    # and verbatim-span guidance reduces LLM extraction error.
+    "extract_span_k8": PipelineConfig(
+        name="extract_span_k8",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=8,
+        prompt_template="extract_span",
+        llm_model="minimax-3",
+    ),
+    # Same as extract_span_k8 but with the full 10-paragraph context.
+    # Only marginally better than k=8 on HotpotQA but useful when the
+    # supporting-fact set spans more paragraphs than top-k=8 covers.
+    "extract_span_k10": PipelineConfig(
+        name="extract_span_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="extract_span",
+        llm_model="minimax-3",
+    ),
     # Hybrid BM25 + dense via Reciprocal Rank Fusion. Different lever than
     # embedding-model size: BM25 catches exact entity-name matches the
     # embedding model glosses over, dense catches paraphrase matches BM25

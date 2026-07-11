@@ -66,6 +66,28 @@ def _normalize_for_coverage(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", text).strip()
 
 
+def gold_paragraph_in_top_k(
+    retrieved_titles: list[str],
+    gold_titles: set[str],
+) -> bool:
+    """Returns True iff at least one gold paragraph title appears in retrieved.
+
+    Used to localize the failure mode of an end-to-end QA pipeline:
+    - gold_in_top_k = True  AND contains_gold = 0  -> extraction miss
+      (the right paragraph was retrieved; the LLM didn't pick the answer).
+    - gold_in_top_k = False AND contains_gold = 0  -> retrieval miss
+      (the right paragraph wasn't retrieved at all).
+
+    Vacuous on empty gold (returns True, matches `paragraph_recall_at_k`).
+    Empty retrieved returns False.
+    """
+    if not gold_titles:
+        return True
+    if not retrieved_titles:
+        return False
+    return any(t in gold_titles for t in retrieved_titles)
+
+
 def answer_coverage_at_k(retrieved_texts: list[str], gold_answer: str) -> float:
     """Returns 1.0 if the normalized gold_answer is a substring of any
     normalized retrieved text (paragraphs joined with newlines). Else 0.0.

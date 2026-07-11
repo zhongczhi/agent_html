@@ -273,6 +273,9 @@ def test_presets_have_expected_keys():
     assert "large_dense" in PRESETS
     assert "dense_then_ce" in PRESETS
     assert "extract_span_prompt" in PRESETS
+    # iter-14 ceiling variants
+    assert "extract_span_k8" in PRESETS
+    assert "extract_span_k10" in PRESETS
 
 
 def test_naive_dense_uses_default_embedding():
@@ -298,6 +301,22 @@ def test_dense_then_ce_has_reranker():
 def test_extract_span_prompt_uses_extract_template():
     cfg = PRESETS["extract_span_prompt"]
     assert cfg.prompt_template == "extract_span"
+
+
+def test_extract_span_k8_combines_prompt_and_top_k():
+    """iter-14 ceiling variant: extract_span prompt with top_k=8."""
+    cfg = PRESETS["extract_span_k8"]
+    assert cfg.prompt_template == "extract_span"
+    assert cfg.top_k == 8
+    assert cfg.reranker is None
+
+
+def test_extract_span_k10_uses_full_context():
+    """iter-14 max-context variant: extract_span prompt with top_k=10."""
+    cfg = PRESETS["extract_span_k10"]
+    assert cfg.prompt_template == "extract_span"
+    assert cfg.top_k == 10
+    assert cfg.reranker is None
 
 
 def test_list_presets_returns_sorted():
