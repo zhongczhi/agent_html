@@ -49,6 +49,10 @@ async def _evaluate_one(
     mode: str,
     prompt_template: str = "default",
     gold_in_top_k: bool | None = None,
+    gold_titles: set[str] | None = None,
+    retrieved_titles: list[str] | None = None,
+    thinking_budget: int | None = None,
+    max_tokens: int | None = None,
 ) -> dict:
     """One LLM call + scoring (FR-42).
 
@@ -82,17 +86,41 @@ async def _evaluate_one(
         from backend.rag.pipeline import ExtractSpanPromptBuilder
         builder = ExtractSpanPromptBuilder()
         prompt = builder.build(question_text, retrieved_docs if mode == "with_context" else None)
+    elif prompt_template == "cot_extract":
+        from backend.rag.pipeline import CoTExtractPromptBuilder
+        builder = CoTExtractPromptBuilder()
+        prompt = builder.build(question_text, retrieved_docs if mode == "with_context" else None)
+    elif prompt_template == "cot_extract_v2":
+        from backend.rag.pipeline import CoTExtractV2PromptBuilder
+        builder = CoTExtractV2PromptBuilder()
+        prompt = builder.build(question_text, retrieved_docs if mode == "with_context" else None)
+    elif prompt_template == "cot_extract_no_titles":
+        from backend.rag.pipeline import CoTExtractNoTitlesPromptBuilder
+        builder = CoTExtractNoTitlesPromptBuilder()
+        prompt = builder.build(question_text, retrieved_docs if mode == "with_context" else None)
     else:
         if mode == "with_context":
             prompt = build_qa_prompt(question_text, retrieved_docs)
         else:
             prompt = build_qa_prompt(question_text, None)
-    answer = await ask_llm(client, model, prompt)
+    # If the preset configures extended thinking, enable it on the LLM call.
+    # max_tokens must be >= thinking_budget so the visible answer has room.
+    if thinking_budget is not None and thinking_budget > 0:
+        answer = await ask_llm(
+            client,
+            model,
+            prompt,
+            max_tokens=max_tokens or max(thinking_budget + 512, 2048),
+            thinking_budget=thinking_budget,
+        )
+    else:
+        answer = await ask_llm(client, model, prompt)
     f1 = metrics.answer_f1(answer, item.answer)
     em = metrics.exact_match(answer, item.answer)
     contains = metrics.answer_coverage_at_k([answer], item.answer)
     return {
         "qid": item.id,
+        "question": question_text,
         "variant": variant_name,
         "mode": mode,
         "predicted": answer,
@@ -101,6 +129,8 @@ async def _evaluate_one(
         "answer_em": 1.0 if em else 0.0,
         "contains_gold": contains,
         "gold_in_top_k": gold_in_top_k,
+        "gold_paragraph_titles": sorted(gold_titles) if gold_titles else [],
+        "retrieved_titles": list(retrieved_titles) if retrieved_titles else [],
     }
 
 
@@ -165,6 +195,17 @@ def main(argv: list[str] | None = None) -> int:
         "--list-pipelines",
         action="store_true",
         help="Print available pipeline presets and exit.",
+    )
+    parser.add_argument(
+        "--dump-results",
+        type=Path,
+        default=None,
+        help=(
+            "Write per-question results as JSON Lines to this path. Each line "
+            "is one result with qid, question, predicted, gold, contains_gold, "
+            "answer_f1, answer_em, gold_in_top_k, gold_paragraph_titles, "
+            "retrieved_titles, etc. Useful for failure-mode inspection."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -346,6 +387,10 @@ def main(argv: list[str] | None = None) -> int:
                             q_text, vname, "with_context",
                             prompt_template=prompt_template,
                             gold_in_top_k=gold_hit,
+                            gold_titles=gold_titles,
+                            retrieved_titles=retrieved_titles,
+                            thinking_budget=pipeline_cfg.thinking_budget if pipeline_cfg else None,
+                            max_tokens=(pipeline_cfg.thinking_budget + 512) if pipeline_cfg and pipeline_cfg.thinking_budget else None,
                         ))
                         if args.compare_baseline:
                             # without-context baseline (retrieval doesn't apply)
@@ -354,6 +399,9 @@ def main(argv: list[str] | None = None) -> int:
                                 q_text, vname, "without_context",
                                 prompt_template=prompt_template,
                                 gold_in_top_k=None,
+                                gold_titles=gold_titles,
+                                retrieved_titles=retrieved_titles,
+                                thinking_budget=None,  # baseline never uses thinking
                             ))
                 except Exception as e:
                     log.warning("qid=%s error: %s", item.id, e)
@@ -493,6 +541,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  cache hits / builds   : {cache_hits} / {cache_builds}")
         print(f"  errors                : {errors}")
         print(f"  elapsed               : {elapsed:.1f}s")
+
+        # Optional dump of every per-question result to JSON Lines.
+        # Used for failure-mode inspection: failures can be grepped out and
+        # inspected offline. Quietly skip if the path isn't writable.
+        if args.dump_results is not None:
+            try:
+                args.dump_results.parent.mkdir(parents=True, exist_ok=True)
+                with args.dump_results.open("w", encoding="utf-8") as f:
+                    for r in per_q:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                print(f"  dumped per-q results  : {args.dump_results}  (n={len(per_q)})")
+            except OSError as e:
+                print(f"  WARNING: failed to dump results to {args.dump_results}: {e}", file=sys.stderr)
+
         return 0
 
     return asyncio.run(run())

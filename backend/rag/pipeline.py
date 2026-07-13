@@ -25,7 +25,7 @@ Design notes
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from langchain_core.documents import Document
@@ -52,6 +52,10 @@ class PipelineConfig:
             the reranker narrows to `top_k`. Ignored when reranker is None.
         top_k: final number of chunks sent to the LLM.
         prompt_template: prompt template name. 'default' or 'extract_span'.
+        thinking_budget: Anthropic extended thinking budget in tokens
+            (passed to messages.create as thinking.budget_tokens). When
+            set, the model produces internal reasoning blocks that are
+            discarded by our scoring path. Pass None to disable.
         llm_model: model name for the LLM call (passed to qa_judge.ask_llm).
     """
 
@@ -63,6 +67,7 @@ class PipelineConfig:
     rerank_top_k: int = 50
     top_k: int = 4
     prompt_template: str = "default"
+    thinking_budget: int | None = None
     llm_model: str = "minimax-3"
 
 
@@ -276,20 +281,113 @@ class ExtractSpanPromptBuilder:
         ]
 
 
+class CoTExtractPromptBuilder:
+    """Iter-15 SOTA: `ExtractSpanPromptBuilder` + an explicit step-by-step
+    reasoning scaffold that targets multi-hop questions.
+
+    Why this exists: at k≥8 retrieval is saturated (0 retrieval misses).
+    The remaining failures are LLM extraction/reasoning errors. About half
+    are multi-hop — the model needs to chain facts across paragraphs before
+    it can pick the right span. A bare extract_span instruction doesn't
+    scaffold that reasoning; this builder does.
+
+    Contains_gold stays safe: the prompt forces the model to begin its
+    visible output with the extracted span, so substring containment of
+    the gold answer remains high. Step-by-step reasoning only appears
+    after the lead span, which is the part substring containment matches.
+    """
+
+    COT_INSTRUCTION = (
+        "Read the <context>...</context> block carefully. Some questions "
+        "require combining facts from multiple paragraphs (multi-hop reasoning).\n\n"
+        "Think step by step:\n"
+        "1. Identify the entities and facts the question asks about.\n"
+        "2. Find the relevant paragraph(s) in the context.\n"
+        "3. If multi-hop reasoning is needed, chain together the supporting "
+        "facts in order.\n"
+        "4. Decide which exact span answers the question.\n\n"
+        "Begin your response with the extracted span (in quotation marks "
+        "if it is a phrase), then briefly explain your reasoning. "
+        "Do not paraphrase the answer — quote it verbatim from the context."
+    )
+
+    def __init__(self):
+        from backend.eval.qa_judge import RAG_SYSTEM_PROMPT_HERE
+        self._system_prompt = RAG_SYSTEM_PROMPT_HERE + "\n\n" + self.COT_INSTRUCTION
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(
+            f"[{d.metadata.get('title', '')}]: {d.page_content}" for d in context_docs
+        )
+        user_content = f"<context>\n{context_str}\n</context>\n\n{question}"
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class CoTExtractNoTitlesPromptBuilder(CoTExtractPromptBuilder):
+    """Iter-21: same CoT instruction as CoTExtractPromptBuilder, but the
+    `[title]:` heading prefix on each context paragraph is stripped.
+
+    Hypothesis (from iter-20 thinking audit): when context paragraphs
+    are introduced with their Wikipedia article heading as a prefix
+    (e.g. `[Hector Berlioz]: ...body...`), the model uses the heading as
+    the entity label when emitting its answer. HotpotQA's gold answers
+    typically use the full canonical name found in the article body
+    opening (e.g. "Louis-Hector Berlioz"), not the colloquial heading
+    form ("Hector Berlioz"). Stripping the heading forces the model to
+    extract the canonical form from the body, where Wikipedia puts it in
+    the first sentence.
+
+    Why a separate builder: preserves the existing
+    `CoTExtractPromptBuilder` behavior for all other presets, isolating
+    the title-stripping experiment to one preset.
+    """
+
+    # COT_INSTRUCTION inherited from CoTExtractPromptBuilder
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        # Strip the `[title]:` heading prefix; model has to find names
+        # in the body text instead of copying the colloquial heading.
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = f"<context>\n{context_str}\n</context>\n\n{question}"
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
 class AnthropicLLM:
     """Async Anthropic client wrapped as an LLM protocol.
 
     Uses the same prompt shape as the eval pipeline (qa_judge.ask_llm) so
     pipelines and evals produce identical outputs given identical inputs.
+
+    If `thinking_budget` is set, enables Anthropic extended thinking mode
+    with that many tokens of internal reasoning. The visible answer
+    remains the only thing returned by `ask()` — internal reasoning is
+    consumed by the model and discarded by our scoring path.
     """
 
-    def __init__(self, client, model: str):
+    def __init__(self, client, model: str, thinking_budget: int | None = None):
         self._client = client
         self._model = model
+        self._thinking_budget = thinking_budget
 
     async def ask(self, messages: list[dict], max_tokens: int = 200) -> str:
         from backend.eval.qa_judge import ask_llm
-        return await ask_llm(self._client, self._model, messages, max_tokens=max_tokens)
+        return await ask_llm(
+            self._client,
+            self._model,
+            messages,
+            max_tokens=max_tokens,
+            thinking_budget=self._thinking_budget,
+        )
 
 
 # ── Factory ──────────────────────────────────────────────────────────────
@@ -341,11 +439,21 @@ def build_prompt_builder(config: PipelineConfig) -> PromptBuilder:
         return DefaultPromptBuilder()
     if config.prompt_template == "extract_span":
         return ExtractSpanPromptBuilder()
+    if config.prompt_template == "cot_extract":
+        return CoTExtractPromptBuilder()
+    if config.prompt_template == "cot_extract_v2":
+        return CoTExtractV2PromptBuilder()
+    if config.prompt_template == "cot_extract_no_titles":
+        return CoTExtractNoTitlesPromptBuilder()
     raise ValueError(f"Unknown prompt_template: {config.prompt_template!r}")
 
 
 def build_llm(config: PipelineConfig, client) -> LLM:
-    return AnthropicLLM(client=client, model=config.llm_model)
+    return AnthropicLLM(
+        client=client,
+        model=config.llm_model,
+        thinking_budget=config.thinking_budget,
+    )
 
 
 # ── Pipeline orchestrator ────────────────────────────────────────────────
@@ -356,7 +464,7 @@ class RagPipeline:
 
     The retriever and LLM are provided at construction time (so they can
     hold expensive state like FAISS indices or API clients). The reranker
-    and prompt builder are stateless and built lazily on first run.
+    and prompt builder are stateless.
     """
 
     def __init__(
@@ -394,7 +502,7 @@ class RagPipeline:
         else:
             final_docs = candidates[: self.config.top_k]
 
-        # Step 3 — prompt.
+        # Step 3 — build the prompt.
         messages = self._prompt_builder.build(question, final_docs)
 
         # Step 4 — ask.
@@ -425,6 +533,64 @@ def build_pipeline(
         prompt_builder=build_prompt_builder(config),
         llm=build_llm(config, llm_client),
     )
+
+
+# ── CoT-extract small modifications (iter-19) ───────────────────────────
+
+
+class CoTExtractV2PromptBuilder:
+    """Iter-19: small, targeted refinement of `CoTExtractPromptBuilder`.
+
+    The iter-14 → iter-18 arc explored many lever combinations (canonical-
+    name rules, yes/no discipline, two-step extraction) and all variants
+    regressed vs cot_extract_k10. The LLM applies conditional rules
+    inconsistently. Rather than more rules, this iter makes a minimal
+    targeted nudge: tighten step 4 toward using the most complete form
+    of an entity name (canonical names live in the context), and tighten
+    the closing directive to reinforce the same.
+
+    What changed vs CoTExtractPromptBuilder:
+      - Step 4: append ", using the most complete form as written in the
+        context for entity-name answers" (one short clause).
+      - Closing: "quote it verbatim" → "quote it verbatim from the context,
+        using the most complete form of an entity name".
+
+    Total prompt growth: ~25 words. No examples, no discriminators, no
+    conditional rules — just one guiding principle embedded in two
+    existing instructions.
+    """
+
+    COT_INSTRUCTION_V2 = (
+        "Read the <context>...</context> block carefully. Some questions "
+        "require combining facts from multiple paragraphs (multi-hop reasoning).\n\n"
+        "Think step by step:\n"
+        "1. Identify the entities and facts the question asks about.\n"
+        "2. Find the relevant paragraph(s) in the context.\n"
+        "3. If multi-hop reasoning is needed, chain together the supporting "
+        "facts in order.\n"
+        "4. Decide which exact span answers the question — using the most "
+        "complete form as written in the context for entity-name answers.\n\n"
+        "Begin your response with the extracted span (in quotation marks "
+        "if it is a phrase), then briefly explain your reasoning. "
+        "Do not paraphrase — quote it verbatim from the context, using the "
+        "most complete form of an entity name."
+    )
+
+    def __init__(self):
+        from backend.eval.qa_judge import RAG_SYSTEM_PROMPT_HERE
+        self._system_prompt = RAG_SYSTEM_PROMPT_HERE + "\n\n" + self.COT_INSTRUCTION_V2
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(
+            f"[{d.metadata.get('title', '')}]: {d.page_content}" for d in context_docs
+        )
+        user_content = f"<context>\n{context_str}\n</context>\n\n{question}"
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
 
 
 # ── Presets ──────────────────────────────────────────────────────────────
@@ -502,6 +668,64 @@ PRESETS: dict[str, PipelineConfig] = {
         reranker=None,
         top_k=10,
         prompt_template="extract_span",
+        llm_model="minimax-3",
+    ),
+    # iter-15 SOTA: CoT scaffold + verbatim-span directive at k=10.
+    "cot_extract_k10": PipelineConfig(
+        name="cot_extract_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="cot_extract",
+        llm_model="minimax-3",
+    ),
+    # iter-19: minimal targeted refinement of cot_extract. One guiding
+    # clause in step 4 + matching tightening of the closing directive,
+    # nudging the model toward using the most complete entity-name form
+    # as written in the context.
+    "cot_extract_v2_k10": PipelineConfig(
+        name="cot_extract_v2_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="cot_extract_v2",
+        llm_model="minimax-3",
+    ),
+    # iter-20: enable Anthropic extended thinking mode (4096 reasoning
+    # budget). Uses the simple extract_span prompt — the model reasons
+    # internally instead of in the visible output. Visible answer stays
+    # clean (no reasoning noise diluted into it), while the model still
+    # gets the multi-hop / canonical-name / yes-no reasoning benefit.
+    "cot_thinking_k10": PipelineConfig(
+        name="cot_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="extract_span",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-21: same CoT prompt as cot_extract_k10 BUT with the [title]:
+    # heading prefix stripped from each context paragraph. Hypothesis
+    # (from iter-20 thinking audit): the model uses Wikipedia article
+    # headings as entity labels when emitting answers, while HotpotQA
+    # gold uses the full canonical form (typically in the body opening).
+    # Stripping the heading forces the model to extract the canonical
+    # name from the body text.
+    "cot_extract_notitles_k10": PipelineConfig(
+        name="cot_extract_notitles_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="cot_extract_no_titles",
         llm_model="minimax-3",
     ),
     # Hybrid BM25 + dense via Reciprocal Rank Fusion. Different lever than

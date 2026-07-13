@@ -79,19 +79,29 @@ async def ask_llm(
     model: str,
     messages: list[dict],
     max_tokens: int = 200,
+    thinking_budget: int | None = None,
 ) -> str:
     """One Anthropic call returning the answer text (FR-41.2).
 
     Skips thinking blocks (we only want the visible answer text for scoring).
     Joins multiple text blocks with newlines; trims whitespace.
     temperature=0 for determinism (NFR-21).
+
+    If `thinking_budget` is set (positive int), enables Anthropic extended
+    thinking mode with that many tokens of internal reasoning budget.
+    `max_tokens` should be >= `thinking_budget` so the visible answer has
+    room to render. Returns only the visible `text` blocks — reasoning
+    is discarded (kept implicit in non-text blocks).
     """
-    response = await client.messages.create(
+    kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
         temperature=0,
         messages=messages,
     )
+    if thinking_budget is not None and thinking_budget > 0:
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+    response = await client.messages.create(**kwargs)
     parts: list[str] = []
     for block in response.content:
         if _block_type(block) == "text":

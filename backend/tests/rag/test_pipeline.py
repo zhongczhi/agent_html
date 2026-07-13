@@ -7,6 +7,9 @@ from langchain_core.documents import Document
 from backend.rag.pipeline import (
     AnthropicLLM,
     BM25Retriever,
+    CoTExtractNoTitlesPromptBuilder,
+    CoTExtractPromptBuilder,
+    CoTExtractV2PromptBuilder,
     CrossEncoderReranker,
     DefaultPromptBuilder,
     DenseRetriever,
@@ -16,6 +19,7 @@ from backend.rag.pipeline import (
     PRESETS,
     PipelineConfig,
     RagPipeline,
+    build_llm,
     build_pipeline,
     build_prompt_builder,
     build_reranker,
@@ -137,6 +141,30 @@ def test_extract_span_builder_user_only_when_no_context():
     assert len(msgs) == 1
 
 
+# ---- CoTExtractPromptBuilder (iter-15) -----------------------------------
+
+def test_cot_extract_builder_appends_step_by_step():
+    """iter-15: CoT-extract prompt must scaffold step-by-step reasoning
+    in addition to the verbatim-span discipline. Both should appear in
+    the system prompt."""
+    b = CoTExtractPromptBuilder()
+    docs = [Document(page_content="text", metadata={"title": "T"})]
+    msgs = b.build("Q?", docs)
+    assert len(msgs) == 2
+    system = msgs[0]["content"].lower()
+    assert "step by step" in system
+    assert "extract" in system
+    assert "verbatim" in system
+
+
+def test_cot_extract_builder_user_only_when_no_context():
+    b = CoTExtractPromptBuilder()
+    msgs = b.build("Q?", None)
+    assert len(msgs) == 1
+
+
+
+
 # ---- Factory: build_reranker --------------------------------------------
 
 def test_build_reranker_none():
@@ -166,6 +194,14 @@ def test_build_prompt_builder_default():
 def test_build_prompt_builder_extract_span():
     cfg = PipelineConfig(name="x", prompt_template="extract_span")
     assert isinstance(build_prompt_builder(cfg), ExtractSpanPromptBuilder)
+
+
+def test_build_prompt_builder_cot_extract():
+    """iter-15: cot_extract dispatch returns the CoT-aware builder."""
+    from backend.rag.pipeline import CoTExtractPromptBuilder
+    cfg = PipelineConfig(name="x", prompt_template="cot_extract")
+    assert isinstance(build_prompt_builder(cfg), CoTExtractPromptBuilder)
+
 
 
 def test_build_prompt_builder_unknown_raises():
@@ -276,6 +312,14 @@ def test_presets_have_expected_keys():
     # iter-14 ceiling variants
     assert "extract_span_k8" in PRESETS
     assert "extract_span_k10" in PRESETS
+    # iter-15 SOTA
+    assert "cot_extract_k10" in PRESETS
+    # iter-19: minimal v2 refinement of cot_extract
+    assert "cot_extract_v2_k10" in PRESETS
+    # iter-19: rolled back the iter-15/16/17 canonical + iter-18 two-step
+    # experiments
+    assert "canonical_extract_k10" not in PRESETS
+    assert "two_step_extract_k10" not in PRESETS
 
 
 def test_naive_dense_uses_default_embedding():
@@ -319,10 +363,234 @@ def test_extract_span_k10_uses_full_context():
     assert cfg.reranker is None
 
 
+def test_cot_extract_k10_combines_cot_and_full_context():
+    """iter-15 preset: cot_extract prompt + k=10 full context window."""
+    cfg = PRESETS["cot_extract_k10"]
+    assert cfg.prompt_template == "cot_extract"
+    assert cfg.top_k == 10
+    assert cfg.reranker is None
+    assert cfg.retriever == "dense"
+
+
+
 def test_list_presets_returns_sorted():
     names = list_presets()
     assert names == sorted(names)
     assert len(names) >= 4
+
+
+# ---- CoTExtractV2PromptBuilder (iter-19) -------------------------------
+
+def test_cot_extract_v2_keeps_cot_scaffold():
+    """iter-19: V2 inherits CoT scaffold (same 4 numbered steps)."""
+    from backend.rag.pipeline import CoTExtractV2PromptBuilder
+    b = CoTExtractV2PromptBuilder()
+    docs = [Document(page_content="text", metadata={"title": "T"})]
+    msgs = b.build("Q?", docs)
+    system = msgs[0]["content"]
+    assert "Think step by step:" in system
+    assert "1. Identify the entities" in system
+    assert "2. Find the relevant paragraph" in system
+    assert "3. If multi-hop reasoning is needed" in system
+
+
+
+def test_cot_extract_v2_user_only_when_no_context():
+    from backend.rag.pipeline import CoTExtractV2PromptBuilder
+    b = CoTExtractV2PromptBuilder()
+    msgs = b.build("Q?", None)
+    assert len(msgs) == 1
+
+
+def test_build_prompt_builder_v2_returns_v2_class():
+    """iter-19: cot_extract_v2 template dispatches to CoTExtractV2PromptBuilder."""
+    cfg = PipelineConfig(name="x", prompt_template="cot_extract_v2")
+    assert isinstance(build_prompt_builder(cfg), CoTExtractV2PromptBuilder)
+
+
+def test_cot_extract_v2_k10_preset_uses_v2_template():
+    cfg = PRESETS["cot_extract_v2_k10"]
+    assert cfg.prompt_template == "cot_extract_v2"
+    assert cfg.top_k == 10
+
+
+
+# ---- CoTExtractV2PromptBuilder (iter-19) -------------------------------
+
+def test_cot_extract_v2_keeps_cot_scaffold():
+    """iter-19: V2 inherits CoT scaffold (same 4 numbered steps)."""
+    b = CoTExtractV2PromptBuilder()
+    docs = [Document(page_content="text", metadata={"title": "T"})]
+    msgs = b.build("Q?", docs)
+    system = msgs[0]["content"]
+    assert "Think step by step:" in system
+    assert "1. Identify the entities" in system
+    assert "2. Find the relevant paragraph" in system
+    assert "3. If multi-hop reasoning is needed" in system
+
+
+def test_cot_extract_v2_adds_canonical_nudge_in_step_4():
+    """iter-19: step 4 contains the 'most complete form' nudge embedded
+    directly into the CoT instruction rather than as a separate rule."""
+    b = CoTExtractV2PromptBuilder()
+    docs = [Document(page_content="text", metadata={"title": "T"})]
+    msgs = b.build("Q?", docs)
+    system = msgs[0]["content"]
+    # Step 4 contains the nudge.
+    assert "most complete form" in system
+
+
+def test_cot_extract_v2_prompt_grows_only_minimally_over_cot():
+    """iter-19: V2 should add only a few extra words vs the cot baseline.
+    No examples, no discriminators, no separate rules."""
+    from backend.rag.pipeline import CoTExtractPromptBuilder
+    v2 = CoTExtractV2PromptBuilder()
+    v1 = CoTExtractPromptBuilder()
+    v2_len = len(v2._system_prompt)
+    v1_len = len(v1._system_prompt)
+    # The nudge adds roughly 25 words. Allow generous slack.
+    assert v2_len - v1_len < 200, (
+        f"V2 prompt grew by {v2_len - v1_len} chars vs cot; iter-19 budget is < 200."
+    )
+
+
+def test_cot_extract_v2_user_only_when_no_context():
+    b = CoTExtractV2PromptBuilder()
+    msgs = b.build("Q?", None)
+    assert len(msgs) == 1
+
+
+def test_build_prompt_builder_v2_returns_v2_class():
+    """iter-19: cot_extract_v2 template dispatches to CoTExtractV2PromptBuilder."""
+    cfg = PipelineConfig(name="x", prompt_template="cot_extract_v2")
+    assert isinstance(build_prompt_builder(cfg), CoTExtractV2PromptBuilder)
+
+
+def test_cot_extract_v2_k10_preset_uses_v2_template():
+    cfg = PRESETS["cot_extract_v2_k10"]
+    assert cfg.prompt_template == "cot_extract_v2"
+    assert cfg.top_k == 10
+    assert cfg.reranker is None
+    assert cfg.retriever == "dense"
+
+
+def test_iter_19_presets_rolled_back():
+    """iter-19: rolled back iter-15/16/17 canonical and iter-18 two-step
+    experiments; those presets should no longer be in PRESETS."""
+    assert "canonical_extract_k10" not in PRESETS
+    assert "two_step_extract_k10" not in PRESETS
+
+
+# ---- iter-21: CoTExtractNoTitlesPromptBuilder (heading-stripped) -------
+
+def test_cot_extract_no_titles_strips_heading_prefix():
+    """iter-21: context paragraphs have NO `[title]:` prefix in the
+    user prompt. The model has to find entity names in the body text."""
+    b = CoTExtractNoTitlesPromptBuilder()
+    docs = [
+        Document(page_content="Louis-Hector Berlioz (born 11 December 1803) was a French Romantic composer.", metadata={"title": "Hector Berlioz"}),
+        Document(page_content="Gaetano Donizetti was an Italian composer.", metadata={"title": "Gaetano Donizetti"}),
+    ]
+    msgs = b.build("Which is the French Romantic composer?", docs)
+    user = msgs[1]["content"]
+    # Body content is present...
+    assert "Louis-Hector Berlioz" in user
+    assert "Gaetano Donizetti" in user
+    # ...but no `[title]:` heading prefix.
+    assert "[Hector Berlioz]:" not in user
+    assert "[Gaetano Donizetti]:" not in user
+
+
+def test_cot_extract_no_titles_keeps_cot_scaffold():
+    """iter-21: title-stripped variant still includes the CoT instruction."""
+    b = CoTExtractNoTitlesPromptBuilder()
+    docs = [Document(page_content="x", metadata={"title": "T"})]
+    msgs = b.build("Q?", docs)
+    system = msgs[0]["content"]
+    assert "Think step by step:" in system
+    assert "quote it verbatim from the context" in system
+
+
+def test_cot_extract_no_titles_user_only_when_no_context():
+    b = CoTExtractNoTitlesPromptBuilder()
+    msgs = b.build("Q?", None)
+    assert len(msgs) == 1
+
+
+def test_build_prompt_builder_no_titles_dispatches_correctly():
+    cfg = PipelineConfig(name="x", prompt_template="cot_extract_no_titles")
+    assert isinstance(build_prompt_builder(cfg), CoTExtractNoTitlesPromptBuilder)
+
+
+def test_cot_extract_notitles_k10_preset_uses_no_titles_template():
+    """iter-21: preset registered with the title-stripped template."""
+    cfg = PRESETS["cot_extract_notitles_k10"]
+    assert cfg.prompt_template == "cot_extract_no_titles"
+    assert cfg.top_k == 10
+    assert cfg.reranker is None
+
+
+def test_cot_extract_keeps_titles_for_backward_compat():
+    """iter-21: original cot_extract template still uses titles (the iter-21
+    experiment must not silently change SOTA behavior)."""
+    b = CoTExtractPromptBuilder()
+    docs = [Document(page_content="x", metadata={"title": "T"})]
+    msgs = b.build("Q?", docs)
+    user = msgs[1]["content"]
+    assert "[T]:" in user  # cot_extract DOES include the heading
+
+
+# ---- iter-20: Anthropic extended thinking mode ---------------------------
+
+def test_pipeline_config_default_thinking_budget_is_none():
+    """iter-20: default thinking_budget is None (disabled) for backward
+    compatibility with all existing presets."""
+    cfg = PipelineConfig(name="test")
+    assert cfg.thinking_budget is None
+
+
+def test_cot_thinking_k10_preset_uses_thinking_budget_4096():
+    """iter-20: cot_thinking_k10 enables Anthropic thinking mode at 4096."""
+    cfg = PRESETS["cot_thinking_k10"]
+    assert cfg.thinking_budget == 4096
+    assert cfg.top_k == 10
+    assert cfg.reranker is None
+    assert cfg.retriever == "dense"
+
+
+def test_anthropic_llm_stores_thinking_budget():
+    """iter-20: AnthropicLLM accepts thinking_budget in __init__."""
+    from backend.rag.pipeline import AnthropicLLM
+    llm = AnthropicLLM(client=MagicMock(), model="m", thinking_budget=4096)
+    assert llm._thinking_budget == 4096
+
+
+def test_anthropic_llm_thinking_budget_default_is_none():
+    """iter-20: default thinking_budget is None (preserves old behavior)."""
+    from backend.rag.pipeline import AnthropicLLM
+    llm = AnthropicLLM(client=MagicMock(), model="m")
+    assert llm._thinking_budget is None
+
+
+def test_build_llm_threads_thinking_budget_from_config():
+    """iter-20: build_llm reads thinking_budget from PipelineConfig."""
+    cfg = PRESETS["cot_thinking_k10"]
+    llm = build_llm(cfg, client=MagicMock())
+    assert llm._thinking_budget == 4096
+
+
+@pytest.mark.asyncio
+async def test_anthropic_llm_ask_calls_ask_llm_with_thinking_budget():
+    """iter-20: AnthropicLLM.ask passes thinking_budget through to ask_llm."""
+    from unittest.mock import AsyncMock, patch
+    from backend.rag.pipeline import AnthropicLLM
+    llm = AnthropicLLM(client=MagicMock(), model="m", thinking_budget=2048)
+    with patch("backend.eval.qa_judge.ask_llm", new=AsyncMock(return_value="ANS")) as mock_ask:
+        out = await llm.ask([{"role": "user", "content": "Q"}], max_tokens=2048)
+    assert out == "ANS"
+    # Confirm thinking_budget was passed through.
+    kwargs = mock_ask.call_args.kwargs
+    assert kwargs.get("thinking_budget") == 2048
 
 
 # ---- build_pipeline (the one-switch API) --------------------------------
