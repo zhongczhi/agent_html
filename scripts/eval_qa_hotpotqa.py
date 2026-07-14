@@ -207,6 +207,16 @@ def main(argv: list[str] | None = None) -> int:
             "retrieved_titles, etc. Useful for failure-mode inspection."
         ),
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of items to process concurrently. Each item still has its "
+            "variants/modes done sequentially; batch-size only parallelizes the "
+            "LLM calls across items. Default 1 (sequential)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Handle --list-pipelines early.
@@ -310,102 +320,123 @@ def main(argv: list[str] | None = None) -> int:
     cache_hits = cache_builds = errors = 0
     t0 = time.monotonic()
 
+    async def _process_one_item(client, item) -> list[dict]:
+        """Process one item end-to-end (sync setup + async LLM calls).
+
+        Returns the list of result dicts (one per variant × mode).
+        """
+        nonlocal cache_hits, cache_builds
+        item_results: list[dict] = []
+        try:
+            # Hybrid retrievers also need the raw corpus (to build
+            # the BM25 index). For dense-only, we skip it for speed.
+            needs_corpus = (
+                pipeline_cfg is not None
+                and pipeline_cfg.retriever == "hybrid"
+            )
+            if needs_corpus:
+                index, hit, corpus = ev_cache.load_or_build(
+                    item, d_sha, embeddings,
+                    no_cache=args.no_cache, with_corpus=True,
+                )
+            else:
+                index, hit = ev_cache.load_or_build(
+                    item, d_sha, embeddings, no_cache=args.no_cache
+                )
+                corpus = None
+            if hit:
+                cache_hits += 1
+            else:
+                cache_builds += 1
+
+            # Build the (question_text, variant_name) list.
+            variants: list[tuple[str, str]] = [(item.question, "original")]
+            para_entry = paraphrases.get(item.id)
+            if para_entry:
+                for style in ("lexical", "structural", "casual"):
+                    if style in para_entry.get("paraphrases", {}):
+                        variants.append(
+                            (para_entry["paraphrases"][style], style)
+                        )
+
+            # If the pipeline is hybrid, build the hybrid retriever
+            # once per question (it holds the BM25 index in memory).
+            hybrid_retriever = None
+            if pipeline_cfg is not None and pipeline_cfg.retriever == "hybrid":
+                from backend.rag.pipeline import (
+                    BM25Retriever, DenseRetriever, HybridRetriever,
+                )
+                hybrid_retriever = HybridRetriever(
+                    dense_retriever=DenseRetriever(index),
+                    bm25_retriever=BM25Retriever(corpus),
+                )
+
+            for q_text, vname in variants:
+                # When the pipeline preset configures a reranker,
+                # retrieve more candidates and rerank to top_k.
+                # Otherwise a plain top_k retrieval is enough.
+                # Hybrid path uses the prebuilt HybridRetriever.
+                if hybrid_retriever is not None:
+                    retrieved_docs = hybrid_retriever.retrieve(q_text, k=pipeline_cfg.top_k)
+                elif pipeline_cfg is not None and pipeline_cfg.reranker is not None:
+                    from backend.rag.pipeline import build_reranker
+                    reranker = build_reranker(pipeline_cfg)
+                    candidates = index.similarity_search(
+                        q_text, k=pipeline_cfg.rerank_top_k,
+                    )
+                    retrieved_docs = reranker.rerank(
+                        q_text, candidates, top_k=pipeline_cfg.top_k,
+                    )
+                else:
+                    retrieved_docs = index.similarity_search(q_text, k=args.k)
+                # Localize failure modes: was the gold paragraph in the
+                # retrieved set, even if the LLM still missed the answer?
+                gold_titles = hotpot.gold_paragraph_titles(item)
+                retrieved_titles = [d.metadata.get("title", "") for d in retrieved_docs]
+                gold_hit = metrics.gold_paragraph_in_top_k(retrieved_titles, gold_titles)
+                # with-context mode
+                item_results.append(await _evaluate_one(
+                    client, args.llm_model, item, retrieved_docs,
+                    q_text, vname, "with_context",
+                    prompt_template=prompt_template,
+                    gold_in_top_k=gold_hit,
+                    gold_titles=gold_titles,
+                    retrieved_titles=retrieved_titles,
+                    thinking_budget=pipeline_cfg.thinking_budget if pipeline_cfg else None,
+                    max_tokens=(pipeline_cfg.thinking_budget + 512) if pipeline_cfg and pipeline_cfg.thinking_budget else None,
+                ))
+                if args.compare_baseline:
+                    # without-context baseline (retrieval doesn't apply)
+                    item_results.append(await _evaluate_one(
+                        client, args.llm_model, item, None,
+                        q_text, vname, "without_context",
+                        prompt_template=prompt_template,
+                        gold_in_top_k=None,
+                        gold_titles=gold_titles,
+                        retrieved_titles=retrieved_titles,
+                        thinking_budget=None,  # baseline never uses thinking
+                    ))
+        except Exception as e:
+            log.warning("qid=%s error: %s", item.id, e)
+        return item_results
+
     async def run() -> int:
         nonlocal cache_hits, cache_builds, errors
         async with AsyncAnthropic(api_key=api_key) as client:
-            for item in items:
-                try:
-                    # Hybrid retrievers also need the raw corpus (to build
-                    # the BM25 index). For dense-only, we skip it for speed.
-                    needs_corpus = (
-                        pipeline_cfg is not None
-                        and pipeline_cfg.retriever == "hybrid"
-                    )
-                    if needs_corpus:
-                        index, hit, corpus = ev_cache.load_or_build(
-                            item, d_sha, embeddings,
-                            no_cache=args.no_cache, with_corpus=True,
-                        )
-                    else:
-                        index, hit = ev_cache.load_or_build(
-                            item, d_sha, embeddings, no_cache=args.no_cache
-                        )
-                        corpus = None
-                    if hit:
-                        cache_hits += 1
-                    else:
-                        cache_builds += 1
-
-                    # Build the (question_text, variant_name) list.
-                    variants: list[tuple[str, str]] = [(item.question, "original")]
-                    para_entry = paraphrases.get(item.id)
-                    if para_entry:
-                        for style in ("lexical", "structural", "casual"):
-                            if style in para_entry.get("paraphrases", {}):
-                                variants.append(
-                                    (para_entry["paraphrases"][style], style)
-                                )
-
-                    # If the pipeline is hybrid, build the hybrid retriever
-                    # once per question (it holds the BM25 index in memory).
-                    hybrid_retriever = None
-                    if pipeline_cfg is not None and pipeline_cfg.retriever == "hybrid":
-                        from backend.rag.pipeline import (
-                            BM25Retriever, DenseRetriever, HybridRetriever,
-                        )
-                        hybrid_retriever = HybridRetriever(
-                            dense_retriever=DenseRetriever(index),
-                            bm25_retriever=BM25Retriever(corpus),
-                        )
-
-                    for q_text, vname in variants:
-                        # When the pipeline preset configures a reranker,
-                        # retrieve more candidates and rerank to top_k.
-                        # Otherwise a plain top_k retrieval is enough.
-                        # Hybrid path uses the prebuilt HybridRetriever.
-                        if hybrid_retriever is not None:
-                            retrieved_docs = hybrid_retriever.retrieve(q_text, k=pipeline_cfg.top_k)
-                        elif pipeline_cfg is not None and pipeline_cfg.reranker is not None:
-                            from backend.rag.pipeline import build_reranker
-                            reranker = build_reranker(pipeline_cfg)
-                            candidates = index.similarity_search(
-                                q_text, k=pipeline_cfg.rerank_top_k,
-                            )
-                            retrieved_docs = reranker.rerank(
-                                q_text, candidates, top_k=pipeline_cfg.top_k,
-                            )
-                        else:
-                            retrieved_docs = index.similarity_search(q_text, k=args.k)
-                        # Localize failure modes: was the gold paragraph in the
-                        # retrieved set, even if the LLM still missed the answer?
-                        gold_titles = hotpot.gold_paragraph_titles(item)
-                        retrieved_titles = [d.metadata.get("title", "") for d in retrieved_docs]
-                        gold_hit = metrics.gold_paragraph_in_top_k(retrieved_titles, gold_titles)
-                        # with-context mode
-                        per_q.append(await _evaluate_one(
-                            client, args.llm_model, item, retrieved_docs,
-                            q_text, vname, "with_context",
-                            prompt_template=prompt_template,
-                            gold_in_top_k=gold_hit,
-                            gold_titles=gold_titles,
-                            retrieved_titles=retrieved_titles,
-                            thinking_budget=pipeline_cfg.thinking_budget if pipeline_cfg else None,
-                            max_tokens=(pipeline_cfg.thinking_budget + 512) if pipeline_cfg and pipeline_cfg.thinking_budget else None,
-                        ))
-                        if args.compare_baseline:
-                            # without-context baseline (retrieval doesn't apply)
-                            per_q.append(await _evaluate_one(
-                                client, args.llm_model, item, None,
-                                q_text, vname, "without_context",
-                                prompt_template=prompt_template,
-                                gold_in_top_k=None,
-                                gold_titles=gold_titles,
-                                retrieved_titles=retrieved_titles,
-                                thinking_budget=None,  # baseline never uses thinking
-                            ))
-                except Exception as e:
-                    log.warning("qid=%s error: %s", item.id, e)
-                    errors += 1
+            batch_size = max(1, args.batch_size)
+            for batch_start in range(0, len(items), batch_size):
+                batch = items[batch_start:batch_start + batch_size]
+                # Process this batch of items concurrently.
+                batch_results = await asyncio.gather(
+                    *[_process_one_item(client, item) for item in batch],
+                    return_exceptions=False,
+                )
+                for item_results in batch_results:
+                    per_q.extend(item_results)
+                # Pacing between batches (skipped when batch_size=1 and within
+                # the LLM round-trip latency, but useful when batched).
+                if batch_size > 1:
+                    await asyncio.sleep(PACING_SECONDS)
 
         elapsed = time.monotonic() - t0
 
