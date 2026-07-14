@@ -728,6 +728,20 @@ PRESETS: dict[str, PipelineConfig] = {
         prompt_template="cot_extract_no_titles",
         llm_model="minimax-3",
     ),
+    # iter-22: combine title-strip (iter-21) with thinking mode (iter-20).
+    # Title-strip forces canonical-name extraction from the body; thinking
+    # gives the model more reasoning budget for hard multi-hop questions.
+    "cot_extract_notitles_thinking_k10": PipelineConfig(
+        name="cot_extract_notitles_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="cot_extract_no_titles",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
     # Hybrid BM25 + dense via Reciprocal Rank Fusion. Different lever than
     # embedding-model size: BM25 catches exact entity-name matches the
     # embedding model glosses over, dense catches paraphrase matches BM25

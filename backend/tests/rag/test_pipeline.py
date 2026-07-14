@@ -530,6 +530,14 @@ def test_cot_extract_notitles_k10_preset_uses_no_titles_template():
     assert cfg.reranker is None
 
 
+def test_cot_extract_notitles_thinking_k10_combines_both():
+    """iter-22: combine title-strip with thinking mode (4096 budget)."""
+    cfg = PRESETS["cot_extract_notitles_thinking_k10"]
+    assert cfg.prompt_template == "cot_extract_no_titles"
+    assert cfg.thinking_budget == 4096
+    assert cfg.top_k == 10
+
+
 def test_cot_extract_keeps_titles_for_backward_compat():
     """iter-21: original cot_extract template still uses titles (the iter-21
     experiment must not silently change SOTA behavior)."""

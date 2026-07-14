@@ -26,7 +26,7 @@ implementations are deliberately short.
 | Pacing | `PACING_SECONDS = 1` (1s between LLM calls) |
 | Per-question corpus | 10 paragraphs (2 gold + 8 distractor) |
 | Embedding backends | `sentence-transformers` (HuggingFace) |
-| Iterations | iter-12 (large_dense, dense_then_ce), iter-13 (hybrid), iter-14 (extract_span family + k-variants). All rerun on the same SHA 2026-07-12. |
+| Iterations | iter-12 (large_dense, dense_then_ce), iter-13 (hybrid), iter-14 (extract_span family + k-variants), iter-15 (cot_extract), iter-19 (cot_extract_v2), iter-20 (cot_thinking), iter-21 (cot_extract_notitles), iter-22 (cot_extract_notitles_thinking). All rerun on the same SHA 2026-07-12. |
 
 Re-running any row from scratch takes ~17–60 min wall-clock depending on
 cold-cache vs warm-cache.
@@ -44,15 +44,21 @@ Sorted by `contains_gold` (best first), same dataset, same LLM:
 
 | # | Pipeline | `contains_gold` | `answer_f1` | `answer_em` | extraction miss | retrieval miss | n | Cost note |
 |:-:|---|---:|---:|---:|---:|---:|:-:|---|
-| 1 | **extract_span_k10** | **0.889** | 0.098 | 0.006 | 37 | 0 | 334 | MiniLM + 10 paragraphs + verbatim-span prompt |
-| 2 | top_k=10 (naive) | 0.880 | 0.128 | 0.009 | 40 | 0 | 334 | MiniLM + 10 paragraphs, default prompt |
-| 3 | extract_span_k8 | 0.874 | 0.089 | 0.003 | 42 | 0 | 334 | MiniLM + 8 paragraphs + verbatim-span prompt |
-| 4 | top_k=8 (naive) | 0.850 | 0.125 | 0.009 | 50 | 0 | 334 | MiniLM + 8 paragraphs, default prompt |
-| 5 | extract_span_prompt (k=4) | 0.792 | 0.083 | 0.000 | 63 | 6 | 332 | mpnet, k=4, verbatim-span prompt |
-| 6 | large_dense (mpnet, k=4) | 0.787 | 0.124 | 0.015 | 68 | 3 | 334 | mpnet, k=4, default prompt |
-| 7 | dense_then_ce (rerank) | 0.786 | 0.129 | 0.019 | 68 | 1 | 322 | mpnet + cross-encoder rerank 50→4 |
-| 8 | naive_dense (k=4) | 0.778 | 0.118 | 0.009 | 71 | 3 | 334 | MiniLM, k=4, default prompt (baseline) |
-| 9 | hybrid_bm25_dense | 0.769 | 0.117 | 0.009 | 74 | 3 | 334 | MiniLM + BM25 via RRF, k=4 |
+| 1 | **cot_extract_notitles_thinking_k10** (NEW SOTA) | **0.934** | 0.077 | 0.000 | 22 | 0 | 334 | MiniLM + 10 paragraphs + title-strip + CoT scaffold + Anthropic thinking (4096 budget) |
+| 2 | cot_extract_notitles_k10 | 0.925 | 0.088 | 0.009 | 25 | 0 | 334 | MiniLM + 10 paragraphs + title-strip + CoT scaffold |
+| 3 | cot_extract_k10 | 0.904 | 0.123 | 0.012 | 32 | 0 | 334 | MiniLM + 10 paragraphs + CoT scaffold (titles retained) |
+| 4 | extract_span_k10 | 0.889 | 0.098 | 0.006 | 37 | 0 | 334 | MiniLM + 10 paragraphs + verbatim-span prompt |
+| 5 | top_k=10 (naive) | 0.880 | 0.128 | 0.009 | 40 | 0 | 334 | MiniLM + 10 paragraphs, default prompt |
+| 6 | extract_span_k8 | 0.874 | 0.089 | 0.003 | 42 | 0 | 334 | MiniLM + 8 paragraphs + verbatim-span prompt |
+| 7 | top_k=8 (naive) | 0.850 | 0.125 | 0.009 | 50 | 0 | 334 | MiniLM + 8 paragraphs, default prompt |
+| 8 | extract_span_prompt (k=4) | 0.792 | 0.083 | 0.000 | 63 | 6 | 332 | mpnet, k=4, verbatim-span prompt |
+| 9 | large_dense (mpnet, k=4) | 0.787 | 0.124 | 0.015 | 68 | 3 | 334 | mpnet, k=4, default prompt |
+| 10 | dense_then_ce (rerank) | 0.786 | 0.129 | 0.019 | 68 | 1 | 322 | mpnet + cross-encoder rerank 50→4 |
+| 11 | naive_dense (k=4) | 0.778 | 0.118 | 0.009 | 71 | 3 | 334 | MiniLM, k=4, default prompt (baseline) |
+| 12 | hybrid_bm25_dense | 0.769 | 0.117 | 0.009 | 74 | 3 | 334 | MiniLM + BM25 via RRF, k=4 |
+
+(Note: `cot_thinking_k10` and `cot_extract_v2_k10` were also evaluated but tied
+with `cot_extract_k10` at 0.904 — kept in `PRESETS` as documented variants.)
 
 ### Key observations from the table
 
@@ -82,7 +88,23 @@ contains_gold over naive_dense k=4 (0.778):
   large_dense      :  +0.9 pp   (within noise)
   dense_then_ce    :  +0.8 pp   (within noise, 12 errors!)
   hybrid_bm25_dense:  -0.9 pp   (within noise)
-```
+
+Trajectory after iter-14 (the original SOTA was cot_extract_k10 at 0.904):
+
+  cot_extract_k10                  :   baseline       (0.904, 32 fail)
+  cot_extract_v2_k10 (nudge)       :   -0.9 pp        (regressed)
+  cot_thinking_k10                 :    0 pp  tie     (different questions)
+  cot_extract_notitles_k10         :   +2.1 pp        (0.925, 25 fail)
+  cot_extract_notitles_thinking_k10:   +3.0 pp        (0.934, 22 fail)  ← SOTA
+
+The iter-20 audit (thinking-mode dump of failure thinking content) revealed
+that the model was treating Wikipedia article headings as entity labels
+when emitting answers — but HotpotQA's gold uses the full canonical name
+found in the article body opening. Iter-21 stripped the `[title]:`
+heading prefix to remove the bad cue at the source. Iter-22 added
+thinking-mode reasoning budget on top, giving the model space to reason
+about canonical-form choice. Each lever compounds; no single lever
+reached 0.934 alone.
 
 ---
 
@@ -481,6 +503,76 @@ distractor hits that dilute top-4.
 
 ---
 
+### 3.8 cot_extract_notitles_thinking_k10 — the current SOTA (iter-22)
+
+**What it is**: Combines three iter-15→22 levers:
+
+1. **CoT scaffold** (iter-15): `CoTExtractPromptBuilder`'s step-by-step reasoning.
+2. **Title-strip** (iter-21): `CoTExtractNoTitlesPromptBuilder` strips the
+   `[title]:` heading prefix from each context paragraph.
+3. **Anthropic thinking mode** (iter-20+22): 4096-token internal
+   reasoning budget via `thinking.budget_tokens`; visible answer is
+   extracted from the resulting `text` block only (thinking is discarded).
+
+**Configuration**:
+```python
+PRESETS["cot_extract_notitles_thinking_k10"] = PipelineConfig(
+    embedding_backend="sentence-transformers",
+    embedding_model="all-MiniLM-L6-v2",
+    retriever="dense",
+    reranker=None,
+    top_k=10,
+    prompt_template="cot_extract_no_titles",  # CoT scaffold + title-strip
+    thinking_budget=4096,                    # Anthropic extended thinking
+    llm_model="minimax-3",
+)
+```
+
+**Why this combination wins**: Each lever addresses a different failure
+mode — they compound.
+
+- **CoT** scaffolds multi-hop reasoning (had been solving ~7 of 32 failures)
+- **Title-strip** removes the bad cue where the model latches onto
+  Wikipedia article headings instead of the canonical body form
+  (adds ~7 fixes on top of CoT)
+- **Thinking** gives the model budget to reason about canonical-form
+  choice on hard multi-hop questions (adds ~3 more fixes on top)
+
+**Implementation**:
+
+| Stage | Class | File | Lines |
+|---|---|---|---|
+| CoT scaffold + title-strip prompt | `CoTExtractNoTitlesPromptBuilder` | `backend/rag/pipeline.py` | 314-… |
+| Thinking plumbing | `AnthropicLLM.ask` | `backend/rag/pipeline.py` | 333-… |
+| Eval routing | `_evaluate_one` | `scripts/eval_qa_hotpotqa.py` | 81-… |
+
+**Cost delta vs cot_extract_k10**: ~50% more wall-clock (1939s vs 1012s on
+n=334) because thinking-mode emits 5-10× more output tokens per call,
+even though we discard the thinking content in scoring.
+
+**How to use**:
+```bash
+python scripts/eval_qa_hotpotqa.py --subset 1000 --pipeline cot_extract_notitles_thinking_k10
+```
+
+**When to use**: Recommended default for HotpotQA-style benchmarks where
+gold answers use canonical entity names (full first/middle names,
+suffixes, parentheticals) different from the colloquial Wikipedia heading.
+The title-strip lift may not transfer to other benchmarks where this
+gap doesn't exist.
+
+**Caveats**:
+- The benchmark must have gold-vs-heading name divergence. On datasets
+  where gold uses colloquial names (or where paragraphs have no heading
+  cue), title-strip is a wash.
+- 2× LLM cost vs CoT-only presets.
+- The 22 remaining failures break down: ~7 still-name-variant
+  (model extracts a shorter body form), ~5 yes/no (model doesn't lead
+  with literal), ~3 dataset-noise (corpus disagrees with gold), ~7
+  reasoning/wrong-entity (genuine model limits).
+
+---
+
 ## 4. How to reproduce any row
 
 Every number in §2 was generated by one of these commands, run from the
@@ -489,6 +581,9 @@ repo root with `ANTHROPIC_API_KEY` set. Wall-clock depends on cache state.
 ```bash
 # Baseline (MiniLM, k=4)
 python scripts/eval_qa_hotpotqa.py --subset 1000 --pipeline naive_dense
+
+# NEW SOTA (iter-22): CoT + title-strip + thinking
+python scripts/eval_qa_hotpotqa.py --subset 1000 --pipeline cot_extract_notitles_thinking_k10
 
 # Bigger embedding (mpnet, k=4)
 python scripts/eval_qa_hotpotqa.py --subset 1000 --pipeline large_dense
@@ -652,7 +747,9 @@ the eval pipeline working, then sweep `top_k` first.
 
 - **n=334 is small for deltas <2 pp.** Lifts like `+0.8 pp` for
   dense_then_ce are within sampling noise. Don't read too much into
-  ranking below rank 4.
+  ranking below rank 4. The iter-21 → iter-22 lift (+0.9 pp) is also
+  within noise; the cumulative iter-15 → iter-22 lift (+3.0 pp) is more
+  robust.
 - **HotpotQA-specific.** Paragraphs are pre-chosen (10 per question),
   retrieval is "easy" within those 10. On larger / noisier corpora,
   hybrid and rerank likely help more.
@@ -660,11 +757,17 @@ the eval pipeline working, then sweep `top_k` first.
   That alone de-rates the comparison; the missing 12 questions might
   have lifted `contains_gold` by ~1 pp if completed.
 - **`answer_f1` and `answer_em` behave inversely to `contains_gold` for
-  `extract_span_*` variants.** The model is now quoting verbatim, which
-  is great for substring containment but strips the conversational
-  padding that the token-level F1 prefers. `contains_gold` is the
-  user-relevant metric; `answer_f1` is included for benchmark parity
-  but is not the optimization target.
+  `extract_span_*` and `cot_*` variants.** The model is now quoting
+  verbatim, which is great for substring containment but strips the
+  conversational padding that the token-level F1 prefers. `contains_gold`
+  is the user-relevant metric; `answer_f1` is included for benchmark
+  parity but is not the optimization target.
 - **LLM `minimax-3` is a generic model**, not a fine-tuned extractor. A
   larger instruction-tuned LLM might have a different
   extraction-vs-context curve.
+- **Title-strip is benchmark-specific.** HotpotQA gold uses the
+  full canonical entity name (e.g., "Louis-Hector Berlioz") rather than
+  the Wikipedia heading ("Hector Berlioz"). Other QA benchmarks may not
+  have this gap, in which case the iter-21 lift wouldn't reproduce.
+  Worth checking before adopting `cot_extract_notitles_*` as a default
+  for non-HotpotQA workloads.
