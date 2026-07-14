@@ -217,6 +217,24 @@ def main(argv: list[str] | None = None) -> int:
             "LLM calls across items. Default 1 (sequential)."
         ),
     )
+    parser.add_argument(
+        "--start-from",
+        type=int,
+        default=0,
+        help=(
+            "Skip the first N items in the (possibly subset) item list. Use with "
+            "--max-items for resumable runs after a crash. Default 0."
+        ),
+    )
+    parser.add_argument(
+        "--max-items",
+        type=int,
+        default=None,
+        help=(
+            "Process at most this many items from the start position. Default: "
+            "all remaining items. Use with --start-from for resumable runs."
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Handle --list-pipelines early.
@@ -256,6 +274,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.subset is not None:
         items = hotpot.sample(items, args.subset)
+
+    # Apply --start-from / --max-items for resumable runs.
+    if args.start_from:
+        items = items[args.start_from:]
+    if args.max_items is not None:
+        items = items[: args.max_items]
 
     d_sha = hotpot.dataset_sha(dataset_path)
     print(
