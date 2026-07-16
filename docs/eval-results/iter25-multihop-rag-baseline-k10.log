@@ -1,0 +1,152 @@
+C:\Python314\Lib\site-packages\langchain_core\utils\pydantic.py:41: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1 import BaseModel as BaseModelV1
+2026-07-16 12:48:00,291 INFO eval_qa_hotpotqa Using pipeline preset: extract_span_k10 (embed=all-MiniLM-L6-v2, rerank=none, prompt=extract_span, top_k=10)
+2026-07-16 12:48:05,326 INFO sentence_transformers.base.model No device provided, using cpu
+2026-07-16 12:48:06,213 INFO httpx HTTP Request: GET https://huggingface.co/api/agent-harnesses "HTTP/1.1 200 OK"
+2026-07-16 12:48:06,454 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/modules.json "HTTP/1.1 307 Temporary Redirect"
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-07-16 12:48:06,454 WARNING huggingface_hub.utils._http Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-07-16 12:48:06,489 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/modules.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:06,740 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config_sentence_transformers.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:06,786 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config_sentence_transformers.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:06,787 INFO sentence_transformers.base.model Loading SentenceTransformer model from sentence-transformers/all-MiniLM-L6-v2.
+2026-07-16 12:48:07,029 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config_sentence_transformers.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:07,068 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config_sentence_transformers.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:07,309 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/README.md "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:07,338 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/README.md "HTTP/1.1 200 OK"
+2026-07-16 12:48:07,595 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/modules.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:07,627 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/modules.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:07,869 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/sentence_bert_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:07,913 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/sentence_bert_config.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:08,166 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/adapter_config.json "HTTP/1.1 404 Not Found"
+2026-07-16 12:48:08,409 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:08,440 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config.json "HTTP/1.1 200 OK"
+Dataset: HotpotQA dev_distractor v1 (CC BY-SA 4.0 ¡ª https://hotpotqa.github.io/)
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€| 103/103 [00:00<00:00, 11956.86it/s]
+2026-07-16 12:48:08,766 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
+2026-07-16 12:48:09,017 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/preprocessor_config.json "HTTP/1.1 404 Not Found"
+2026-07-16 12:48:09,276 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/video_preprocessor_config.json "HTTP/1.1 404 Not Found"
+2026-07-16 12:48:09,517 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/preprocessor_config.json "HTTP/1.1 404 Not Found"
+2026-07-16 12:48:09,763 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:09,792 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:10,027 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:10,058 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:10,311 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:10,341 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:10,581 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:10,611 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:10,870 INFO httpx HTTP Request: GET https://huggingface.co/api/models/sentence-transformers/all-MiniLM-L6-v2/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-07-16 12:48:11,125 INFO httpx HTTP Request: GET https://huggingface.co/api/models/sentence-transformers/all-MiniLM-L6-v2/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-07-16 12:48:11,401 INFO httpx HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/1_Pooling/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-07-16 12:48:11,429 INFO httpx HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/1_Pooling%2Fconfig.json "HTTP/1.1 200 OK"
+2026-07-16 12:48:11,671 INFO httpx HTTP Request: GET https://huggingface.co/api/models/sentence-transformers/all-MiniLM-L6-v2 "HTTP/1.1 200 OK"
+2026-07-16 12:48:12,145 INFO faiss.loader Loading faiss with AVX2 support.
+2026-07-16 12:48:12,145 INFO faiss.loader Could not load library with AVX2 support due to:
+ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")
+2026-07-16 12:48:12,145 INFO faiss.loader Loading faiss.
+2026-07-16 12:48:12,160 INFO faiss.loader Successfully loaded faiss.
+2026-07-16 12:48:17,071 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:48:22,678 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:48:26,605 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:48:32,681 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:48:36,861 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:48:42,021 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:48:45,975 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:48:51,476 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:48:58,715 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:03,703 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:08,210 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:12,607 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:16,921 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:21,261 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:28,669 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:33,172 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:41,751 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:47,421 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:52,071 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:49:59,376 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:03,951 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:09,609 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:13,141 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:17,070 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:22,398 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:28,230 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:34,723 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:39,962 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:44,206 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:49,717 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:53,332 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:50:57,897 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:02,586 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:07,926 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:14,297 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:19,625 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:24,771 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:29,051 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:33,683 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:38,211 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:42,819 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:46,766 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:51,274 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:55,011 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:51:59,523 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:05,196 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:10,191 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:15,326 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:20,909 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:24,426 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:28,931 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:33,351 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:37,969 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:42,580 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:48,381 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:52,596 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:52:56,327 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:00,867 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:07,879 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:12,498 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:18,081 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:22,378 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:27,700 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:32,791 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:36,929 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:41,976 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:47,567 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:50,826 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:53:55,729 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:01,280 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:05,166 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:10,085 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:14,819 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:20,054 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:23,692 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:28,295 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:32,758 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:38,179 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:43,439 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:47,976 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:52,442 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:54:58,826 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:55:04,295 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:55:07,426 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:55:12,591 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:55:17,256 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:55:21,216 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:55:25,663 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:55:31,169 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+2026-07-16 12:55:37,609 INFO httpx HTTP Request: POST https://api.minimaxi.com/anthropic/v1/messages "HTTP/1.1 200 OK"
+
+HotpotQA End-to-End QA Eval ¡ª subset=100, k=10, dataset_sha=c3ca08c90bfa7e67
+  with_context:
+    contains_gold: 0.589  (n=90)
+    answer_f1   : 0.045  (n=90)
+    answer_em   : 0.022  (n=90)
+  failure-mode breakdown (with_context):
+    success         :   53  (0.589)
+    extraction miss :   37  (0.411) ¡ª gold in top-k, LLM missed
+    retrieval miss  :    0  (0.000) ¡ª gold NOT in top-k
+  LLM calls             : 90
+  cache hits / builds   : 90 / 0
+  errors                : 0
+  elapsed               : 445.9s
+  dumped per-q results  : docs\eval-results\iter25-multihop-rag-baseline-k10-dump.jsonl  (n=90)
