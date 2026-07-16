@@ -53,19 +53,26 @@ or that hit transient 5xx after retries).
 | 1 | **cot_extract_notitles_thinking_k10** (NEW SOTA) | **0.937** | 0.084 | 0.000 | 467 | 0 | **7369 full** | MiniLM + 10 paragraphs + title-strip + CoT scaffold + Anthropic thinking (4096 budget) |
 | 1' | cot_extract_notitles_thinking_k10 (n=334 sample) | 0.934 | 0.077 | 0.000 | 22 | 0 | 334 | (same preset, smaller sample — n=334 was published first) |
 | 2 | cot_extract_notitles_k10 | 0.925 | 0.088 | 0.009 | 25 | 0 | 334 | MiniLM + 10 paragraphs + title-strip + CoT scaffold |
-| 3 | cot_extract_k10 | 0.904 | 0.123 | 0.012 | 32 | 0 | 334 | MiniLM + 10 paragraphs + CoT scaffold (titles retained) |
-| 4 | extract_span_k10 | 0.889 | 0.098 | 0.006 | 37 | 0 | 334 | MiniLM + 10 paragraphs + verbatim-span prompt |
-| 5 | top_k=10 (naive) | 0.880 | 0.128 | 0.009 | 40 | 0 | 334 | MiniLM + 10 paragraphs, default prompt |
-| 6 | extract_span_k8 | 0.874 | 0.089 | 0.003 | 42 | 0 | 334 | MiniLM + 8 paragraphs + verbatim-span prompt |
-| 7 | top_k=8 (naive) | 0.850 | 0.125 | 0.009 | 50 | 0 | 334 | MiniLM + 8 paragraphs, default prompt |
-| 8 | extract_span_prompt (k=4) | 0.792 | 0.083 | 0.000 | 63 | 6 | 332 | mpnet, k=4, verbatim-span prompt |
-| 9 | large_dense (mpnet, k=4) | 0.787 | 0.124 | 0.015 | 68 | 3 | 334 | mpnet, k=4, default prompt |
-| 10 | dense_then_ce (rerank) | 0.786 | 0.129 | 0.019 | 68 | 1 | 322 | mpnet + cross-encoder rerank 50→4 |
-| 11 | naive_dense (k=4) | 0.778 | 0.118 | 0.009 | 71 | 3 | 334 | MiniLM, k=4, default prompt (baseline) |
-| 12 | hybrid_bm25_dense | 0.769 | 0.117 | 0.009 | 74 | 3 | 334 | MiniLM + BM25 via RRF, k=4 |
+| 3 | cot_extract_k10 | 0.904 | 0.080 | 0.000 | 32 | 0 | 334 | MiniLM + 10 paragraphs + CoT scaffold (titles retained) |
+| 4 | extract_span_k10 | 0.889 | — | — | 37 | 0 | 334 | MiniLM + 10 paragraphs + verbatim-span prompt |
+| 5 | top_k=10 (naive) | 0.880 | — | — | 40 | 0 | 334 | MiniLM + 10 paragraphs, default prompt |
+| 6 | extract_span_k8 | 0.874 | — | — | 42 | 0 | 334 | MiniLM + 8 paragraphs + verbatim-span prompt |
+| 7 | top_k=8 (naive) | 0.850 | — | — | 50 | 0 | 334 | MiniLM + 8 paragraphs, default prompt |
+| 8 | extract_span_prompt (k=4) | 0.792 | — | — | 63 | 6 | 332 | mpnet, k=4, verbatim-span prompt |
+| 9 | large_dense (mpnet, k=4) | 0.787 | — | — | 68 | 3 | 334 | mpnet, k=4, default prompt |
+| 10 | dense_then_ce (rerank) | 0.786 | — | — | 68 | 1 | 322 | mpnet + cross-encoder rerank 50→4 |
+| 11 | naive_dense (k=4) | 0.778 | — | — | 71 | 3 | 334 | MiniLM, k=4, default prompt (baseline) |
+| 12 | hybrid_bm25_dense | 0.769 | — | — | 74 | 3 | 334 | MiniLM + BM25 via RRF, k=4 |
 
 (Note: `cot_thinking_k10` and `cot_extract_v2_k10` were also evaluated but tied
 with `cot_extract_k10` at 0.904 — kept in `PRESETS` as documented variants.)
+
+**`answer_f1` / `answer_em` sourcing**: values are only shown for rows that
+have an authoritative per-question dump under `docs/eval-results/iter*-k10-dump.jsonl`
+(rows 1, 1', 2, 3, and the full-7k SOTA confirmation). The earlier k=4 / k=8
+runs (rows 4–12) did not persist raw dumps — only the `contains_gold` and
+failure-mode counts were published in the iter-12/13/14 markdown reports.
+Showing `—` for these is more honest than fabricating values.
 
 ### Key observations from the table
 
@@ -100,9 +107,9 @@ Trajectory after iter-14 (the original SOTA was cot_extract_k10 at 0.904):
 
   cot_extract_k10                  :   baseline       (0.904, 32 fail, n=334)
   cot_extract_v2_k10 (nudge)       :   -0.9 pp        (regressed)
-  cot_thinking_k10                 :    0 pp  tie     (different questions)
+  cot_thinking_k10                 :    0 pp  tie     (0.904, 32 fail — only 25 of 32 failures overlap with iter-15)
   cot_extract_notitles_k10         :   +2.1 pp        (0.925, 25 fail, n=334)
-  cot_extract_notitles_thinking_k10:   +2.7 pp        (0.931, n=334 sample, 22 fail)
+  cot_extract_notitles_thinking_k10:   +3.0 pp        (0.934, n=334 sample, 22 fail)
                               full :   +3.3 pp        (0.937, n=7369 full, 467 fail)  ← official SOTA
 
 The iter-20 audit (thinking-mode dump of failure thinking content) revealed
