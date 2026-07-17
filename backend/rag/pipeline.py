@@ -362,6 +362,47 @@ class CoTExtractNoTitlesPromptBuilder(CoTExtractPromptBuilder):
         ]
 
 
+class PreAnalysisExtractPromptBuilder(CoTExtractNoTitlesPromptBuilder):
+    """Iter-29: cot_extract_no_titles + a pre-analysis prefix in the user
+    message that runs BEFORE the model sees the <context> block.
+
+    Hypothesis: forcing the model to briefly note (a) what entities/facts
+    the question asks about and (b) what kind of material would answer it,
+    before reading the context, improves extraction on multi-hop questions.
+    The analysis primes attention toward the right chunks, especially for
+    temporal/comparison questions where the gold span must be located by
+    reasoning rather than direct lookup.
+
+    Same title-strip behavior as iter-21: no `[title]:` prefix on context
+    paragraphs, so canonical names must be extracted from the body.
+
+    Cost: ~50 extra output tokens per question (the pre-analysis sentence).
+    No extra LLM call (single-turn; the analysis prefix is in the same
+    user message as the context, before it).
+    """
+
+    PRE_ANALYSIS_INSTRUCTION = (
+        "Before reading the context, briefly analyze the question: "
+        "(1) what entities, facts, or attributes does it ask about, "
+        "(2) what kind of material would answer it (a date, a name, a "
+        "yes/no adjudication, etc.). One short sentence for each. "
+        "Then read the <context>...</context> block and answer."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self.PRE_ANALYSIS_INSTRUCTION}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
 class AnthropicLLM:
     """Async Anthropic client wrapped as an LLM protocol.
 
@@ -445,6 +486,8 @@ def build_prompt_builder(config: PipelineConfig) -> PromptBuilder:
         return CoTExtractV2PromptBuilder()
     if config.prompt_template == "cot_extract_no_titles":
         return CoTExtractNoTitlesPromptBuilder()
+    if config.prompt_template == "pre_analysis_extract":
+        return PreAnalysisExtractPromptBuilder()
     raise ValueError(f"Unknown prompt_template: {config.prompt_template!r}")
 
 
@@ -739,6 +782,21 @@ PRESETS: dict[str, PipelineConfig] = {
         reranker=None,
         top_k=10,
         prompt_template="cot_extract_no_titles",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-29: iter-22 SOTA + pre-analysis prefix in the user message. The
+    # model briefly analyzes the question (entities, reasoning type) before
+    # seeing the <context> block, priming attention toward the right chunks.
+    # A/B variant only — the iter-22 SOTA preset is unchanged.
+    "pre_analysis_extract_thinking_k10": PipelineConfig(
+        name="pre_analysis_extract_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="pre_analysis_extract",
         thinking_budget=4096,
         llm_model="minimax-3",
     ),

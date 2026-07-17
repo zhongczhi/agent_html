@@ -17,6 +17,7 @@ from backend.rag.pipeline import (
     HybridRetriever,
     NoOpReranker,
     PRESETS,
+    PreAnalysisExtractPromptBuilder,
     PipelineConfig,
     RagPipeline,
     build_llm,
@@ -536,6 +537,63 @@ def test_cot_extract_notitles_thinking_k10_combines_both():
     assert cfg.prompt_template == "cot_extract_no_titles"
     assert cfg.thinking_budget == 4096
     assert cfg.top_k == 10
+
+
+# ---- iter-29: PreAnalysisExtractPromptBuilder (pre-analysis prefix) -----
+
+def test_pre_analysis_extract_includes_pre_analysis_instruction():
+    """iter-29: the user message opens with a pre-analysis instruction
+    BEFORE the <context> block."""
+    b = PreAnalysisExtractPromptBuilder()
+    docs = [Document(page_content="Foo bar baz.", metadata={"title": "T1"})]
+    msgs = b.build("Which is X?", docs)
+    user = msgs[1]["content"]
+    assert user.startswith("Before reading the context, briefly analyze the question:")
+    assert "<context>" in user
+    assert "Which is X?" in user
+    # The pre-analysis instruction must come before the context block.
+    assert user.index("Before reading the context") < user.index("<context>")
+
+
+def test_pre_analysis_extract_strips_heading_prefix():
+    """iter-29: inherits the title-strip behavior from iter-21."""
+    b = PreAnalysisExtractPromptBuilder()
+    docs = [
+        Document(page_content="Louis-Hector Berlioz was a French composer.", metadata={"title": "Hector Berlioz"}),
+    ]
+    msgs = b.build("Which composer?", docs)
+    user = msgs[1]["content"]
+    assert "Louis-Hector Berlioz" in user
+    assert "[Hector Berlioz]:" not in user
+
+
+def test_pre_analysis_extract_keeps_cot_scaffold_in_system():
+    """iter-29: the system prompt still contains the CoT scaffold."""
+    b = PreAnalysisExtractPromptBuilder()
+    msgs = b.build("Q?", [Document(page_content="x", metadata={"title": "T"})])
+    system = msgs[0]["content"]
+    assert "Think step by step:" in system
+    assert "quote it verbatim from the context" in system
+
+
+def test_pre_analysis_extract_user_only_when_no_context():
+    b = PreAnalysisExtractPromptBuilder()
+    msgs = b.build("Q?", None)
+    assert len(msgs) == 1
+
+
+def test_build_prompt_builder_pre_analysis_dispatches_correctly():
+    cfg = PipelineConfig(name="x", prompt_template="pre_analysis_extract")
+    assert isinstance(build_prompt_builder(cfg), PreAnalysisExtractPromptBuilder)
+
+
+def test_pre_analysis_extract_thinking_k10_preset_registered():
+    """iter-29: preset combines pre-analysis with title-strip + thinking."""
+    cfg = PRESETS["pre_analysis_extract_thinking_k10"]
+    assert cfg.prompt_template == "pre_analysis_extract"
+    assert cfg.top_k == 10
+    assert cfg.thinking_budget == 4096
+    assert cfg.reranker is None
 
 
 def test_cot_extract_keeps_titles_for_backward_compat():
