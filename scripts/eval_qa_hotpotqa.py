@@ -235,6 +235,33 @@ def main(argv: list[str] | None = None) -> int:
             "all remaining items. Use with --start-from for resumable runs."
         ),
     )
+    parser.add_argument(
+        "--dataset-name",
+        default=None,
+        help=(
+            "Human-readable dataset name for the attribution banner. "
+            "Default: derived from the fixture filename ('hotpot_dev_distractor_v1' "
+            "or the basename of --fixture / --from-local)."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-license",
+        default=None,
+        help=(
+            "License string for the attribution banner. "
+            "Default: 'CC BY-SA 4.0' for HotpotQA; auto-detected to "
+            "'ODC-BY 1.0' for MultiHop-RAG fixture; 'unspecified' otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-url",
+        default=None,
+        help=(
+            "Source URL for the attribution banner. "
+            "Default: 'https://hotpotqa.github.io/' for HotpotQA; "
+            "'https://github.com/yixuantt/MultiHop-RAG' for MultiHop-RAG."
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Handle --list-pipelines early.
@@ -282,10 +309,40 @@ def main(argv: list[str] | None = None) -> int:
         items = items[: args.max_items]
 
     d_sha = hotpot.dataset_sha(dataset_path)
-    print(
-        "Dataset: HotpotQA dev_distractor v1 "
-        "(CC BY-SA 4.0 — https://hotpotqa.github.io/)"
-    )
+    # Dataset attribution: derive from fixture path or honor explicit
+    # --dataset-* flags. The defaults preserve the original behavior for
+    # HotpotQA (no --fixture) and MultiHop-RAG (when --fixture points to
+    # a multihop_rag_fixture_*.json).
+    if args.dataset_name is None:
+        ds_name = (
+            "HotpotQA dev_distractor v1"
+            if "hotpot" in dataset_path.name.lower()
+            else f"MultiHop-RAG (via {dataset_path.name})"
+            if "multihop" in dataset_path.name.lower()
+            else dataset_path.stem
+        )
+    else:
+        ds_name = args.dataset_name
+    if args.dataset_license is None:
+        if "hotpot" in dataset_path.name.lower():
+            ds_license = "CC BY-SA 4.0"
+        elif "multihop" in dataset_path.name.lower():
+            ds_license = "ODC-BY 1.0"
+        else:
+            ds_license = "unspecified"
+    else:
+        ds_license = args.dataset_license
+    if args.dataset_url is None:
+        if "hotpot" in dataset_path.name.lower():
+            ds_url = "https://hotpotqa.github.io/"
+        elif "multihop" in dataset_path.name.lower():
+            ds_url = "https://github.com/yixuantt/MultiHop-RAG"
+        else:
+            ds_url = ""
+    else:
+        ds_url = args.dataset_url
+    url_part = f" — {ds_url}" if ds_url else ""
+    print(f"Dataset: {ds_name} ({ds_license}{url_part})")
 
     paraphrases: dict[str, dict[str, str]] = {}
     if args.paraphrase_set:
@@ -349,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
 
         Returns the list of result dicts (one per variant × mode).
         """
-        nonlocal cache_hits, cache_builds
+        nonlocal cache_hits, cache_builds, errors
         item_results: list[dict] = []
         try:
             # Hybrid retrievers also need the raw corpus (to build
@@ -442,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
                     ))
         except Exception as e:
             log.warning("qid=%s error: %s", item.id, e)
+            errors += 1
         return item_results
 
     async def run() -> int:
@@ -596,6 +654,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  cache hits / builds   : {cache_hits} / {cache_builds}")
         print(f"  errors                : {errors}")
         print(f"  elapsed               : {elapsed:.1f}s")
+
+        # Per-item completion: number of input items vs. number that produced
+        # at least one result. A gap here means some questions never made it
+        # through `_process_one_item` (typically API content-safety filter).
+        attempted_ids = {getattr(it, "id", None) for it in items}
+        completed_ids = {r["qid"] for r in per_q}
+        missing_ids = attempted_ids - completed_ids
+        if missing_ids:
+            preview = ", ".join(sorted(i for i in missing_ids if i)[:5])
+            extra = f" (+{len(missing_ids) - 5} more)" if len(missing_ids) > 5 else ""
+            print(
+                f"  WARNING: {len(missing_ids)} of {len(attempted_ids)} items produced no result "
+                f"(likely API content filter). First missing: {preview}{extra}",
+                file=sys.stderr,
+            )
 
         # Optional dump of every per-question result to JSON Lines.
         # Used for failure-mode inspection: failures can be grepped out and
