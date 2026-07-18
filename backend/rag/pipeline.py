@@ -387,6 +387,16 @@ class PreAnalysisExtractPromptBuilder(CoTExtractNoTitlesPromptBuilder):
     ENTITY; "Does X suggest" → YES/NO; "consistent with" → TEMPORAL). No
     type-detection code at the prompt-construction layer.
 
+    Iter-29 v3 tried to add: (a) agreement words ("Consistent", "Agreement")
+    to the YES/NO list, (b) "if the question expects a yes/no answer" hint
+    inside ENTITY LOOKUP for HotpotQA comparison, and (c) an "exact words"
+    emphasis on the REFUSAL phrase. v3 regressed vs v2 (-0.5 pp) because
+    the "if the question expects a yes/no answer" hint made the model
+    start comparison responses with meta-commentary about question
+    premises ("The premise of your question contains a misattribution...")
+    instead of with the answer word. v2's simpler shape enumeration is
+    the right level of guidance.
+
     Same title-strip behavior as iter-21: no `[title]:` prefix on context
     paragraphs, so canonical names must be extracted from the body.
 
