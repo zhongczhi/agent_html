@@ -366,43 +366,63 @@ class PreAnalysisExtractPromptBuilder(CoTExtractNoTitlesPromptBuilder):
     """Iter-29 (v2): cot_extract_no_titles + a pre-analysis prefix that
     enumerates the four question shapes observed in the eval datasets.
 
-    Iter-29 v1 had a generic pre-analysis instruction ("what entities, facts,
-    or attributes does it ask about, what kind of material would answer it").
-    The smoke test on MultiHop-RAG (n=200) showed that generic instruction
-    helped temporal questions (+5.3 pp) but hurt comparison questions (-4.1
-    pp) because the model couldn't decide which "kind of material" applied
-    to "Does X suggest Y, while Z" questions. This v2 enumerates the four
-    shapes directly so the model picks the right strategy without guessing:
+    Iter-29 history (all v3-v6 attempts are documented but did not
+    produce a clear improvement over v2 on the smoke 200 set; full
+    per-attempt analysis in docs/eval-results/2026-07-18-iter29-attempt-log.md):
 
-      1. ENTITY LOOKUP (MultiHop-RAG inference + HotpotQA bridge; ~80% of
-         questions): one named entity extracted verbatim.
-      2. YES/NO ADJUDICATION (MultiHop-RAG comparison; ~33% of questions):
-         one word — Yes, no, True, or False.
-      3. TEMPORAL ORDERING / CONSISTENCY (MultiHop-RAG temporal; ~23% of
-         questions): check ordering/change, answer Yes or no.
-      4. REFUSAL (MultiHop-RAG null; ~12% of questions): if the answer is
-         not in the context, say "Insufficient information".
+      v1 (generic): "what entities, facts, or attributes does it ask
+        about" — helped temporal (+5.3 pp) but hurt comparison (-4.1 pp)
+        because the model couldn't decide which "kind of material"
+        applied to "Does X suggest Y" questions.
+      v2 (this, shape-enumerated): four shape bullets with example
+        phrasings — fixed the comparison regression, +6.0 pp on smoke
+        200 (run 1; run 2 produced 0.645, showing 3.5 pp run-to-run
+        variance on n=200). Lift came from implicit pattern-matching
+        to the example phrasings.
+      v3 (refinement): added agreement words, yes/no caveat in ENTITY,
+        exact-words emphasis on REFUSAL — regressed -0.5 pp because
+        the "if the question expects a yes/no answer" hint made the
+        model write premise-correction meta-commentary.
+      v4 (paraphrase): replaced shape-matching with question-paraphrase
+        step — regressed to SOTA baseline (0.620). "ignoring source
+        attributions" made the model over-confidently reject framing.
+      v5 (CRITICAL anti-preamble): added explicit "first word must be
+        the answer" rules with "CRITICAL" framing — 0.685 (+0.5 pp vs
+        v2 run 1, +4.0 pp vs v2 run 2). The CRITICAL framing did not
+        actually change the preamble rate; the small lift is within
+        run-to-run noise.
+      v6 (fill-in-the-blank template): literal [ANSWER] template +
+        worked examples — 0.646 (within noise of v2). Hurt comparison
+        by 8.2 pp because the model became over-confident in
+        rejecting question framing.
 
-    The LLM picks the shape from the question's wording (e.g. "Who is" →
-    ENTITY; "Does X suggest" → YES/NO; "consistent with" → TEMPORAL). No
-    type-detection code at the prompt-construction layer.
+    Across all attempts, the dominant v2 failure modes are:
+      1. Source-attribution confusion in thinking (37% of fails): the
+         model spends thinking budget trying to figure out which
+         context chunk matches "the Fortune article". A prompt
+         change can't fix this — it requires dataset-level changes
+         (include source attributions in retrieved context, or
+         remove source names from questions).
+      2. "Based on the context..." preamble (35% of fails): the model
+         writes analysis first, then the answer. The system prompt's
+         CoT scaffold reinforces this. No prompt change reliably
+         suppresses the preamble.
+      3. Semantic refusals (32% of fails): the model says "context
+         does not contain" when the answer is present. A metric
+         change (semantic similarity for refusal-shaped answers)
+         would fix this without prompt changes.
 
-    Iter-29 v3 tried to add: (a) agreement words ("Consistent", "Agreement")
-    to the YES/NO list, (b) "if the question expects a yes/no answer" hint
-    inside ENTITY LOOKUP for HotpotQA comparison, and (c) an "exact words"
-    emphasis on the REFUSAL phrase. v3 regressed vs v2 (-0.5 pp) because
-    the "if the question expects a yes/no answer" hint made the model
-    start comparison responses with meta-commentary about question
-    premises ("The premise of your question contains a misattribution...")
-    instead of with the answer word. v2's simpler shape enumeration is
-    the right level of guidance.
+    Run-to-run variance is ~3.5 pp on n=200 (37/200 questions change
+    pass/fail between runs). The v2 vs SOTA +6.0 pp is suggestive
+    (1.8σ) but not conclusive. v3-v6 results are all within noise.
+    The next step is either a full n=2556 run to get a firm answer
+    on v2, or a direction that attacks one of the three root causes
+    (dataset-level source attribution, preamble-suppression at the
+    system-prompt level, or a metric change for refusals).
 
-    Same title-strip behavior as iter-21: no `[title]:` prefix on context
-    paragraphs, so canonical names must be extracted from the body.
-
-    Cost: ~80-100 extra output tokens per question (shape-name + extraction).
-    No extra LLM call (single-turn; the analysis prefix is in the same
-    user message as the context, before it).
+    Cost: ~80-100 extra output tokens per question. No extra LLM
+    call (single-turn; the analysis prefix is in the same user
+    message as the context, before it).
     """
 
     PRE_ANALYSIS_INSTRUCTION = (

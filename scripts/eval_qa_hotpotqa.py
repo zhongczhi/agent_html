@@ -53,6 +53,7 @@ async def _evaluate_one(
     retrieved_titles: list[str] | None = None,
     thinking_budget: int | None = None,
     max_tokens: int | None = None,
+    capture_thinking: bool = False,
 ) -> dict:
     """One LLM call + scoring (FR-42).
 
@@ -106,19 +107,21 @@ async def _evaluate_one(
     # If the preset configures extended thinking, enable it on the LLM call.
     # max_tokens must be >= thinking_budget so the visible answer has room.
     if thinking_budget is not None and thinking_budget > 0:
-        answer = await ask_llm(
+        answer, thinking = await ask_llm(
             client,
             model,
             prompt,
             max_tokens=max_tokens or max(thinking_budget + 512, 2048),
             thinking_budget=thinking_budget,
+            return_thinking=True,
         )
     else:
         answer = await ask_llm(client, model, prompt)
+        thinking = ""
     f1 = metrics.answer_f1(answer, item.answer)
     em = metrics.exact_match(answer, item.answer)
     contains = metrics.answer_coverage_at_k([answer], item.answer)
-    return {
+    result = {
         "qid": item.id,
         "question": question_text,
         "variant": variant_name,
@@ -132,6 +135,9 @@ async def _evaluate_one(
         "gold_paragraph_titles": sorted(gold_titles) if gold_titles else [],
         "retrieved_titles": list(retrieved_titles) if retrieved_titles else [],
     }
+    if capture_thinking and thinking:
+        result["thinking"] = thinking
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -260,6 +266,15 @@ def main(argv: list[str] | None = None) -> int:
             "Source URL for the attribution banner. "
             "Default: 'https://hotpotqa.github.io/' for HotpotQA; "
             "'https://github.com/yixuantt/MultiHop-RAG' for MultiHop-RAG."
+        ),
+    )
+    parser.add_argument(
+        "--capture-thinking",
+        action="store_true",
+        help=(
+            "Capture extended-thinking block content into the per-question "
+            "dump as a 'thinking' field. Default off (thinking is discarded "
+            "for backward compatibility with the rest of the eval pipeline)."
         ),
     )
     args = parser.parse_args(argv)
@@ -485,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
                     retrieved_titles=retrieved_titles,
                     thinking_budget=pipeline_cfg.thinking_budget if pipeline_cfg else None,
                     max_tokens=(pipeline_cfg.thinking_budget + 512) if pipeline_cfg and pipeline_cfg.thinking_budget else None,
+                    capture_thinking=args.capture_thinking,
                 ))
                 if args.compare_baseline:
                     # without-context baseline (retrieval doesn't apply)
@@ -496,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
                         gold_titles=gold_titles,
                         retrieved_titles=retrieved_titles,
                         thinking_budget=None,  # baseline never uses thinking
+                        capture_thinking=args.capture_thinking,
                     ))
         except Exception as e:
             log.warning("qid=%s error: %s", item.id, e)

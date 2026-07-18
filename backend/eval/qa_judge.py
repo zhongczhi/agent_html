@@ -59,11 +59,14 @@ def _block_text(block) -> str:
 
     Anthropic SDK returns blocks as either Pydantic models (with .type / .text
     attributes) or plain dicts (with ['type'] / ['text'] keys), depending on
-    version. This helper normalizes both.
+    version. This helper normalizes both. Different block types store their
+    content under different attribute names: text blocks use 'text', thinking
+    blocks use 'thinking'.
     """
     if isinstance(block, dict):
-        return block.get("text", "") or ""
-    text = getattr(block, "text", None)
+        # Text block: 'text' key. Thinking block: 'thinking' key.
+        return block.get("text", "") or block.get("thinking", "") or ""
+    text = getattr(block, "text", None) or getattr(block, "thinking", None)
     return text or ""
 
 
@@ -80,7 +83,8 @@ async def ask_llm(
     messages: list[dict],
     max_tokens: int = 200,
     thinking_budget: int | None = None,
-) -> str:
+    return_thinking: bool = False,
+) -> str | tuple[str, str]:
     """One Anthropic call returning the answer text (FR-41.2).
 
     Skips thinking blocks (we only want the visible answer text for scoring).
@@ -90,8 +94,12 @@ async def ask_llm(
     If `thinking_budget` is set (positive int), enables Anthropic extended
     thinking mode with that many tokens of internal reasoning budget.
     `max_tokens` should be >= `thinking_budget` so the visible answer has
-    room to render. Returns only the visible `text` blocks — reasoning
-    is discarded (kept implicit in non-text blocks).
+    room to render.
+
+    If `return_thinking=True`, returns (visible_text, thinking_text) where
+    thinking_text is the concatenated contents of all `thinking` blocks
+    (or "" if thinking is disabled). Default returns just the visible text
+    for backward compatibility with the rest of the eval pipeline.
     """
     kwargs: dict = dict(
         model=model,
@@ -102,10 +110,19 @@ async def ask_llm(
     if thinking_budget is not None and thinking_budget > 0:
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
     response = await client.messages.create(**kwargs)
-    parts: list[str] = []
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
     for block in response.content:
-        if _block_type(block) == "text":
+        btype = _block_type(block)
+        if btype == "text":
             text = _block_text(block)
             if text:
-                parts.append(text)
-    return "\n".join(parts).strip()
+                text_parts.append(text)
+        elif btype == "thinking":
+            think = _block_text(block)
+            if think:
+                thinking_parts.append(think)
+    visible = "\n".join(text_parts).strip()
+    if return_thinking:
+        return visible, "\n".join(thinking_parts).strip()
+    return visible
