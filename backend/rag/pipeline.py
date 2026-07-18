@@ -363,29 +363,52 @@ class CoTExtractNoTitlesPromptBuilder(CoTExtractPromptBuilder):
 
 
 class PreAnalysisExtractPromptBuilder(CoTExtractNoTitlesPromptBuilder):
-    """Iter-29: cot_extract_no_titles + a pre-analysis prefix in the user
-    message that runs BEFORE the model sees the <context> block.
+    """Iter-29 (v2): cot_extract_no_titles + a pre-analysis prefix that
+    enumerates the four question shapes observed in the eval datasets.
 
-    Hypothesis: forcing the model to briefly note (a) what entities/facts
-    the question asks about and (b) what kind of material would answer it,
-    before reading the context, improves extraction on multi-hop questions.
-    The analysis primes attention toward the right chunks, especially for
-    temporal/comparison questions where the gold span must be located by
-    reasoning rather than direct lookup.
+    Iter-29 v1 had a generic pre-analysis instruction ("what entities, facts,
+    or attributes does it ask about, what kind of material would answer it").
+    The smoke test on MultiHop-RAG (n=200) showed that generic instruction
+    helped temporal questions (+5.3 pp) but hurt comparison questions (-4.1
+    pp) because the model couldn't decide which "kind of material" applied
+    to "Does X suggest Y, while Z" questions. This v2 enumerates the four
+    shapes directly so the model picks the right strategy without guessing:
+
+      1. ENTITY LOOKUP (MultiHop-RAG inference + HotpotQA bridge; ~80% of
+         questions): one named entity extracted verbatim.
+      2. YES/NO ADJUDICATION (MultiHop-RAG comparison; ~33% of questions):
+         one word — Yes, no, True, or False.
+      3. TEMPORAL ORDERING / CONSISTENCY (MultiHop-RAG temporal; ~23% of
+         questions): check ordering/change, answer Yes or no.
+      4. REFUSAL (MultiHop-RAG null; ~12% of questions): if the answer is
+         not in the context, say "Insufficient information".
+
+    The LLM picks the shape from the question's wording (e.g. "Who is" →
+    ENTITY; "Does X suggest" → YES/NO; "consistent with" → TEMPORAL). No
+    type-detection code at the prompt-construction layer.
 
     Same title-strip behavior as iter-21: no `[title]:` prefix on context
     paragraphs, so canonical names must be extracted from the body.
 
-    Cost: ~50 extra output tokens per question (the pre-analysis sentence).
+    Cost: ~80-100 extra output tokens per question (shape-name + extraction).
     No extra LLM call (single-turn; the analysis prefix is in the same
     user message as the context, before it).
     """
 
     PRE_ANALYSIS_INSTRUCTION = (
-        "Before reading the context, briefly analyze the question: "
-        "(1) what entities, facts, or attributes does it ask about, "
-        "(2) what kind of material would answer it (a date, a name, a "
-        "yes/no adjudication, etc.). One short sentence for each. "
+        "Before reading the context, briefly identify what kind of question this is. "
+        "Pick the shape that matches, then extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a single named entity (1-3 words) verbatim from the context.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?', "
+        "'Was there...?'): compare both sides of the claim, then answer with one word "
+        "(Yes, no, True, or False).\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', 'Was there a "
+        "change between...?', 'Was X consistent with Y?'): check whether the time "
+        "order or consistency holds across the two articles, then answer Yes or no.\n"
+        "- REFUSAL (the context may not contain the answer): if neither paragraph "
+        "states what's asked, answer 'Insufficient information' rather than guessing.\n"
+        "One short sentence naming the shape is enough; do not re-read the question. "
         "Then read the <context>...</context> block and answer."
     )
 

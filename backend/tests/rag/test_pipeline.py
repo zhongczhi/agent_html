@@ -542,17 +542,36 @@ def test_cot_extract_notitles_thinking_k10_combines_both():
 # ---- iter-29: PreAnalysisExtractPromptBuilder (pre-analysis prefix) -----
 
 def test_pre_analysis_extract_includes_pre_analysis_instruction():
-    """iter-29: the user message opens with a pre-analysis instruction
-    BEFORE the <context> block."""
+    """iter-29 v2: the user message opens with a pre-analysis instruction
+    that enumerates the four question shapes BEFORE the <context> block."""
     b = PreAnalysisExtractPromptBuilder()
     docs = [Document(page_content="Foo bar baz.", metadata={"title": "T1"})]
     msgs = b.build("Which is X?", docs)
     user = msgs[1]["content"]
-    assert user.startswith("Before reading the context, briefly analyze the question:")
+    assert user.startswith("Before reading the context, briefly identify what kind of question this is.")
     assert "<context>" in user
     assert "Which is X?" in user
     # The pre-analysis instruction must come before the context block.
     assert user.index("Before reading the context") < user.index("<context>")
+
+
+def test_pre_analysis_extract_enumerates_all_question_shapes():
+    """iter-29 v2: prompt must cover all four question shapes observed in
+    the eval datasets. The iter-29 v1 generic wording missed comparison
+    questions because the model couldn't decide which 'kind of material'
+    applied to 'Does X suggest Y' questions."""
+    b = PreAnalysisExtractPromptBuilder()
+    msgs = b.build("Q?", [Document(page_content="x", metadata={"title": "T"})])
+    user = msgs[1]["content"]
+    # All four shapes must be present so the LLM can pick the right one.
+    assert "ENTITY LOOKUP" in user
+    assert "YES/NO ADJUDICATION" in user
+    assert "TEMPORAL ORDERING" in user
+    assert "REFUSAL" in user
+    # Each shape should give a brief extraction directive.
+    assert "extract a single named entity" in user  # entity
+    assert "answer with one word" in user            # yes/no
+    assert "Insufficient information" in user        # refusal
 
 
 def test_pre_analysis_extract_strips_heading_prefix():
