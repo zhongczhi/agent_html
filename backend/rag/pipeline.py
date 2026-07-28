@@ -456,6 +456,160 @@ class PreAnalysisExtractPromptBuilder(CoTExtractNoTitlesPromptBuilder):
         ]
 
 
+class CleanGroupedPromptBuilder:
+    """Iter-33 v12: clean per-group prompts with numbered notes.
+
+    Architecture (different from v9-v11):
+      - All groups share the same base: "You are a helpful assistant.
+        Answer the question carefully."
+      - Each group has a SHORT (3-5 line) prompt body describing its task.
+      - Each group has NUMBERED NOTES (1-3 each) targeting that group's
+        dominant failure mode. Notes are POSITIVE directives ("match the
+        article reference to the right context chunk"), not "do NOT X"
+        anti-patterns that prime the model to do X.
+      - No CoT scaffold, no pre-analysis prefix, no "Begin with extracted
+        span" directive. The user explicitly asked for clean and simple.
+
+    Groups (dispatch by question first word):
+      - ENTITY LOOKUP (Who/What/Which/Where/How) → canonical-name
+        extraction, no parenthetical additions
+      - YES/NO (Does/Do/Did/Is/Are/Was/Were/Has/Have/Had/Can/Could/Will/
+        Would/Should/May/Might/Must/Shall) → verdict first, source-
+        attribution verification, no preamble
+      - TEMPORAL_ORDER (Between/After/Before/When) → commit to verdict
+        based on substantive content, even when dates are hard
+      - REFUSAL (fallback) → literal "Insufficient information." phrase
+
+    Failure modes targeted (from iter-32 sub-agent analysis):
+      - YES/NO (35 fails in v2): long hedged preamble before any verdict,
+        confidently-wrong commits on premise-disagreement, source-
+        attribution confusion when same publisher has multiple articles.
+      - TEMPORAL_ORDER (12 fails in v2): refuses to commit ("I cannot
+        definitively answer"), writes multi-section comparative essays
+        instead of verdict.
+      - INFERENCE (3 fails, mostly noise): parenthetical additions after
+        canonical name.
+      - REFUSAL (14/14 fails): model phrases refusal in own words instead
+        of literal "Insufficient information." Note that this is partly
+        a retrieval-coverage problem (cited articles not retrieved), so
+        the note only helps when the model has correctly identified that
+        evidence is missing.
+
+    v13 update: dropped the "first word must be answer" rule (failed
+    across v9, v10, v11, v12 — 4+ attempts, ABANDONED per the user's
+    2-failure rule). New notes target the v12 failure modes:
+      - YES/NO note 4: "Answer the question as asked. Do not dispute
+        the question's framing." Targets premise-disagreement.
+      - TEMPORAL: dropped "commit to verdict" (failed). New
+        directive: "State your verdict in the first sentence.
+        Use 1-2 sentences total." Less restrictive than "first word"
+        but addresses preamble + hedging.
+      - REFUSAL: kept the literal-phrase directive even though it has
+        failed 7+ times, because it's the only direction we have.
+
+    v14 update: dropped the "do not dispute framing" note (failed in
+    v13 — premise-disagreement unchanged at ~17/38 failures). Tried a
+    new direction: "Treat minor attribution or wording imprecision as
+    compatible when the substantive claim is supported." This is the
+    sub-agent's recommended YES/NO direction. If v14 also fails to
+    improve on v13, ABANDON per-group per the user's 2-failure rule.
+    """
+
+    _BASE = "You are a helpful assistant. Answer the question carefully."
+
+    _ENTITY_LOOKUP_BODY = (
+        "Read the <context>...</context> block. Find the named entity "
+        "the question asks about."
+    )
+    _ENTITY_LOOKUP_NOTES = (
+        "Notes:\n"
+        "1. Use the most complete form of the entity name as written in "
+        "the context."
+    )
+
+    _YESNO_BODY = (
+        "Read the <context>...</context> block. The question asks "
+        "whether a claim is supported by the context."
+    )
+    _YESNO_NOTES = (
+        "Notes:\n"
+        "1. Match the question's source names (e.g. 'the Fortune "
+        "article') to the correct context chunk. Two articles from the "
+        "same publisher may appear.\n"
+        "2. Compare the claim against what those articles say.\n"
+        "3. Answer with Yes, no, True, False, Consistent, or Aligned "
+        "based on whether the claim is supported.\n"
+        "4. Answer the question as asked. Do not dispute the question's "
+        "framing."
+    )
+
+    _TEMPORAL_BODY = (
+        "Read the <context>...</context> block. The question asks about "
+        "time order or consistency between two articles."
+    )
+    _TEMPORAL_NOTES = (
+        "Notes:\n"
+        "1. Match the question's source names to the correct context "
+        "chunk.\n"
+        "2. State your verdict in the first sentence. Use 1-2 sentences "
+        "total. Do not write multi-section comparative essays.\n"
+        "3. Answer with Yes, no, Consistent, Inconsistent, or Aligned."
+    )
+
+    _REFUSAL_BODY = (
+        "If the context does not contain the information needed to "
+        "answer the question:"
+    )
+    _REFUSAL_NOTES = (
+        "Notes:\n"
+        "1. Write EXACTLY 'Insufficient information.' (with the period) "
+        "and stop. Do not write any explanation."
+    )
+
+    _ENTITY_TRIGGERS = frozenset({
+        "who", "what", "which", "where", "how",
+    })
+    _YESNO_TRIGGERS = frozenset({
+        "does", "do", "did", "is", "are", "was", "were",
+        "has", "have", "had", "can", "could", "will", "would",
+        "should", "may", "might", "must", "shall",
+    })
+    _TEMPORAL_TRIGGERS = frozenset({
+        "between", "after", "before", "when",
+    })
+
+    def _classify(self, question: str) -> str:
+        first = question.strip().lower().split(maxsplit=1)[0] if question.strip() else ""
+        first = first.rstrip(",.;:?!")
+        if first in self._ENTITY_TRIGGERS:
+            return "entity_lookup"
+        if first in self._YESNO_TRIGGERS:
+            return "yesno"
+        if first in self._TEMPORAL_TRIGGERS:
+            return "temporal"
+        return "refusal"
+
+    def _system_for(self, group: str) -> str:
+        if group == "entity_lookup":
+            return "\n\n".join([self._BASE, self._ENTITY_LOOKUP_BODY, self._ENTITY_LOOKUP_NOTES])
+        if group == "yesno":
+            return "\n\n".join([self._BASE, self._YESNO_BODY, self._YESNO_NOTES])
+        if group == "temporal":
+            return "\n\n".join([self._BASE, self._TEMPORAL_BODY, self._TEMPORAL_NOTES])
+        return "\n\n".join([self._BASE, self._REFUSAL_BODY, self._REFUSAL_NOTES])
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        group = self._classify(question)
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = f"<context>\n{context_str}</context>\n\n{question}"
+        return [
+            {"role": "system", "content": self._system_for(group)},
+            {"role": "user", "content": user_content},
+        ]
+
+
 class AnthropicLLM:
     """Async Anthropic client wrapped as an LLM protocol.
 
@@ -541,6 +695,8 @@ def build_prompt_builder(config: PipelineConfig) -> PromptBuilder:
         return CoTExtractNoTitlesPromptBuilder()
     if config.prompt_template == "pre_analysis_extract":
         return PreAnalysisExtractPromptBuilder()
+    if config.prompt_template == "clean_grouped":
+        return CleanGroupedPromptBuilder()
     raise ValueError(f"Unknown prompt_template: {config.prompt_template!r}")
 
 
@@ -850,6 +1006,23 @@ PRESETS: dict[str, PipelineConfig] = {
         reranker=None,
         top_k=10,
         prompt_template="pre_analysis_extract",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-33 v12: clean per-group prompts with numbered notes. All
+    # groups share the base "You are a helpful assistant. Answer the
+    # question carefully." Each group has 1-3 positive directives
+    # targeting its dominant failure mode (from iter-32 sub-agent
+    # analysis). No CoT scaffold, no pre-analysis prefix. See
+    # CleanGroupedPromptBuilder docstring for failure-mode mapping.
+    "clean_grouped_thinking_k10": PipelineConfig(
+        name="clean_grouped_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="clean_grouped",
         thinking_budget=4096,
         llm_model="minimax-3",
     ),

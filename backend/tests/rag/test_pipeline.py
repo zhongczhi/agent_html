@@ -20,6 +20,7 @@ from backend.rag.pipeline import (
     PreAnalysisExtractPromptBuilder,
     PipelineConfig,
     RagPipeline,
+    CleanGroupedPromptBuilder,
     build_llm,
     build_pipeline,
     build_prompt_builder,
@@ -882,3 +883,159 @@ def test_build_pipeline_hybrid_without_corpus_raises():
     vs = FakeVectorStore([Document(page_content="d")])
     with pytest.raises(ValueError, match="corpus"):
         build_pipeline(cfg, vectorstore=vs, llm_client=fake_client)
+
+
+# ---- iter-33 v12: CleanGroupedPromptBuilder -------------------------------
+
+def _make_grouped_docs():
+    return [
+        Document(page_content="para1", metadata={"title": "T1"}),
+        Document(page_content="para2", metadata={"title": "T2"}),
+    ]
+
+
+def test_clean_grouped_all_prompts_share_same_base():
+    """iter-33 v12: every group prompt starts with the same base phrase
+    ('You are a helpful assistant. Answer the question carefully.') so
+    the model sees a consistent framing across question types."""
+    b = CleanGroupedPromptBuilder()
+    docs = _make_grouped_docs()
+    for q in [
+        "Who is X?",
+        "Does X suggest Y?",
+        "Between X and Y, was Z consistent?",
+        "Considering all the evidence, what should we do?",
+    ]:
+        msgs = b.build(q, docs)
+        sys = msgs[0]["content"]
+        assert sys.startswith("You are a helpful assistant. Answer the question carefully.")
+
+
+def test_clean_grouped_entity_lookup_prompt_has_canonical_name_note():
+    """iter-33 v13: ENTITY LOOKUP prompt targets the canonical-name
+    extraction with a 'most complete form' note. Dropped
+    'begin with entity name' and 'no parentheticals' notes
+    (failed in v12 — model still adds parentheticals)."""
+    b = CleanGroupedPromptBuilder()
+    msgs = b.build("Who is X?", _make_grouped_docs())
+    sys = msgs[0]["content"]
+    assert "Notes:" in sys
+    # Note 1: canonical name (kept)
+    assert "most complete form" in sys.lower() or "canonical" in sys.lower()
+
+
+def test_clean_grouped_yesno_prompt_has_verdict_first_and_attribution_notes():
+    """iter-33 v13: YES/NO prompt targets (a) source-attribution confusion,
+    (b) verdict options, and (c) premise-disagreement. The
+    'first word must be answer' rule was ABANDONED (failed in v9-v12)."""
+    b = CleanGroupedPromptBuilder()
+    msgs = b.build("Does X suggest Y?", _make_grouped_docs())
+    sys = msgs[0]["content"]
+    assert "Notes:" in sys
+    # Note 1: source attribution (positive directive, no "do NOT verify" anti-pattern)
+    assert "match" in sys.lower() or "source names" in sys.lower()
+    assert "do not verify" not in sys.lower()
+    # Note 2: verdict options
+    assert "Yes" in sys and "no" in sys
+    # Note 4 (new in v13): answer the question as asked, don't dispute framing
+    assert "as asked" in sys.lower() or "dispute" in sys.lower() or "framing" in sys.lower()
+
+
+def test_clean_grouped_yesno_prompt_does_not_use_v9_anti_patterns():
+    """iter-33 v13: NO 'do NOT verify which article' prime. NO
+    'first word must be the answer' rule (abandoned — failed in v9-v12).
+    NO 'do NOT write preamble' phrasing. Use positive directives only."""
+    b = CleanGroupedPromptBuilder()
+    msgs = b.build("Does X suggest Y?", _make_grouped_docs())
+    sys = msgs[0]["content"]
+    assert "do not verify" not in sys.lower()
+    assert "first word must be" not in sys.lower()
+    assert "first word must" not in sys.lower()
+
+
+def test_clean_grouped_temporal_prompt_targets_preamble_failure():
+    """iter-33 v13: TEMPORAL prompt targets the preamble/hedging failure
+    with a 'state verdict in first sentence, 1-2 sentences total'
+    directive. Dropped 'commit to verdict' (failed in v12)."""
+    b = CleanGroupedPromptBuilder()
+    msgs = b.build("Between X and Y, was Z consistent?", _make_grouped_docs())
+    sys = msgs[0]["content"]
+    assert "Notes:" in sys
+    # New direction: state in first sentence, 1-2 sentences total
+    assert "first sentence" in sys.lower() or "1-2 sentences" in sys.lower()
+    # Drop the "commit" word (that direction failed)
+    assert "commit to" not in sys.lower()
+    assert "consistent" in sys.lower()
+
+
+def test_clean_grouped_refusal_prompt_emits_literal_phrase():
+    """iter-33 v12: REFUSAL prompt instructs the model to emit the literal
+    'Insufficient information.' phrase (3 words + period)."""
+    b = CleanGroupedPromptBuilder()
+    msgs = b.build("Considering all the evidence, what should we do?", _make_grouped_docs())
+    sys = msgs[0]["content"]
+    assert "Notes:" in sys
+    assert "Insufficient information" in sys
+
+
+def test_clean_grouped_user_message_has_clean_context():
+    """iter-33 v12: user message is <context>...</context> + question, no
+    pre-analysis prefix, no CoT instruction. Just context + question."""
+    b = CleanGroupedPromptBuilder()
+    msgs = b.build("Does X suggest Y?", _make_grouped_docs())
+    user = msgs[1]["content"]
+    # No pre-analysis prefix
+    assert "Before reading the context" not in user
+    assert "Think step by step" not in user
+    assert "Notes:" not in user  # notes are in system, not user
+    # Clean: <context> + question
+    assert user.lstrip().startswith("<context>")
+    assert "Does X suggest Y?" in user
+
+
+def test_clean_grouped_user_only_when_no_context():
+    """iter-33 v12: no context → user-only message."""
+    b = CleanGroupedPromptBuilder()
+    msgs = b.build("Does X suggest Y?", None)
+    assert msgs == [{"role": "user", "content": "Does X suggest Y?"}]
+
+
+def test_clean_grouped_classification_handles_lowercase_and_punctuation():
+    """iter-33 v12: classification is robust to lowercase and trailing punctuation."""
+    b = CleanGroupedPromptBuilder()
+    msgs = b.build("does X suggest Y, while Z says W?", _make_grouped_docs())
+    sys = msgs[0]["content"]
+    assert "Yes" in sys  # yes/no prompt
+    msgs = b.build("Who,", _make_grouped_docs())
+    sys = msgs[0]["content"]
+    assert "most complete form" in sys.lower() or "canonical" in sys.lower()  # entity_lookup prompt
+
+
+def test_clean_grouped_preset_registered():
+    """iter-33 v12: PRESETS contains clean_grouped_thinking_k10."""
+    cfg = PRESETS["clean_grouped_thinking_k10"]
+    assert cfg.prompt_template == "clean_grouped"
+    assert cfg.top_k == 10
+    assert cfg.thinking_budget == 4096
+
+
+def test_build_prompt_builder_returns_clean_grouped():
+    """iter-33 v12: build_prompt_builder wires clean_grouped → CleanGroupedPromptBuilder."""
+    cfg = PipelineConfig(name="test", prompt_template="clean_grouped")
+    builder = build_prompt_builder(cfg)
+    assert isinstance(builder, CleanGroupedPromptBuilder)
+
+
+def test_clean_grouped_strips_heading_prefix():
+    """iter-33 v12: context paragraphs are stripped of [title]: prefix."""
+    b = CleanGroupedPromptBuilder()
+    docs = [
+        Document(page_content="para1", metadata={"title": "T1"}),
+        Document(page_content="para2", metadata={"title": "T2"}),
+    ]
+    msgs = b.build("Does X suggest Y?", docs)
+    user = msgs[1]["content"]
+    assert "[T1]:" not in user
+    assert "[T2]:" not in user
+    assert "para1" in user
+    assert "para2" in user
