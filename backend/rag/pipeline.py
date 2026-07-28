@@ -457,62 +457,18 @@ class PreAnalysisExtractPromptBuilder(CoTExtractNoTitlesPromptBuilder):
 
 
 class CleanGroupedPromptBuilder:
-    """Iter-33 v12: clean per-group prompts with numbered notes.
+    """Iter-33 v13 default preset (clean_grouped_thinking_k10).
 
-    Architecture (different from v9-v11):
-      - All groups share the same base: "You are a helpful assistant.
-        Answer the question carefully."
-      - Each group has a SHORT (3-5 line) prompt body describing its task.
-      - Each group has NUMBERED NOTES (1-3 each) targeting that group's
-        dominant failure mode. Notes are POSITIVE directives ("match the
-        article reference to the right context chunk"), not "do NOT X"
-        anti-patterns that prime the model to do X.
-      - No CoT scaffold, no pre-analysis prefix, no "Begin with extracted
-        span" directive. The user explicitly asked for clean and simple.
+    Per-group prompts with numbered notes. The user abandoned this
+    direction in iter-33 v14 (3 attempts all regressed), but the
+    default preset is kept for backward compatibility. See
+    ParametrizedGroupedPromptBuilder for the parameterized variant
+    used in iter-33 v15 experiments.
 
-    Groups (dispatch by question first word):
-      - ENTITY LOOKUP (Who/What/Which/Where/How) → canonical-name
-        extraction, no parenthetical additions
-      - YES/NO (Does/Do/Did/Is/Are/Was/Were/Has/Have/Had/Can/Could/Will/
-        Would/Should/May/Might/Must/Shall) → verdict first, source-
-        attribution verification, no preamble
-      - TEMPORAL_ORDER (Between/After/Before/When) → commit to verdict
-        based on substantive content, even when dates are hard
-      - REFUSAL (fallback) → literal "Insufficient information." phrase
-
-    Failure modes targeted (from iter-32 sub-agent analysis):
-      - YES/NO (35 fails in v2): long hedged preamble before any verdict,
-        confidently-wrong commits on premise-disagreement, source-
-        attribution confusion when same publisher has multiple articles.
-      - TEMPORAL_ORDER (12 fails in v2): refuses to commit ("I cannot
-        definitively answer"), writes multi-section comparative essays
-        instead of verdict.
-      - INFERENCE (3 fails, mostly noise): parenthetical additions after
-        canonical name.
-      - REFUSAL (14/14 fails): model phrases refusal in own words instead
-        of literal "Insufficient information." Note that this is partly
-        a retrieval-coverage problem (cited articles not retrieved), so
-        the note only helps when the model has correctly identified that
-        evidence is missing.
-
-    v13 update: dropped the "first word must be answer" rule (failed
-    across v9, v10, v11, v12 — 4+ attempts, ABANDONED per the user's
-    2-failure rule). New notes target the v12 failure modes:
-      - YES/NO note 4: "Answer the question as asked. Do not dispute
-        the question's framing." Targets premise-disagreement.
-      - TEMPORAL: dropped "commit to verdict" (failed). New
-        directive: "State your verdict in the first sentence.
-        Use 1-2 sentences total." Less restrictive than "first word"
-        but addresses preamble + hedging.
-      - REFUSAL: kept the literal-phrase directive even though it has
-        failed 7+ times, because it's the only direction we have.
-
-    v14 update: dropped the "do not dispute framing" note (failed in
-    v13 — premise-disagreement unchanged at ~17/38 failures). Tried a
-    new direction: "Treat minor attribution or wording imprecision as
-    compatible when the substantive claim is supported." This is the
-    sub-agent's recommended YES/NO direction. If v14 also fails to
-    improve on v13, ABANDON per-group per the user's 2-failure rule.
+    All groups share the base: "You are a helpful assistant. Answer
+    the question carefully." Each group has a SHORT body + NUMBERED
+    NOTES (1-4 each) targeting that group's dominant failure mode.
+    No CoT scaffold, no pre-analysis prefix, no "do NOT X" anti-patterns.
     """
 
     _BASE = "You are a helpful assistant. Answer the question carefully."
@@ -610,6 +566,305 @@ class CleanGroupedPromptBuilder:
         ]
 
 
+class ParametrizedGroupedPromptBuilder:
+    """Iter-33 v15: parameterized version of CleanGroupedPromptBuilder.
+
+    Same architecture (clean base + per-group body + numbered notes) but
+    accepts note wordings for each group as constructor parameters. This
+    lets us run 5 rounds × 3 variants = 15 experiments on a 20% sample
+    without writing 15 separate classes.
+
+    Each preset (clean_grouped_v15_dXvY) configures one round+variant.
+    The dispatch (first-word classification) is identical to
+    CleanGroupedPromptBuilder; only the note wordings vary.
+
+    Designed for the user's experimental protocol:
+      "choose 20% samples of each group as the dataset for this round
+       for time efficiency, for the previous failure modes you conclude,
+       for each specific guiding note, write it in 3 different forms
+       as control group, keep previous per-group experimental steps
+       with 5 loops"
+
+    Five directions × three variants (15 experiments):
+      d1: YES/NO source-attribution verification (failed in v12-v14)
+      d2: YES/NO premise-disagreement (failed in v13)
+      d3: TEMPORAL brevity (partial success in v13)
+      d4: ENTITY canonical name (partial)
+      d5: REFUSAL literal-phrase (failed 8x)
+
+    For each direction, ONLY the relevant group's note wording is
+    changed; the other 3 groups use the v13 default notes. This
+    isolates the effect of each direction's variants.
+    """
+
+    _BASE = "You are a helpful assistant. Answer the question carefully."
+
+    _ENTITY_LOOKUP_BODY = (
+        "Read the <context>...</context> block. Find the named entity "
+        "the question asks about."
+    )
+    _YESNO_BODY = (
+        "Read the <context>...</context> block. The question asks "
+        "whether a claim is supported by the context."
+    )
+    _TEMPORAL_BODY = (
+        "Read the <context>...</context> block. The question asks about "
+        "time order or consistency between two articles."
+    )
+    _REFUSAL_BODY = (
+        "If the context does not contain the information needed to "
+        "answer the question:"
+    )
+
+    # Default notes (v13) — used for non-target groups in each experiment
+    _ENTITY_DEFAULT_NOTES = (
+        "Notes:\n"
+        "1. Use the most complete form of the entity name as written in "
+        "the context."
+    )
+    _YESNO_DEFAULT_NOTES = (
+        "Notes:\n"
+        "1. Match the question's source names (e.g. 'the Fortune "
+        "article') to the correct context chunk. Two articles from the "
+        "same publisher may appear.\n"
+        "2. Compare the claim against what those articles say.\n"
+        "3. Answer with Yes, no, True, False, Consistent, or Aligned.\n"
+        "4. Answer the question as asked. Do not dispute the question's "
+        "framing."
+    )
+    _TEMPORAL_DEFAULT_NOTES = (
+        "Notes:\n"
+        "1. Match the question's source names to the correct context "
+        "chunk.\n"
+        "2. State your verdict in the first sentence. Use 1-2 sentences "
+        "total. Do not write multi-section comparative essays.\n"
+        "3. Answer with Yes, no, Consistent, Inconsistent, or Aligned."
+    )
+    _REFUSAL_DEFAULT_NOTES = (
+        "Notes:\n"
+        "1. Write EXACTLY 'Insufficient information.' (with the period) "
+        "and stop. Do not write any explanation."
+    )
+
+    _ENTITY_TRIGGERS = frozenset({
+        "who", "what", "which", "where", "how",
+    })
+    _YESNO_TRIGGERS = frozenset({
+        "does", "do", "did", "is", "are", "was", "were",
+        "has", "have", "had", "can", "could", "will", "would",
+        "should", "may", "might", "must", "shall",
+    })
+    _TEMPORAL_TRIGGERS = frozenset({
+        "between", "after", "before", "when",
+    })
+
+    def __init__(self, entity_notes, yesno_notes, temporal_notes, refusal_notes):
+        self._entity_notes = entity_notes
+        self._yesno_notes = yesno_notes
+        self._temporal_notes = temporal_notes
+        self._refusal_notes = refusal_notes
+
+    def _classify(self, question: str) -> str:
+        first = question.strip().lower().split(maxsplit=1)[0] if question.strip() else ""
+        first = first.rstrip(",.;:?!")
+        if first in self._ENTITY_TRIGGERS:
+            return "entity_lookup"
+        if first in self._YESNO_TRIGGERS:
+            return "yesno"
+        if first in self._TEMPORAL_TRIGGERS:
+            return "temporal"
+        return "refusal"
+
+    def _system_for(self, group: str) -> str:
+        if group == "entity_lookup":
+            return "\n\n".join([self._BASE, self._ENTITY_LOOKUP_BODY, self._entity_notes])
+        if group == "yesno":
+            return "\n\n".join([self._BASE, self._YESNO_BODY, self._yesno_notes])
+        if group == "temporal":
+            return "\n\n".join([self._BASE, self._TEMPORAL_BODY, self._temporal_notes])
+        return "\n\n".join([self._BASE, self._REFUSAL_BODY, self._refusal_notes])
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        group = self._classify(question)
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = f"<context>\n{context_str}</context>\n\n{question}"
+        return [
+            {"role": "system", "content": self._system_for(group)},
+            {"role": "user", "content": user_content},
+        ]
+
+
+# iter-33 v15: 5 directions × 3 variants = 15 note wordings.
+# Only the target group's notes change per experiment; the other 3
+# groups use ParametrizedGroupedPromptBuilder's default notes.
+
+# Direction 1: YES/NO source-attribution (3 variants)
+_V15_D1V1_YESNO = (
+    "Notes:\n"
+    "1. The question names a source (e.g. \"the Fortune article\"). "
+    "Multiple context chunks may come from the same publisher; identify "
+    "the chunk whose content matches the claimed topic and dates.\n"
+    "2. Compare the claim against the matched chunk's statements, not "
+    "against any unrelated chunk that shares the publisher.\n"
+    "3. Answer with Yes, no, True, False, Consistent, or Aligned based "
+    "on what the matched chunk says."
+)
+_V15_D1V2_YESNO = (
+    "Notes:\n"
+    "1. The question references a specific article (e.g. \"the Fortune "
+    "article\"). Locate that article in the context by reading each "
+    "chunk's content, not by the publication name alone.\n"
+    "2. Once located, evaluate the claim against that chunk's content.\n"
+    "3. Answer with Yes, no, True, False, Consistent, or Aligned."
+)
+_V15_D1V3_YESNO = (
+    "Notes:\n"
+    "1. The source named in the question (e.g. \"the Fortune article\") "
+    "refers to a specific piece. Use the people, dates, and facts the "
+    "question mentions to find the chunk where they appear.\n"
+    "2. Assess whether that chunk's content supports, contradicts, or "
+    "is consistent with the claim.\n"
+    "3. Answer with Yes, no, True, False, Consistent, or Aligned based "
+    "on what is in the matched chunk."
+)
+
+# Direction 2: YES/NO premise-disagreement (3 variants)
+_V15_D2V1_YESNO = (
+    "Notes:\n"
+    "1. Identify whether the statements the question asks about appear "
+    "in the context.\n"
+    "2. Evaluate based on whether those statements are present and "
+    "what they say, not on whether the question's wording would "
+    "normally be phrased that way.\n"
+    "3. Answer with Yes, no, True, False, Consistent, or Aligned."
+)
+_V15_D2V2_YESNO = (
+    "Notes:\n"
+    "1. Focus on whether the substantive claim is supported by the "
+    "context's content.\n"
+    "2. Base your answer on the presence or absence of supporting "
+    "statements; treat how the claim is framed as separate from "
+    "whether it is supported.\n"
+    "3. Answer with Yes, no, True, False, Consistent, or Aligned."
+)
+_V15_D2V3_YESNO = (
+    "Notes:\n"
+    "1. Read each statement the question asks about and check whether "
+    "it is supported by the context.\n"
+    "2. Base your answer strictly on what the context says about those "
+    "statements, not on whether the question's framing is "
+    "conventionally accurate.\n"
+    "3. Answer with Yes, no, True, False, Consistent, or Aligned."
+)
+
+# Direction 3: TEMPORAL brevity (3 variants)
+_V15_D3V1_TEMPORAL = (
+    "Notes:\n"
+    "1. Match the question's source names to the correct context chunk.\n"
+    "2. Lead with the answer (one sentence). Follow with the single "
+    "most relevant supporting fact.\n"
+    "3. Answer with Yes, no, Consistent, Inconsistent, or Aligned."
+)
+_V15_D3V2_TEMPORAL = (
+    "Notes:\n"
+    "1. Match the question's source names to the correct context chunk.\n"
+    "2. Your first sentence must state the answer. Keep the entire "
+    "response to two sentences or fewer.\n"
+    "3. Answer with Yes, no, Consistent, Inconsistent, or Aligned."
+)
+_V15_D3V3_TEMPORAL = (
+    "Notes:\n"
+    "1. Match the question's source names to the correct context chunk.\n"
+    "2. Commit to one verdict in a single sentence. Cite at most one "
+    "supporting fact.\n"
+    "3. Answer with Yes, no, Consistent, Inconsistent, or Aligned."
+)
+
+# Direction 4: ENTITY canonical name (3 variants)
+_V15_D4V1_ENTITY = (
+    "Notes:\n"
+    "1. Use the most complete form of the entity name as written in "
+    "the context."
+)
+_V15_D4V2_ENTITY = (
+    "Notes:\n"
+    "1. Copy the entity name verbatim from the context as it appears "
+    "there. Do not paraphrase or add qualifications."
+)
+_V15_D4V3_ENTITY = (
+    "Notes:\n"
+    "1. Use the entity's full name as it first appears in the relevant "
+    "context chunk, without additions."
+)
+
+# Direction 5: REFUSAL literal-phrase (3 variants)
+_V15_D5V1_REFUSAL = (
+    "Notes:\n"
+    "1. Write EXACTLY three words — \"Insufficient information.\" — and "
+    "stop. No other text."
+)
+_V15_D5V2_REFUSAL = (
+    "Notes:\n"
+    "1. Your entire response must be only: Insufficient information."
+)
+_V15_D5V3_REFUSAL = (
+    "Notes:\n"
+    "1. Respond with the literal phrase \"Insufficient information.\" "
+    "and nothing else. Do not explain, qualify, or paraphrase."
+)
+
+
+# Build the 15 ParametrizedGroupedPromptBuilder variants for the v15
+# experimental protocol. Each preset name encodes direction + variant:
+#   clean_grouped_v15_d1v1 = Direction 1 (YES/NO source-attribution), Variant 1
+#   clean_grouped_v15_d1v2 = Direction 1, Variant 2
+#   ... etc.
+#
+# Only the target group's notes change per experiment; the other 3
+# groups use the v13 default notes.
+
+def _build_v15_preset(name: str) -> ParametrizedGroupedPromptBuilder:
+    """Resolve a v15 preset name to a configured builder."""
+    entity_default = CleanGroupedPromptBuilder._ENTITY_LOOKUP_NOTES
+    yesno_default = CleanGroupedPromptBuilder._YESNO_NOTES
+    temporal_default = CleanGroupedPromptBuilder._TEMPORAL_NOTES
+    refusal_default = CleanGroupedPromptBuilder._REFUSAL_NOTES
+
+    if name == "clean_grouped_v15_d1v1":
+        return ParametrizedGroupedPromptBuilder(entity_default, _V15_D1V1_YESNO, temporal_default, refusal_default)
+    if name == "clean_grouped_v15_d1v2":
+        return ParametrizedGroupedPromptBuilder(entity_default, _V15_D1V2_YESNO, temporal_default, refusal_default)
+    if name == "clean_grouped_v15_d1v3":
+        return ParametrizedGroupedPromptBuilder(entity_default, _V15_D1V3_YESNO, temporal_default, refusal_default)
+    if name == "clean_grouped_v15_d2v1":
+        return ParametrizedGroupedPromptBuilder(entity_default, _V15_D2V1_YESNO, temporal_default, refusal_default)
+    if name == "clean_grouped_v15_d2v2":
+        return ParametrizedGroupedPromptBuilder(entity_default, _V15_D2V2_YESNO, temporal_default, refusal_default)
+    if name == "clean_grouped_v15_d2v3":
+        return ParametrizedGroupedPromptBuilder(entity_default, _V15_D2V3_YESNO, temporal_default, refusal_default)
+    if name == "clean_grouped_v15_d3v1":
+        return ParametrizedGroupedPromptBuilder(entity_default, yesno_default, _V15_D3V1_TEMPORAL, refusal_default)
+    if name == "clean_grouped_v15_d3v2":
+        return ParametrizedGroupedPromptBuilder(entity_default, yesno_default, _V15_D3V2_TEMPORAL, refusal_default)
+    if name == "clean_grouped_v15_d3v3":
+        return ParametrizedGroupedPromptBuilder(entity_default, yesno_default, _V15_D3V3_TEMPORAL, refusal_default)
+    if name == "clean_grouped_v15_d4v1":
+        return ParametrizedGroupedPromptBuilder(_V15_D4V1_ENTITY, yesno_default, temporal_default, refusal_default)
+    if name == "clean_grouped_v15_d4v2":
+        return ParametrizedGroupedPromptBuilder(_V15_D4V2_ENTITY, yesno_default, temporal_default, refusal_default)
+    if name == "clean_grouped_v15_d4v3":
+        return ParametrizedGroupedPromptBuilder(_V15_D4V3_ENTITY, yesno_default, temporal_default, refusal_default)
+    if name == "clean_grouped_v15_d5v1":
+        return ParametrizedGroupedPromptBuilder(entity_default, yesno_default, temporal_default, _V15_D5V1_REFUSAL)
+    if name == "clean_grouped_v15_d5v2":
+        return ParametrizedGroupedPromptBuilder(entity_default, yesno_default, temporal_default, _V15_D5V2_REFUSAL)
+    if name == "clean_grouped_v15_d5v3":
+        return ParametrizedGroupedPromptBuilder(entity_default, yesno_default, temporal_default, _V15_D5V3_REFUSAL)
+    raise ValueError(f"Unknown v15 preset name: {name!r}")
+
+
 class AnthropicLLM:
     """Async Anthropic client wrapped as an LLM protocol.
 
@@ -697,6 +952,8 @@ def build_prompt_builder(config: PipelineConfig) -> PromptBuilder:
         return PreAnalysisExtractPromptBuilder()
     if config.prompt_template == "clean_grouped":
         return CleanGroupedPromptBuilder()
+    if config.prompt_template == "parametrized_grouped_v15":
+        return _build_v15_preset(config.name)
     raise ValueError(f"Unknown prompt_template: {config.prompt_template!r}")
 
 
@@ -1026,6 +1283,24 @@ PRESETS: dict[str, PipelineConfig] = {
         thinking_budget=4096,
         llm_model="minimax-3",
     ),
+    # iter-33 v15: 5 directions × 3 variants = 15 experimental presets.
+    # Each preset changes ONLY the target group's note wording; the other
+    # 3 groups use the v13 default notes. This isolates the effect of
+    # each direction's variant. All presets share the same base +
+    # dispatch logic. See ParametrizedGroupedPromptBuilder docstring.
+    # Tested on a 20% stratified sample (40 questions: 7 entity_lookup,
+    # 21 yesno, 9 temporal_order, 3 refusal) for time efficiency.
+    **{f"clean_grouped_v15_d{d}v{v}": PipelineConfig(
+        name=f"clean_grouped_v15_d{d}v{v}",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="parametrized_grouped_v15",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ) for d in range(1, 6) for v in range(1, 4)},
     # Hybrid BM25 + dense via Reciprocal Rank Fusion. Different lever than
     # embedding-model size: BM25 catches exact entity-name matches the
     # embedding model glosses over, dense catches paraphrase matches BM25

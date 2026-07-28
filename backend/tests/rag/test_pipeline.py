@@ -21,6 +21,8 @@ from backend.rag.pipeline import (
     PipelineConfig,
     RagPipeline,
     CleanGroupedPromptBuilder,
+    ParametrizedGroupedPromptBuilder,
+    _build_v15_preset,
     build_llm,
     build_pipeline,
     build_prompt_builder,
@@ -1039,3 +1041,110 @@ def test_clean_grouped_strips_heading_prefix():
     assert "[T2]:" not in user
     assert "para1" in user
     assert "para2" in user
+
+
+# ---- iter-33 v15: ParametrizedGroupedPromptBuilder (15 experiments) -----
+
+def test_parametrized_grouped_uses_passed_notes():
+    """iter-33 v15: ParametrizedGroupedPromptBuilder uses constructor-passed
+    note wordings instead of hardcoded defaults."""
+    custom_yesno = "Notes:\n1. Custom YES/NO directive."
+    custom_temporal = "Notes:\n1. Custom TEMPORAL directive."
+    b = ParametrizedGroupedPromptBuilder(
+        entity_notes=CleanGroupedPromptBuilder._ENTITY_LOOKUP_NOTES,
+        yesno_notes=custom_yesno,
+        temporal_notes=custom_temporal,
+        refusal_notes=CleanGroupedPromptBuilder._REFUSAL_NOTES,
+    )
+    msgs = b.build("Does X suggest Y?", _make_grouped_docs())
+    assert "Custom YES/NO directive" in msgs[0]["content"]
+    msgs = b.build("Between X and Y, was Z?", _make_grouped_docs())
+    assert "Custom TEMPORAL directive" in msgs[0]["content"]
+    msgs = b.build("Who is X?", _make_grouped_docs())
+    assert "Custom" not in msgs[0]["content"]
+    assert "most complete form" in msgs[0]["content"]
+
+
+def test_v15_presets_resolve():
+    """iter-33 v15: all 15 v15 preset names resolve to a builder."""
+    for d in range(1, 6):
+        for v in range(1, 4):
+            name = f"clean_grouped_v15_d{d}v{v}"
+            cfg = PRESETS[name]
+            assert cfg.prompt_template == "parametrized_grouped_v15"
+            builder = _build_v15_preset(name)
+            assert isinstance(builder, ParametrizedGroupedPromptBuilder)
+
+
+def test_v15_d1_d2_only_change_yesno_notes():
+    """iter-33 v15: directions 1 & 2 only change yesno notes."""
+    base_entity = CleanGroupedPromptBuilder._ENTITY_LOOKUP_NOTES
+    base_temporal = CleanGroupedPromptBuilder._TEMPORAL_NOTES
+    base_refusal = CleanGroupedPromptBuilder._REFUSAL_NOTES
+    for d in (1, 2):
+        for v in (1, 2, 3):
+            b = _build_v15_preset(f"clean_grouped_v15_d{d}v{v}")
+            assert b._entity_notes == base_entity
+            assert b._temporal_notes == base_temporal
+            assert b._refusal_notes == base_refusal
+
+
+def test_v15_d3_only_changes_temporal_notes():
+    """iter-33 v15: direction 3 only changes temporal notes."""
+    base_entity = CleanGroupedPromptBuilder._ENTITY_LOOKUP_NOTES
+    base_yesno = CleanGroupedPromptBuilder._YESNO_NOTES
+    base_refusal = CleanGroupedPromptBuilder._REFUSAL_NOTES
+    for v in (1, 2, 3):
+        b = _build_v15_preset(f"clean_grouped_v15_d3v{v}")
+        assert b._entity_notes == base_entity
+        assert b._yesno_notes == base_yesno
+        assert b._refusal_notes == base_refusal
+
+
+def test_v15_d4_only_changes_entity_notes():
+    """iter-33 v15: direction 4 only changes entity notes."""
+    base_yesno = CleanGroupedPromptBuilder._YESNO_NOTES
+    base_temporal = CleanGroupedPromptBuilder._TEMPORAL_NOTES
+    base_refusal = CleanGroupedPromptBuilder._REFUSAL_NOTES
+    for v in (1, 2, 3):
+        b = _build_v15_preset(f"clean_grouped_v15_d4v{v}")
+        assert b._yesno_notes == base_yesno
+        assert b._temporal_notes == base_temporal
+        assert b._refusal_notes == base_refusal
+
+
+def test_v15_d5_only_changes_refusal_notes():
+    """iter-33 v15: direction 5 only changes refusal notes."""
+    base_entity = CleanGroupedPromptBuilder._ENTITY_LOOKUP_NOTES
+    base_yesno = CleanGroupedPromptBuilder._YESNO_NOTES
+    base_temporal = CleanGroupedPromptBuilder._TEMPORAL_NOTES
+    for v in (1, 2, 3):
+        b = _build_v15_preset(f"clean_grouped_v15_d5v{v}")
+        assert b._entity_notes == base_entity
+        assert b._yesno_notes == base_yesno
+        assert b._temporal_notes == base_temporal
+
+
+def test_v15_variants_are_different_within_direction():
+    """iter-33 v15: V1/V2/V3 within a direction must have different wordings."""
+    for d in range(1, 6):
+        notes = []
+        for v in (1, 2, 3):
+            b = _build_v15_preset(f"clean_grouped_v15_d{d}v{v}")
+            if d in (1, 2):
+                notes.append(b._yesno_notes)
+            elif d == 3:
+                notes.append(b._temporal_notes)
+            elif d == 4:
+                notes.append(b._entity_notes)
+            else:
+                notes.append(b._refusal_notes)
+        assert notes[0] != notes[1], f"d{d}: V1 == V2"
+        assert notes[1] != notes[2], f"d{d}: V2 == V3"
+        assert notes[0] != notes[2], f"d{d}: V1 == V3"
+
+
+def test_v15_unknown_preset_raises():
+    """iter-33 v15: unknown v15 preset name raises ValueError."""
+    with pytest.raises(ValueError, match="Unknown v15"):
+        _build_v15_preset("clean_grouped_v15_d99v1")
