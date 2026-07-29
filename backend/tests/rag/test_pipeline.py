@@ -22,6 +22,12 @@ from backend.rag.pipeline import (
     RagPipeline,
     CleanGroupedPromptBuilder,
     ParametrizedGroupedPromptBuilder,
+    PreAnalysisExtractPromptBuilder,
+    SimplifiedV2PromptBuilder,
+    SimplifiedV2Bv1PromptBuilder,
+    SimplifiedV2Cv1PromptBuilder,
+    SimplifiedV2Dv1PromptBuilder,
+    SimplifiedV2Ev1PromptBuilder,
     _build_v15_preset,
     build_llm,
     build_pipeline,
@@ -1148,3 +1154,330 @@ def test_v15_unknown_preset_raises():
     """iter-33 v15: unknown v15 preset name raises ValueError."""
     with pytest.raises(ValueError, match="Unknown v15"):
         _build_v15_preset("clean_grouped_v15_d99v1")
+
+
+# ---- iter-34 v16-a: SimplifiedV2PromptBuilder (simplified v2) -----
+
+def test_simplified_v2_drops_cot_scaffold():
+    """iter-34 v16-a: simplified v2 drops the CoT scaffold from the
+    system prompt. Should NOT contain 'Think step by step' or
+    'Begin your response with the extracted span'."""
+    b = SimplifiedV2PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    msgs = b.build("Who is X?", docs)
+    sys = msgs[0]["content"]
+    # CoT scaffold should be GONE
+    assert "Think step by step" not in sys
+    assert "Begin your response with the extracted span" not in sys
+    assert "1. Identify the entities" not in sys
+    assert "4. Decide which exact span" not in sys
+    # RAG framing should remain
+    assert "You are a helpful assistant" in sys
+    assert "grounding material" in sys
+
+
+def test_simplified_v2_keeps_4_shape_enumeration():
+    """iter-34 v16-a: simplified v2 keeps the 4-shape pre-analysis
+    (ENTITY LOOKUP / YES/NO / TEMPORAL / REFUSAL) which is the
+    iter-29 v2 lift mechanism."""
+    b = SimplifiedV2PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    msgs = b.build("Who is X?", docs)
+    user = msgs[1]["content"]
+    assert "ENTITY LOOKUP" in user
+    assert "YES/NO" in user or "YES/NO ADJUDICATION" in user
+    assert "TEMPORAL" in user
+    assert "REFUSAL" in user
+
+
+def test_simplified_v2_keeps_verbatim_directive():
+    """iter-34 v16-a: simplified v2 keeps the verbatim canonical-name
+    directive (consolidated to one line)."""
+    b = SimplifiedV2PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    msgs = b.build("Who is X?", docs)
+    user = msgs[1]["content"]
+    assert "verbatim" in user.lower()
+
+
+def test_simplified_v2_user_only_when_no_context():
+    """iter-34 v16-a: simplified v2 still returns user-only when no context."""
+    b = SimplifiedV2PromptBuilder()
+    msgs = b.build("Who is X?", None)
+    assert msgs == [{"role": "user", "content": "Who is X?"}]
+
+
+def test_simplified_v2_strips_heading_prefix():
+    """iter-34 v16-a: simplified v2 strips [title]: prefix (inherited
+    from PreAnalysisExtractPromptBuilder → CoTExtractNoTitlesPromptBuilder)."""
+    b = SimplifiedV2PromptBuilder()
+    docs = [
+        Document(page_content="para1", metadata={"title": "T1"}),
+        Document(page_content="para2", metadata={"title": "T2"}),
+    ]
+    msgs = b.build("Who is X?", docs)
+    user = msgs[1]["content"]
+    assert "[T1]:" not in user
+    assert "[T2]:" not in user
+    assert "para1" in user
+    assert "para2" in user
+
+
+def test_simplified_v2_prompt_is_shorter_than_v2():
+    """iter-34 v16-a: simplified v2 prompt should be shorter than v2's.
+    v2 has the CoT scaffold (~280 chars) + pre-analysis; simplified
+    has only the simplified pre-analysis (~600 chars) + RAG framing.
+    Total comparison: simplified should be measurably shorter."""
+    v2 = PreAnalysisExtractPromptBuilder()
+    simplified = SimplifiedV2PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    v2_total = len(v2.build("Who is X?", docs)[0]["content"]) + len(v2.build("Who is X?", docs)[1]["content"])
+    simplified_total = len(simplified.build("Who is X?", docs)[0]["content"]) + len(simplified.build("Who is X?", docs)[1]["content"])
+    assert simplified_total < v2_total, (
+        f"simplified ({simplified_total}) should be shorter than v2 ({v2_total})"
+    )
+
+
+def test_simplified_v2_preset_registered():
+    """iter-34 v16-a: PRESETS contains simplified_v2_thinking_k10."""
+    cfg = PRESETS["simplified_v2_thinking_k10"]
+    assert cfg.prompt_template == "simplified_v2"
+    assert cfg.top_k == 10
+    assert cfg.thinking_budget == 4096
+
+
+def test_build_prompt_builder_returns_simplified_v2():
+    """iter-34 v16-a: build_prompt_builder wires simplified_v2 → SimplifiedV2PromptBuilder."""
+    cfg = PipelineConfig(name="test", prompt_template="simplified_v2")
+    builder = build_prompt_builder(cfg)
+    assert isinstance(builder, SimplifiedV2PromptBuilder)
+
+
+# ---- iter-34 v16-b: SimplifiedV2Bv1PromptBuilder -----
+
+def test_v16b_adds_temporal_verdict_leading_directive():
+    """iter-34 v16-b: simplified v2 with TEMPORAL verdict-leading
+    directive. The TEMPORAL bullet should include 'first sentence
+    states the verdict' wording."""
+    b = SimplifiedV2Bv1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    msgs = b.build("Was X consistent with Y?", docs)
+    user = msgs[1]["content"]
+    assert "first sentence" in user.lower()
+    assert "verdict" in user.lower()
+
+
+def test_v16b_keeps_other_shapes_unchanged():
+    """iter-34 v16-b: only TEMPORAL bullet changed; ENTITY, YES/NO, REFUSAL
+    bullets remain identical to v16-a."""
+    a = SimplifiedV2PromptBuilder()
+    b = SimplifiedV2Bv1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    a_yn = a.build("Does X suggest Y?", docs)[1]["content"]
+    b_yn = b.build("Does X suggest Y?", docs)[1]["content"]
+    # YES/NO bullet must be identical
+    assert "compare both sides, answer Yes, no, True, or False" in a_yn
+    assert "compare both sides, answer Yes, no, True, or False" in b_yn
+    # Entity bullet must be identical
+    a_ent = a.build("Who is X?", docs)[1]["content"]
+    b_ent = b.build("Who is X?", docs)[1]["content"]
+    assert "extract a named entity verbatim" in a_ent
+    assert "extract a named entity verbatim" in b_ent
+
+
+def test_v16b_preset_registered():
+    """iter-34 v16-b: PRESETS contains simplified_v2_v16b_thinking_k10."""
+    cfg = PRESETS["simplified_v2_v16b_thinking_k10"]
+    assert cfg.prompt_template == "simplified_v2_v16b"
+
+
+def test_build_prompt_builder_returns_v16b():
+    """iter-34 v16-b: build_prompt_builder wires simplified_v2_v16b →
+    SimplifiedV2Bv1PromptBuilder."""
+    cfg = PipelineConfig(name="test", prompt_template="simplified_v2_v16b")
+    builder = build_prompt_builder(cfg)
+    assert isinstance(builder, SimplifiedV2Bv1PromptBuilder)
+
+
+# ---- iter-34 v16-c: SimplifiedV2Cv1PromptBuilder -----
+
+def test_v16c_strengthens_temporal_opening():
+    """iter-34 v16-c: TEMPORAL bullet now says 'Lead with the verdict
+    word (Yes, No, Consistent, or Inconsistent), followed by a brief
+    one-sentence explanation.'"""
+    b = SimplifiedV2Cv1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    msgs = b.build("Was X consistent with Y?", docs)
+    user = msgs[1]["content"]
+    assert "Lead with the verdict word" in user
+    assert "one-sentence explanation" in user
+    # Verdict word options are explicit
+    assert "Yes, No, Consistent, or Inconsistent" in user
+
+
+def test_v16c_keeps_other_bullets_unchanged():
+    """iter-34 v16-c: only TEMPORAL bullet changed; ENTITY, YES/NO, REFUSAL
+    must remain identical to v16-b."""
+    b = SimplifiedV2Bv1PromptBuilder()
+    c = SimplifiedV2Cv1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    # YES/NO bullet identical
+    b_yn = b.build("Does X suggest Y?", docs)[1]["content"]
+    c_yn = c.build("Does X suggest Y?", docs)[1]["content"]
+    assert "compare both sides, answer Yes, no, True, or False" in b_yn
+    assert "compare both sides, answer Yes, no, True, or False" in c_yn
+    # Entity bullet identical
+    b_ent = b.build("Who is X?", docs)[1]["content"]
+    c_ent = c.build("Who is X?", docs)[1]["content"]
+    assert "extract a named entity verbatim" in b_ent
+    assert "extract a named entity verbatim" in c_ent
+    # REFUSAL bullet identical
+    b_rf = b.build("Considering Z?", docs)[1]["content"]
+    c_rf = c.build("Considering Z?", docs)[1]["content"]
+    assert "'Insufficient information'" in b_rf
+    assert "'Insufficient information'" in c_rf
+
+
+def test_v16c_drops_v16b_temporal_phrase():
+    """iter-34 v16-c: drops v16-b's 'first sentence states the verdict'
+    wording in favor of the more directive 'Lead with the verdict
+    word'."""
+    c = SimplifiedV2Cv1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    user = c.build("Was X consistent with Y?", docs)[1]["content"]
+    assert "first sentence states the verdict" not in user
+    assert "two sentences or fewer" not in user
+
+
+def test_v16c_preset_registered():
+    """iter-34 v16-c: PRESETS contains simplified_v2_v16c_thinking_k10."""
+    cfg = PRESETS["simplified_v2_v16c_thinking_k10"]
+    assert cfg.prompt_template == "simplified_v2_v16c"
+
+
+def test_build_prompt_builder_returns_v16c():
+    """iter-34 v16-c: build_prompt_builder wires simplified_v2_v16c →
+    SimplifiedV2Cv1PromptBuilder."""
+    cfg = PipelineConfig(name="test", prompt_template="simplified_v2_v16c")
+    builder = build_prompt_builder(cfg)
+    assert isinstance(builder, SimplifiedV2Cv1PromptBuilder)
+
+
+# ---- iter-34 v16-d: SimplifiedV2Dv1PromptBuilder -----
+
+def test_v16d_yesno_bullet_has_chunk_match_directive():
+    """iter-34 v16-d: YES/NO bullet now includes chunk-matching +
+    lead-with-verdict + brevity directives."""
+    b = SimplifiedV2Dv1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    msgs = b.build("Does X suggest Y?", docs)
+    user = msgs[1]["content"]
+    # Chunk-matching (positive wording, no "do NOT verify")
+    assert "context chunk whose content matches" in user.lower()
+    assert "do not verify" not in user.lower()
+    # Lead-with-verdict
+    assert "lead with the verdict word" in user.lower()
+    # Brevity
+    assert "brief one-sentence explanation" in user.lower()
+
+
+def test_v16d_keeps_temporal_unchanged_from_v16c():
+    """iter-34 v16-d: TEMPORAL bullet identical to v16-c (extract the
+    substring containing the TEMPORAL_ORDERING marker)."""
+    c = SimplifiedV2Cv1PromptBuilder()
+    d = SimplifiedV2Dv1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    c_t = c.build("Was X consistent with Y?", docs)[1]["content"]
+    d_t = d.build("Was X consistent with Y?", docs)[1]["content"]
+    # Both must contain the v16-c TEMPORAL wording verbatim
+    expected = "Lead with the verdict word (Yes, No, Consistent, or Inconsistent), followed by a brief one-sentence explanation."
+    assert expected in c_t
+    assert expected in d_t
+    # The TEMPORAL portion should appear in the same context (surrounding text)
+    # Check that v16-d's TEMPORAL chunk starts the same way as v16-c's
+    c_t_idx = c_t.index(expected)
+    d_t_idx = d_t.index(expected)
+    # And the surrounding 20 chars before should be identical
+    assert c_t[c_t_idx-50:c_t_idx] == d_t[d_t_idx-50:d_t_idx]
+
+
+def test_v16d_keeps_entity_and_refusal_unchanged():
+    """iter-34 v16-d: only YES/NO bullet changed; ENTITY + REFUSAL must
+    remain identical to v16-c."""
+    c = SimplifiedV2Cv1PromptBuilder()
+    d = SimplifiedV2Dv1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    # ENTITY
+    c_e = c.build("Who is X?", docs)[1]["content"]
+    d_e = d.build("Who is X?", docs)[1]["content"]
+    assert "extract a named entity verbatim" in c_e
+    assert "extract a named entity verbatim" in d_e
+    # REFUSAL
+    c_r = c.build("Considering Z?", docs)[1]["content"]
+    d_r = d.build("Considering Z?", docs)[1]["content"]
+    assert "'Insufficient information'" in c_r
+    assert "'Insufficient information'" in d_r
+
+
+def test_v16d_preset_registered():
+    """iter-34 v16-d: PRESETS contains simplified_v2_v16d_thinking_k10."""
+    cfg = PRESETS["simplified_v2_v16d_thinking_k10"]
+    assert cfg.prompt_template == "simplified_v2_v16d"
+
+
+def test_build_prompt_builder_returns_v16d():
+    """iter-34 v16-d: build_prompt_builder wires simplified_v2_v16d →
+    SimplifiedV2Dv1PromptBuilder."""
+    cfg = PipelineConfig(name="test", prompt_template="simplified_v2_v16d")
+    builder = build_prompt_builder(cfg)
+    assert isinstance(builder, SimplifiedV2Dv1PromptBuilder)
+
+
+# ---- iter-34 v16-e: SimplifiedV2Ev1PromptBuilder (final iteration) -----
+
+def test_v16e_entity_bullet_has_canonical_name_directive():
+    """iter-34 v16-e: ENTITY bullet now includes 'most complete form'
+    + 'do not add parenthetical clarifications' directives."""
+    b = SimplifiedV2Ev1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    msgs = b.build("Who is X?", docs)
+    user = msgs[1]["content"]
+    assert "most complete form" in user.lower()
+    assert "parenthetical" in user.lower()
+
+
+def test_v16e_keeps_other_bullets_unchanged_from_v16c():
+    """iter-34 v16-e: only ENTITY bullet changed; YES/NO, TEMPORAL,
+    REFUSAL must remain identical to v16-c."""
+    c = SimplifiedV2Cv1PromptBuilder()
+    e = SimplifiedV2Ev1PromptBuilder()
+    docs = [Document(page_content="para1", metadata={"title": "T1"})]
+    # YES/NO
+    c_yn = c.build("Does X suggest Y?", docs)[1]["content"]
+    e_yn = e.build("Does X suggest Y?", docs)[1]["content"]
+    assert "compare both sides, answer Yes, no, True, or False" in c_yn
+    assert "compare both sides, answer Yes, no, True, or False" in e_yn
+    # TEMPORAL
+    c_t = c.build("Was X consistent with Y?", docs)[1]["content"]
+    e_t = e.build("Was X consistent with Y?", docs)[1]["content"]
+    assert "Lead with the verdict word (Yes, No, Consistent, or Inconsistent)" in c_t
+    assert "Lead with the verdict word (Yes, No, Consistent, or Inconsistent)" in e_t
+    # REFUSAL
+    c_r = c.build("Considering Z?", docs)[1]["content"]
+    e_r = e.build("Considering Z?", docs)[1]["content"]
+    assert "'Insufficient information'" in c_r
+    assert "'Insufficient information'" in e_r
+
+
+def test_v16e_preset_registered():
+    """iter-34 v16-e: PRESETS contains simplified_v2_v16e_thinking_k10."""
+    cfg = PRESETS["simplified_v2_v16e_thinking_k10"]
+    assert cfg.prompt_template == "simplified_v2_v16e"
+
+
+def test_build_prompt_builder_returns_v16e():
+    """iter-34 v16-e: build_prompt_builder wires simplified_v2_v16e →
+    SimplifiedV2Ev1PromptBuilder."""
+    cfg = PipelineConfig(name="test", prompt_template="simplified_v2_v16e")
+    builder = build_prompt_builder(cfg)
+    assert isinstance(builder, SimplifiedV2Ev1PromptBuilder)

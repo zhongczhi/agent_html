@@ -456,6 +456,338 @@ class PreAnalysisExtractPromptBuilder(CoTExtractNoTitlesPromptBuilder):
         ]
 
 
+class SimplifiedV2PromptBuilder(PreAnalysisExtractPromptBuilder):
+    """iter-34 v16-a: SIMPLIFIED v2.
+
+    v2 (PreAnalysisExtractPromptBuilder, the local-maximum SOTA at 0.680)
+    had two overlapping scaffolding mechanisms:
+      - System prompt: iter-22 CoT scaffold ('Think step by step: 1. ...
+        2. ... 3. ... 4. ... Begin with extracted span')
+      - User prompt: pre-analysis prefix with 4-shape enumeration
+
+    These overlapped. The CoT scaffold's "identify entities" duplicates
+    the pre-analysis's "identify what kind of question". The "Begin
+    with extracted span" duplicates ENTITY LOOKUP's "extract a named
+    entity verbatim". Dropping the CoT scaffold should not hurt — the
+    iter-29 v2 lift came from the 4-shape enumeration, not the CoT
+    scaffold (iter-22 SOTA was 0.620, iter-29 v2 was 0.680 with the
+    same CoT scaffold plus the new pre-analysis prefix).
+
+    v16-a drops:
+      - The full CoT scaffold (4 steps)
+      - 'Some questions require combining facts from multiple paragraphs'
+      - 'Begin your response with the extracted span'
+      - 'then briefly explain your reasoning'
+      - 'One short sentence naming the shape is enough; do not re-read
+        the question'
+      - 'Then read the <context>...</context> block and answer'
+
+    v16-a keeps:
+      - RAG framing (essential for grounding)
+      - 4-shape enumeration (the lift mechanism)
+      - 'Quote your answer verbatim from the context' (consolidated
+        canonical-name directive)
+
+    v16-a on n=200: 0.620 (vs v2 baseline 0.615 this run). Tied within
+    noise. Simplification verified.
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "compare both sides, answer Yes, no, True, or False.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): check time order or consistency, "
+        "answer Yes or no.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def __init__(self):
+        # Drop the CoT scaffold; keep only RAG framing in system.
+        from backend.eval.qa_judge import RAG_SYSTEM_PROMPT_HERE
+        self._system_prompt = RAG_SYSTEM_PROMPT_HERE
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class SimplifiedV2Bv1PromptBuilder(SimplifiedV2PromptBuilder):
+    """iter-34 v16-b: v16-a + TEMPORAL verdict-leading directive.
+
+    v16-a failure analysis (per sub-agent):
+      - 16/17 TEMPORAL fails are verdict-buried (model writes
+        'Based on the context...' preamble and never leads with the
+        verdict word Yes/no/Consistent/Inconsistent).
+      - v2 (the historical SOTA) had a CoT scaffold that said
+        'Begin your response with the extracted span' which partially
+        fixed this. v16-a dropped the scaffold, and TEMPORAL
+        regressed by 1 question.
+      - v15 d3v2 tested this on 20% sample with directive 'Your
+        first sentence must state the answer. Keep the entire
+        response to two sentences or fewer' and lifted TEMPORAL
+        from 4/9 to 6/9.
+
+    v16-b adds ONE directive to the TEMPORAL_ORDER bullet:
+        'Your first sentence states the verdict; keep the entire
+        response to two sentences or fewer.'
+
+    v16-b on n=200: 0.655 (131/200) — +2.0 pp over v2 baseline
+    re-run (0.635). TEMPORAL recovered from 0.622 (v16-a) to 0.689
+    (v16-b). But the brevity directive didn't bite — only 2/45
+    v16-b responses are ≤2 sentences.
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS_V16B = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "compare both sides, answer Yes, no, True, or False.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): check time order or consistency. "
+        "Your first sentence states the verdict; keep the entire response "
+        "to two sentences or fewer.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS_V16B}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class SimplifiedV2Cv1PromptBuilder(SimplifiedV2Bv1PromptBuilder):
+    """iter-34 v16-c: v16-b + strengthened TEMPORAL opening directive.
+
+    v16-b analysis showed TEMPORAL pass rate jumped 0.622 → 0.689
+    (+6.7 pp), but 14/45 still fail with the same verdict-buried
+    pattern (model writes 'Based on...' preamble, never includes the
+    verdict word). The brevity part of v16-b's directive didn't bite
+    (only 2/45 ≤2 sentences).
+
+    v16-c strengthens the opening format with an explicit verdict
+    structure pattern:
+
+      Old (v16-b): 'Your first sentence states the verdict; keep the
+                    entire response to two sentences or fewer.'
+      New (v16-c): 'Lead with the verdict word (Yes, No, Consistent,
+                    or Inconsistent), followed by a brief one-sentence
+                    explanation.'
+
+    Plus an explicit list of valid verdict words to reduce ambiguity
+    about what counts as a "verdict". The model now sees the format
+    pattern in the directive itself.
+
+    v16-c on n=200: 0.690 (138/200) — +5.5 pp over v2 baseline re-run.
+    YES/NO pass rate went 0.62 → 0.70 (sub-agent says spillover from
+    the TEMPORAL directive; TEMPORAL itself stayed at 0.689). First
+    clear improvement over the historical v2 SOTA (0.680).
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS_V16C = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "compare both sides, answer Yes, no, True, or False.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): check time order or consistency. "
+        "Lead with the verdict word (Yes, No, Consistent, or Inconsistent), "
+        "followed by a brief one-sentence explanation.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS_V16C}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class SimplifiedV2Dv1PromptBuilder(SimplifiedV2Cv1PromptBuilder):
+    """iter-34 v16-d: v16-c + YES/NO verdict-leading + chunk-matching.
+
+    v16-c failure analysis (per sub-agent):
+      - v16-c YES/NO: 73/104 = 0.70 (vs v16-b 0.62, +8 pp).
+      - Remaining yesno failures: 31 = 23 no-lead + 8 wrong-verdict.
+      - Wrong-verdict cases (8) often come from source-attribution
+        confusion: model picks wrong chunk when same publisher has
+        multiple articles (qid 1388f62e, 2b8acb60).
+      - The v16-c TEMPORAL directive ("Lead with verdict word, brief
+        one-sentence explanation") generalizes to yesno by spillover.
+        Formalizing it in the YES/NO bullet should compound the lift.
+
+    v16-d modifies ONLY the YES/NO bullet. Combines three positive
+    directives:
+      1. Chunk-matching: "identify the context chunk whose content
+         matches the topic and details the question names"
+      2. Lead-with-verdict: "lead with the verdict word (Yes, no,
+         True, or False)"
+      3. Brevity: "followed by a brief one-sentence explanation"
+
+    This is qualitatively different from prior D1 (source-attribution)
+    attempts because:
+      - v15 d1v1/d1v2/v9 source-attribution: framed as "match by
+        publisher name" (which primed the model).
+      - v16-d: framed as "match by content + topic details" — positive
+        matching by content, not by source name.
+      - And adds verdict-leading + brevity as combined constraints.
+
+    If v16-d yesno regresses below 0.70, tighten the directive (drop
+    "brief one-sentence explanation" part).
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS_V16D = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "identify the context chunk whose content matches the topic and "
+        "details the question names, judge the claim against that chunk, "
+        "lead with the verdict word (Yes, no, True, or False), followed by "
+        "a brief one-sentence explanation.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): check time order or consistency. "
+        "Lead with the verdict word (Yes, No, Consistent, or Inconsistent), "
+        "followed by a brief one-sentence explanation.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS_V16D}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class SimplifiedV2Ev1PromptBuilder(SimplifiedV2Cv1PromptBuilder):
+    """iter-34 v16-e (final iteration): v16-c + ENTITY canonical-name directive.
+
+    v16-d (YES/NO verdict-leading with chunk-match) regressed -6.5 pp
+    from v16-c. ABANDONED per user's 2-failure rule (this was attempt
+    1 of the combined chunk+verdict+brevity direction for yesno; it
+    joins the 5+ prior yesno-directive failures).
+
+    Per user's protocol, the next iteration targets a different failure.
+    v16-c remaining failures:
+      - inference: 3/37 fails = substring mismatches
+      - yesno: 31/104 fails
+      - temporal: 14/45 fails = verdict-buried
+      - refusal: 14/14 fails = untouchable
+
+    ENTITY canonical-name directive is the only direction untried in
+    v16 series. It targets the 3 inference substring mismatches:
+      - qid 607962ec "New Zealand All Blacks" → "New Zealand (the All Blacks)"
+      - qid 7b40f027 "Australia's cricket team" → "Australia"
+
+    v16-e modifies ONLY the ENTITY bullet. Adds positive wording:
+      "Use the most complete form of the entity name as written in the
+       context. Do not add parenthetical clarifications after the name."
+
+    Predicted lift: +1.5 pp (3 fixes). Even if small, confirms the
+    approach of incremental targeted directives.
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS_V16E = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context. Use the most "
+        "complete form of the entity name as written in the context "
+        "(e.g. 'New Zealand All Blacks', not 'New Zealand' or 'the All "
+        "Blacks'). Do not add parenthetical clarifications after the name.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "compare both sides, answer Yes, no, True, or False.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): check time order or consistency. "
+        "Lead with the verdict word (Yes, No, Consistent, or Inconsistent), "
+        "followed by a brief one-sentence explanation.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS_V16E}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class AnthropicLLM:
+
+    def __init__(self):
+        # Drop the CoT scaffold; keep only RAG framing in system.
+        from backend.eval.qa_judge import RAG_SYSTEM_PROMPT_HERE
+        self._system_prompt = RAG_SYSTEM_PROMPT_HERE
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
 class CleanGroupedPromptBuilder:
     """Iter-33 v13 default preset (clean_grouped_thinking_k10).
 
@@ -950,6 +1282,16 @@ def build_prompt_builder(config: PipelineConfig) -> PromptBuilder:
         return CoTExtractNoTitlesPromptBuilder()
     if config.prompt_template == "pre_analysis_extract":
         return PreAnalysisExtractPromptBuilder()
+    if config.prompt_template == "simplified_v2":
+        return SimplifiedV2PromptBuilder()
+    if config.prompt_template == "simplified_v2_v16b":
+        return SimplifiedV2Bv1PromptBuilder()
+    if config.prompt_template == "simplified_v2_v16c":
+        return SimplifiedV2Cv1PromptBuilder()
+    if config.prompt_template == "simplified_v2_v16d":
+        return SimplifiedV2Dv1PromptBuilder()
+    if config.prompt_template == "simplified_v2_v16e":
+        return SimplifiedV2Ev1PromptBuilder()
     if config.prompt_template == "clean_grouped":
         return CleanGroupedPromptBuilder()
     if config.prompt_template == "parametrized_grouped_v15":
@@ -1263,6 +1605,76 @@ PRESETS: dict[str, PipelineConfig] = {
         reranker=None,
         top_k=10,
         prompt_template="pre_analysis_extract",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-34 v16-a: simplified v2. Drops the iter-22 CoT scaffold (4
+    # steps + 'Begin with extracted span'), keeps the 4-shape pre-
+    # analysis enumeration as the lift mechanism. Hypothesis: the CoT
+    # scaffold overlapped with the pre-analysis and was redundant.
+    # See SimplifiedV2PromptBuilder docstring.
+    "simplified_v2_thinking_k10": PipelineConfig(
+        name="simplified_v2_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-34 v16-b: v16-a + TEMPORAL verdict-leading directive
+    # (recovered from v15 d3v2 winner wording). See
+    # SimplifiedV2Bv1PromptBuilder docstring.
+    "simplified_v2_v16b_thinking_k10": PipelineConfig(
+        name="simplified_v2_v16b_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2_v16b",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-34 v16-c: v16-b + strengthened TEMPORAL opening
+    # ('Lead with the verdict word (Yes, No, Consistent, or
+    # Inconsistent), followed by a brief one-sentence explanation').
+    "simplified_v2_v16c_thinking_k10": PipelineConfig(
+        name="simplified_v2_v16c_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2_v16c",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-34 v16-d: v16-c + YES/NO chunk-match + verdict-leading
+    # + brevity directive. Mirrors v16-c's TEMPORAL pattern.
+    "simplified_v2_v16d_thinking_k10": PipelineConfig(
+        name="simplified_v2_v16d_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2_v16d",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-34 v16-e: v16-c + ENTITY canonical-name directive.
+    # See SimplifiedV2Ev1PromptBuilder docstring.
+    "simplified_v2_v16e_thinking_k10": PipelineConfig(
+        name="simplified_v2_v16e_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2_v16e",
         thinking_budget=4096,
         llm_model="minimax-3",
     ),
