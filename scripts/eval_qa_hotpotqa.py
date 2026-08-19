@@ -54,6 +54,7 @@ async def _evaluate_one(
     thinking_budget: int | None = None,
     max_tokens: int | None = None,
     capture_thinking: bool = False,
+    normalize: bool = True,
 ) -> dict:
     """One LLM call + scoring (FR-42).
 
@@ -118,6 +119,15 @@ async def _evaluate_one(
     else:
         answer = await ask_llm(client, model, prompt)
         thinking = ""
+    # Apply post-processing normalizer (default ON). The normalizer is
+    # pure post-processing — zero extra LLM calls — and addresses two
+    # failure modes: null paraphrasing (model says 'I cannot determine'
+    # when gold is 'Insufficient information.') and verdict-vocabulary
+    # mismatches on temporal questions. See backend/eval/normalizer.py.
+    raw_answer = answer
+    if normalize:
+        from backend.eval.normalizer import normalize_answer
+        answer = normalize_answer(answer, qtype=item.type)
     f1 = metrics.answer_f1(answer, item.answer)
     em = metrics.exact_match(answer, item.answer)
     contains = metrics.answer_coverage_at_k([answer], item.answer)
@@ -127,6 +137,7 @@ async def _evaluate_one(
         "variant": variant_name,
         "mode": mode,
         "predicted": answer,
+        "predicted_raw": raw_answer,
         "gold": item.answer,
         "answer_f1": f1,
         "answer_em": 1.0 if em else 0.0,
@@ -230,6 +241,17 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Skip the first N items in the (possibly subset) item list. Use with "
             "--max-items for resumable runs after a crash. Default 0."
+        ),
+    )
+    parser.add_argument(
+        "--no-normalize",
+        action="store_true",
+        help=(
+            "Disable the answer normalizer (post-processing layer that fixes "
+            "null paraphrasing and temporal verdict-vocabulary mismatches). "
+            "Default: normalization enabled. iter-35 v18 + normalization gives "
+            "0.730 on the iter-29 200-question smoke fixture; without "
+            "normalization v18 gives 0.690."
         ),
     )
     parser.add_argument(
@@ -501,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
                     thinking_budget=pipeline_cfg.thinking_budget if pipeline_cfg else None,
                     max_tokens=(pipeline_cfg.thinking_budget + 512) if pipeline_cfg and pipeline_cfg.thinking_budget else None,
                     capture_thinking=args.capture_thinking,
+                    normalize=not args.no_normalize,
                 ))
                 if args.compare_baseline:
                     # without-context baseline (retrieval doesn't apply)
@@ -513,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
                         retrieved_titles=retrieved_titles,
                         thinking_budget=None,  # baseline never uses thinking
                         capture_thinking=args.capture_thinking,
+                        normalize=not args.no_normalize,
                     ))
         except Exception as e:
             log.warning("qid=%s error: %s", item.id, e)

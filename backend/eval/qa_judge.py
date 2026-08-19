@@ -89,7 +89,10 @@ async def ask_llm(
 
     Skips thinking blocks (we only want the visible answer text for scoring).
     Joins multiple text blocks with newlines; trims whitespace.
-    temperature=0 for determinism (NFR-21).
+    temperature=0 — deterministic output. The iter-35 pre-exploration
+    (2026-08-05) temporarily bumped this to 0.3 to measure sampling
+    noise across 3 runs; reverted for v19 measurement to compare
+    apples-to-apples with v18 SOTA.
 
     If `thinking_budget` is set (positive int), enables Anthropic extended
     thinking mode with that many tokens of internal reasoning budget.

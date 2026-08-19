@@ -139,7 +139,8 @@ async def test_ask_llm_handles_dict_shaped_blocks():
 
 
 @pytest.mark.asyncio
-async def test_ask_llm_passes_temperature_zero():
+async def test_ask_llm_passes_temperature_default():
+    """Default temperature is 0 (deterministic, for SOTA comparison)."""
     client = MagicMock()
     client.messages.create = AsyncMock(return_value=_mock_text_response("ok"))
     await ask_llm(client, "minimax-3", [{"role": "user", "content": "Q"}])

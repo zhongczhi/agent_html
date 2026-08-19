@@ -767,6 +767,337 @@ class SimplifiedV2Ev1PromptBuilder(SimplifiedV2Cv1PromptBuilder):
         ]
 
 
+class SimplifiedV2Cv2PromptBuilder(SimplifiedV2Cv1PromptBuilder):
+    """iter-35 v18: v16-c + verdict + anti-premature-refusal on TEMPORAL.
+
+    Built from the iter-35 GT-only-context probe (20 stratified v17 k5
+    failures re-run with only the gold supporting_facts paragraphs):
+      - 8/20 recovered: failures were context-noise. Already addressed
+        by retrieval improvements (v17 K=5 lifted inference, hurt
+        comparison).
+      - 12/20 persisted even with GT context. These are
+        prompt/extraction problems, not retrieval problems.
+
+    v18 targets the 4 largest persistent-failure sub-patterns that fall
+    on the TEMPORAL bullet:
+
+      1. Verdict vocabulary mismatch (2 cases):
+         Model said 'Consistent' when gold was 'Yes'. v16-c's directive
+         lists 4 valid verdict forms but the model has to PICK one — it
+         defaults to the temporal form ('Consistent') over the yesno
+         form ('Yes'). v18 forces the yesno form first.
+
+      2. Premature refusal (2 cases):
+         Model said 'Insufficient information' when context had the GT
+         paragraphs. The REFUSAL bullet's blanket preference for
+         'Insufficient information' over guessing was being
+         over-applied. v18 adds an anti-premature-refusal cue scoped to
+         the TEMPORAL bullet: prefer Yes/No over 'Insufficient' when
+         at least one article is on-topic.
+
+    The verdict vocabulary fix preserves 'Consistent'/'Inconsistent'
+    as optional parentheticals — so cases where gold is the literal
+    word 'Consistent' still pass (substring match).
+
+    ENTITY, YES/NO, and REFUSAL bullets are unchanged from v16-c to
+    minimize blast radius. The 8 non-temporal persistent failures
+    (4 comparison, 1 inference canonical-name, 1 null metric issue)
+    are not targeted here; v18 is a focused single-bullet revision.
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS_V18 = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "compare both sides, answer Yes, no, True, or False.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): check time order or consistency. "
+        "Lead with 'Yes' or 'No' as the verdict (these are the most "
+        "common verdict forms). For questions explicitly about "
+        "consistency between two reports, you may append '(Consistent)' "
+        "or '(Inconsistent)' in parentheses after the Yes/No. For "
+        "ordering questions (e.g., 'Which came first?'), lead with the "
+        "entity name that came first. Prefer a Yes/No verdict over "
+        "'Insufficient information' when at least one article in the "
+        "context is on-topic, even if a specific date or detail is "
+        "missing. Follow with a brief one-sentence explanation.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS_V18}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class SimplifiedV2V19BPromptBuilder(SimplifiedV2Cv2PromptBuilder):
+    """iter-35 v19b: v18 + verdict-leading directive on YES/NO (B1) +
+    strengthened TEMPORAL directive with CRITICAL framing (B4).
+
+    Hypothesis (from iter-35 v18 failure analysis): the verdict-buried /
+    preamble pattern is the dominant failure mode (52% of comparison
+    failures, 85% of temporal failures). v18 only had the lead-with-
+    verdict directive on the TEMPORAL bullet, and even there it was
+    being ignored 85% of the time. v19b adds an equivalent directive on
+    the YES/NO bullet (mirroring v18's TEMPORAL wording verbatim) and
+    strengthens the TEMPORAL directive with CRITICAL framing plus an
+    anti-preamble rule.
+
+    What changed vs SimplifiedV2Cv2PromptBuilder (v18):
+      - B1: YES/NO bullet append "lead with the verdict word ... then
+        a brief one-sentence explanation" (mirrors v18 TEMPORAL directive
+        verbatim — model already responds to this framing for temporal).
+      - B4: TEMPORAL directive opens with "**CRITICAL:** Your FIRST WORD
+        must be the verdict word" and explicitly forbids preamble
+        ("Based on...", "Looking at...").
+
+    What did NOT change:
+      - ENTITY, REFUSAL bullets (v18 wording preserved).
+      - The verdict-vocab / anti-premature-refusal clauses in TEMPORAL
+        (v18 wording preserved below the new CRITICAL preamble).
+
+    Result: REGRESSED on smoke 200. contains_gold 0.705 vs v18 SOTA 0.730.
+    The "CRITICAL: FIRST WORD" framing made the model over-commit to
+    verdicts, and the anti-preamble rule caused over-refusal on temporal
+    questions. Abandoned per the 2-failure rule. Kept here as a
+    reference and a warning about over-aggressive directives.
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS_V19B = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "compare both sides. **Lead with the verdict word** (Yes, no, "
+        "True, or False), followed by a brief one-sentence explanation. "
+        "Do not begin with 'Based on...', 'Looking at...', 'The ...', or "
+        "any preamble — start your response with the verdict word.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): **CRITICAL: Your FIRST WORD must "
+        "be the verdict word** (Yes, No, Consistent, or Inconsistent). "
+        "Do not begin with 'Based on...', 'Looking at...', 'The ...', or "
+        "any preamble. After the verdict, follow with a brief one-"
+        "sentence explanation. For questions explicitly about consistency "
+        "between two reports, you may append '(Consistent)' or "
+        "'(Inconsistent)' in parentheses after the Yes/No. For ordering "
+        "questions (e.g., 'Which came first?'), lead with the entity name "
+        "that came first. Prefer a Yes/No verdict over 'Insufficient "
+        "information' when at least one article in the context is "
+        "on-topic, even if a specific date or detail is missing.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS_V19B}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class SimplifiedV2V19CSoftPromptBuilder(SimplifiedV2Cv2PromptBuilder):
+    """iter-35 v19b-soft: v18 + mild verdict-leading on YES/NO (B1 only).
+
+    Differs from SimplifiedV2V19BPromptBuilder (v19b) by dropping the
+    parts that caused regression:
+      - Removed "CRITICAL: Your FIRST WORD must be the verdict word"
+        (too aggressive — model over-committed to wrong verdicts)
+      - Removed "Do not begin with 'Based on...'" anti-preamble rule
+        (caused over-refusal on temporal questions)
+      - Kept the positive "Lead with the verdict word" directive
+      - Kept v18's anti-premature-refusal clause on TEMPORAL
+      - TEMPORAL bullet is identical to v18
+
+    Net change vs v18: ONLY the YES/NO bullet adds
+      "lead with the verdict word ... followed by a brief one-sentence
+       explanation"
+    (a soft version of v18's TEMPORAL wording). This is the minimal
+    B1 implementation.
+
+    Result on smoke 200: 0.800 (160/200) — new SOTA, +14 cases vs v18.
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS_V19C_SOFT = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "compare both sides, then lead with the verdict word (Yes, no, "
+        "True, or False), followed by a brief one-sentence explanation.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): check time order or consistency. "
+        "Lead with 'Yes' or 'No' as the verdict (these are the most "
+        "common verdict forms). For questions explicitly about "
+        "consistency between two reports, you may append '(Consistent)' "
+        "or '(Inconsistent)' in parentheses after the Yes/No. For "
+        "ordering questions (e.g., 'Which came first?'), lead with the "
+        "entity name that came first. Prefer a Yes/No verdict over "
+        "'Insufficient information' when at least one article in the "
+        "context is on-topic, even if a specific date or detail is "
+        "missing. Follow with a brief one-sentence explanation.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS_V19C_SOFT}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class SimplifiedV2V19DSoftPromptBuilder(SimplifiedV2V19CSoftPromptBuilder):
+    """iter-35 v19d-soft: v19b-soft + anti-markdown-heading rule for temporal.
+
+    v19b-soft has 3 temporal regressions where the model adopted markdown
+    headings (e.g. '# Comparing the Two Reports ...') which bury the
+    verdict word below the heading. This builder adds a targeted rule:
+
+      "Do not begin your response with a markdown heading (#). If you
+       use headings for structure, your first word after the heading
+       must be the verdict word."
+
+    Result on smoke 200: 0.720 (144/200) — REGRESSED -16 cases vs
+    v19b-soft (0.800). The rule didn't reliably fire (model still
+    produced '# Comparing ...' in 3 cases) and triggered widespread
+    temporal verdict reversals on cases that previously passed.
+    Additional prompt instruction in the temporal bullet caused the
+    model to "overthink" temporal questions and flip verdicts.
+
+    Abandoned per 2-failure rule. Kept here as a record.
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS_V19D_SOFT = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "compare both sides, then lead with the verdict word (Yes, no, "
+        "True, or False), followed by a brief one-sentence explanation.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): check time order or consistency. "
+        "**Do not begin your response with a markdown heading (#).** "
+        "If you use headings for structure, the first word after the "
+        "heading must be the verdict word. Lead with 'Yes' or 'No' as "
+        "the verdict (these are the most common verdict forms). For "
+        "questions explicitly about consistency between two reports, you "
+        "may append '(Consistent)' or '(Inconsistent)' in parentheses "
+        "after the Yes/No. For ordering questions (e.g., 'Which came "
+        "first?'), lead with the entity name that came first. Prefer a "
+        "Yes/No verdict over 'Insufficient information' when at least "
+        "one article in the context is on-topic, even if a specific date "
+        "or detail is missing. Follow with a brief one-sentence "
+        "explanation.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS_V19D_SOFT}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
+class SimplifiedV2V19ESoftPromptBuilder(SimplifiedV2V19CSoftPromptBuilder):
+    """iter-35 v19e-soft: v19b-soft + canonical-name directive on ENTITY.
+
+    v19b-soft has 3 inference failures where the model paraphrases or
+    reformats the canonical entity name:
+      - mhrag_607962ec: gold="New Zealand All Blacks", pred="All Blacks (New Zealand)"
+      - mhrag_791632b4: gold="Taylor Swift and Travis Kelce", pred="Taylor Swift...Travis Kelce"
+      - mhrag_7b40f027: gold="Australia's cricket team", pred="Australia"
+
+    v16-e (iter-34) tried a canonical-name directive: "Use the most
+    complete form of the entity name as written in the context. Do not
+    add parenthetical clarifications after the name." v16-e was
+    unstable at temp=0.3 (0/3 on stability test) but should be more
+    reliable at temp=0 since the model is deterministic.
+
+    Differs from v19b-soft ONLY in the ENTITY bullet. YES/NO, TEMPORAL,
+    and REFUSAL bullets are unchanged from v19b-soft.
+    """
+
+    _SIMPLIFIED_PRE_ANALYSIS_V19E_SOFT = (
+        "Before reading the context, identify the question type and "
+        "extract accordingly:\n"
+        "- ENTITY LOOKUP (e.g. 'Who is X?', 'What company...?', 'Which director...'): "
+        "extract a named entity verbatim from the context. Use the most "
+        "complete form of the entity name as written in the context "
+        "(e.g. 'New Zealand All Blacks', not 'New Zealand' or 'the All "
+        "Blacks'). Do not add parenthetical clarifications after the name.\n"
+        "- YES/NO ADJUDICATION (e.g. 'Does X suggest Y?', 'Are A and B both...?'): "
+        "compare both sides, then lead with the verdict word (Yes, no, "
+        "True, or False), followed by a brief one-sentence explanation.\n"
+        "- TEMPORAL ORDERING / CONSISTENCY (e.g. 'Which came first?', "
+        "'Was X consistent with Y?'): check time order or consistency. "
+        "Lead with 'Yes' or 'No' as the verdict (these are the most "
+        "common verdict forms). For questions explicitly about "
+        "consistency between two reports, you may append '(Consistent)' "
+        "or '(Inconsistent)' in parentheses after the Yes/No. For "
+        "ordering questions (e.g., 'Which came first?'), lead with the "
+        "entity name that came first. Prefer a Yes/No verdict over "
+        "'Insufficient information' when at least one article in the "
+        "context is on-topic, even if a specific date or detail is "
+        "missing. Follow with a brief one-sentence explanation.\n"
+        "- REFUSAL (the context may not contain the answer): answer "
+        "'Insufficient information' rather than guessing.\n\n"
+        "Quote your answer verbatim from the context."
+    )
+
+    def build(self, question: str, context_docs: list[Document] | None) -> list[dict]:
+        if not context_docs:
+            return [{"role": "user", "content": question}]
+        context_str = "\n\n".join(d.page_content for d in context_docs)
+        user_content = (
+            f"{self._SIMPLIFIED_PRE_ANALYSIS_V19E_SOFT}\n\n"
+            f"<context>\n{context_str}\n</context>\n\n{question}"
+        )
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+
 class AnthropicLLM:
 
     def __init__(self):
@@ -1292,6 +1623,16 @@ def build_prompt_builder(config: PipelineConfig) -> PromptBuilder:
         return SimplifiedV2Dv1PromptBuilder()
     if config.prompt_template == "simplified_v2_v16e":
         return SimplifiedV2Ev1PromptBuilder()
+    if config.prompt_template == "simplified_v2_v18":
+        return SimplifiedV2Cv2PromptBuilder()
+    if config.prompt_template == "simplified_v2_v19b":
+        return SimplifiedV2V19BPromptBuilder()
+    if config.prompt_template == "simplified_v2_v19c_soft":
+        return SimplifiedV2V19CSoftPromptBuilder()
+    if config.prompt_template == "simplified_v2_v19d_soft":
+        return SimplifiedV2V19DSoftPromptBuilder()
+    if config.prompt_template == "simplified_v2_v19e_soft":
+        return SimplifiedV2V19ESoftPromptBuilder()
     if config.prompt_template == "clean_grouped":
         return CleanGroupedPromptBuilder()
     if config.prompt_template == "parametrized_grouped_v15":
@@ -1649,6 +1990,104 @@ PRESETS: dict[str, PipelineConfig] = {
         reranker=None,
         top_k=10,
         prompt_template="simplified_v2_v16c",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-35 v17: v16-c + relevance-filtered retrieval (top_k=5 instead
+    # of top_k=10). The retrieval-score probe showed FAISS distance has a
+    # clean separation: ~90% of GT paragraphs cluster in L2 distance
+    # 0.6-1.4, while most non-GT cluster in 1.4-2.0. Keeping only the top-5
+    # most similar paragraphs drops 50% of context (10 -> 5) while
+    # preserving 99.36% of GT titles (only 3/470 dropped). The smaller
+    # context window reduces extraction noise on yesno/temporal questions
+    # where distractor paragraphs cause mis-extraction.
+    "simplified_v2_v16c_thinking_k5": PipelineConfig(
+        name="simplified_v2_v16c_thinking_k5",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=5,
+        prompt_template="simplified_v2_v16c",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-35 v18: v16-c + verdict + anti-premature-refusal on TEMPORAL.
+    # Built from the iter-35 GT-only-context probe (20 stratified v17 k5
+    # failures re-run with GT-only paragraphs): 12/20 failed even with
+    # clean context. Of those, 4 are TEMPORAL bullet failures
+    # (2 verdict-vocabulary mismatch, 2 premature refusal). v18
+    # strengthens the TEMPORAL bullet: force 'Yes/No' as the verdict
+    # (with optional '(Consistent)'/'Inconsistent)' parenthetical), and
+    # prefer Yes/No over 'Insufficient information' when at least one
+    # article is on-topic. See SimplifiedV2Cv2PromptBuilder docstring.
+    "simplified_v2_v18_thinking_k10": PipelineConfig(
+        name="simplified_v2_v18_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2_v18",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-35 v19b: v18 + verdict-leading directive on YES/NO (B1)
+    # + strengthened TEMPORAL directive with CRITICAL framing (B4).
+    # Targets the verdict-buried / preamble pattern (52% of comparison
+    # failures, 85% of temporal failures). Uses the v19a normalizer
+    # automatically (C1 + D1 applied at eval time).
+    "simplified_v2_v19b_thinking_k10": PipelineConfig(
+        name="simplified_v2_v19b_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2_v19b",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-35 v19b-soft: v18 + mild verdict-leading on YES/NO (B1 only).
+    # Drops the CRITICAL/anti-preamble parts that regressed v19b. TEMPORAL
+    # bullet unchanged from v18. Second attempt of the B1 direction.
+    "simplified_v2_v19c_soft_thinking_k10": PipelineConfig(
+        name="simplified_v2_v19c_soft_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2_v19c_soft",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-35 v19d-soft: v19b-soft + anti-markdown-heading rule for
+    # TEMPORAL. Targets the 3 markdown-heading regressions (mhrag_201d8101,
+    # mhrag_54a88d9a, mhrag_cd1c9a22). Narrower than v19b's anti-preamble
+    # rule, so lower regression risk.
+    "simplified_v2_v19d_soft_thinking_k10": PipelineConfig(
+        name="simplified_v2_v19d_soft_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2_v19d_soft",
+        thinking_budget=4096,
+        llm_model="minimax-3",
+    ),
+    # iter-35 v19e-soft: v19b-soft + canonical-name directive on
+    # ENTITY (v16-e style). Targets the 3 inference failures where the
+    # model paraphrases/reorders the entity name.
+    "simplified_v2_v19e_soft_thinking_k10": PipelineConfig(
+        name="simplified_v2_v19e_soft_thinking_k10",
+        embedding_backend="sentence-transformers",
+        embedding_model="all-MiniLM-L6-v2",
+        retriever="dense",
+        reranker=None,
+        top_k=10,
+        prompt_template="simplified_v2_v19e_soft",
         thinking_budget=4096,
         llm_model="minimax-3",
     ),

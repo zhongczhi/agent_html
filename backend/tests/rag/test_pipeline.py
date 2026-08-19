@@ -1475,6 +1475,116 @@ def test_v16e_preset_registered():
     assert cfg.prompt_template == "simplified_v2_v16e"
 
 
+# ---- iter-35 v17: simplified_v2_v16c_thinking_k5 (relevance-filtered) -----
+
+def test_v17_k5_preset_registered():
+    """iter-35 v17: PRESETS contains simplified_v2_v16c_thinking_k5 — v16-c
+    prompt with top_k=5 instead of 10 (relevance-filtered retrieval)."""
+    cfg = PRESETS["simplified_v2_v16c_thinking_k5"]
+    assert cfg.prompt_template == "simplified_v2_v16c"
+    assert cfg.top_k == 5
+    assert cfg.thinking_budget == 4096
+    assert cfg.reranker is None
+
+
+def test_v17_k5_uses_v16c_prompt_builder():
+    """iter-35 v17: build_prompt_builder wires simplified_v2_v16c_thinking_k5
+    → SimplifiedV2Cv1PromptBuilder (same prompt as v16-c)."""
+    cfg = PRESETS["simplified_v2_v16c_thinking_k5"]
+    builder = build_prompt_builder(cfg)
+    assert isinstance(builder, SimplifiedV2Cv1PromptBuilder)
+
+
+# ---- iter-35 v18: SimplifiedV2Cv2PromptBuilder (verdict + anti-premature-refusal) ----
+
+def test_v18_temporal_leads_with_yes_no():
+    """iter-35 v18: TEMPORAL bullet must say 'Lead with Yes or No' (forcing
+    the yesno verdict vocabulary, with Consistent/Inconsistent as
+    optional parentheticals)."""
+    from backend.rag.pipeline import SimplifiedV2Cv2PromptBuilder
+    b = SimplifiedV2Cv2PromptBuilder()
+    docs = [Document(page_content="para", metadata={"title": "T"})]
+    msgs = b.build("Was X consistent with Y?", docs)
+    user = msgs[1]["content"]
+    assert "Lead with 'Yes' or 'No'" in user
+
+
+def test_v18_temporal_keeps_consistent_parenthetical_option():
+    """iter-35 v18: 'Consistent'/'Inconsistent' preserved as parenthetical
+    options so cases where gold is the literal word 'Consistent' still
+    pass (substring match)."""
+    from backend.rag.pipeline import SimplifiedV2Cv2PromptBuilder
+    b = SimplifiedV2Cv2PromptBuilder()
+    docs = [Document(page_content="para", metadata={"title": "T"})]
+    msgs = b.build("Was X consistent with Y?", docs)
+    user = msgs[1]["content"]
+    assert "'(Consistent)'" in user
+    assert "'(Inconsistent)'" in user
+
+
+def test_v18_temporal_anti_premature_refusal():
+    """iter-35 v18: TEMPORAL bullet must contain anti-premature-refusal
+    cue: prefer Yes/No over 'Insufficient information' when at least
+    one article is on-topic."""
+    from backend.rag.pipeline import SimplifiedV2Cv2PromptBuilder
+    b = SimplifiedV2Cv2PromptBuilder()
+    docs = [Document(page_content="para", metadata={"title": "T"})]
+    msgs = b.build("Was X consistent with Y?", docs)
+    user = msgs[1]["content"]
+    assert "Prefer a Yes/No verdict over 'Insufficient information'" in user
+    assert "at least one article" in user
+
+
+def test_v18_keeps_other_bullets_unchanged_from_v16c():
+    """iter-35 v18: ENTITY, YES/NO, REFUSAL bullets identical to v16-c.
+    Only TEMPORAL bullet changes."""
+    from backend.rag.pipeline import SimplifiedV2Cv2PromptBuilder
+    c = SimplifiedV2Cv1PromptBuilder()
+    v = SimplifiedV2Cv2PromptBuilder()
+    docs = [Document(page_content="para", metadata={"title": "T"})]
+    # ENTITY bullet
+    c_e = c.build("Who is X?", docs)[1]["content"]
+    v_e = v.build("Who is X?", docs)[1]["content"]
+    assert "extract a named entity verbatim from the context" in c_e
+    assert "extract a named entity verbatim from the context" in v_e
+    # YES/NO bullet
+    c_yn = c.build("Does X suggest Y?", docs)[1]["content"]
+    v_yn = v.build("Does X suggest Y?", docs)[1]["content"]
+    assert "compare both sides, answer Yes, no, True, or False" in c_yn
+    assert "compare both sides, answer Yes, no, True, or False" in v_yn
+    # REFUSAL bullet
+    c_r = c.build("Considering Z?", docs)[1]["content"]
+    v_r = v.build("Considering Z?", docs)[1]["content"]
+    assert "'Insufficient information' rather than guessing" in c_r
+    assert "'Insufficient information' rather than guessing" in v_r
+
+
+def test_v18_user_only_when_no_context():
+    """iter-35 v18: no context → user-only message (no system prompt)."""
+    from backend.rag.pipeline import SimplifiedV2Cv2PromptBuilder
+    b = SimplifiedV2Cv2PromptBuilder()
+    msgs = b.build("Was X consistent with Y?", None)
+    assert msgs == [{"role": "user", "content": "Was X consistent with Y?"}]
+
+
+def test_v18_preset_registered():
+    """iter-35 v18: PRESETS contains simplified_v2_v18_thinking_k10."""
+    cfg = PRESETS["simplified_v2_v18_thinking_k10"]
+    assert cfg.prompt_template == "simplified_v2_v18"
+    assert cfg.top_k == 10
+    assert cfg.thinking_budget == 4096
+    assert cfg.reranker is None
+
+
+def test_build_prompt_builder_returns_v18():
+    """iter-35 v18: build_prompt_builder wires simplified_v2_v18 →
+    SimplifiedV2Cv2PromptBuilder."""
+    from backend.rag.pipeline import SimplifiedV2Cv2PromptBuilder
+    cfg = PRESETS["simplified_v2_v18_thinking_k10"]
+    builder = build_prompt_builder(cfg)
+    assert isinstance(builder, SimplifiedV2Cv2PromptBuilder)
+
+
 def test_build_prompt_builder_returns_v16e():
     """iter-34 v16-e: build_prompt_builder wires simplified_v2_v16e →
     SimplifiedV2Ev1PromptBuilder."""
